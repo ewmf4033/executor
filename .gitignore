@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+executor.egg-info/
+.coverage
+htmlcov/
+*.egg-info/
+.env
+.env.*
+!.env.example
+
+# Runtime state — keep schema files, drop DBs
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Audit log files
+audit/*.sqlite
+audit/*.sqlite.gz
+audit-logs/
+
+# Local overrides
+risk.local.yaml

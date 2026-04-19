@@ -1,0 +1,27 @@
+[Unit]
+Description=Executor (Build Zero 0d) — Phase 1 scaffolding
+Documentation=file:///root/trading-wiki/specs/0d-executor.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/executor
+Environment=PYTHONUNBUFFERED=1
+Environment=EXECUTOR_LOG_LEVEL=INFO
+Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs
+ExecStart=/root/executor/.venv/bin/python -m executor
+Restart=on-failure
+RestartSec=5
+# Kill switch + Telegram bot run as a separate unit (executor-telegram.service, Phase 4)
+
+# Graceful shutdown: SIGTERM lets the event bus drain.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
