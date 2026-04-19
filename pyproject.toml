@@ -9,6 +9,7 @@ dependencies = [
   "cryptography>=42.0.0",
   "aiohttp>=3.9.0",
   "uuid6>=2024.7.10",
+  "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
