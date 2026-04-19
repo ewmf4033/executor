@@ -1,0 +1,444 @@
+"""
+Risk state — SQLite cache + rebuild-on-startup.
+
+Tables:
+- positions           : (venue, market_id, outcome_id, size, avg_prob, updated_ts_ns)
+- exposures           : cached $ exposure per (venue, market_id, outcome_id)
+                        — regenerable from positions at current prices
+- daily_pnl           : (date TEXT, strategy_id TEXT, pnl REAL, PRIMARY KEY (date, strategy_id))
+                        — strategy_id "" = portfolio-level
+- clip_history        : (intent_id TEXT, gate TEXT, original REAL, clipped REAL, ts_ns INT)
+- kill_state          : mirror of KillSwitch entries
+- adverse_flags       : (strategy_id, market_id, flagged_ts_ns)
+- config_hash         : (id INTEGER PRIMARY KEY, hash TEXT, loaded_ts_ns INT)
+
+Rebuild on startup:
+1. If risk_state.sqlite exists and opens cleanly, load exposures + daily_pnl + kill + flags + config_hash.
+2. Otherwise: delete corrupt file, rebuild exposures from every registered venue
+   (get_account + get_positions). Replay audit FILL events since UTC midnight
+   into daily_pnl from a provided audit_db_path (if given).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sqlite3
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from ..core.logging import get_logger
+from ..core.types import Position
+
+
+log = get_logger("executor.risk.state")
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS positions (
+    venue TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome_id TEXT NOT NULL,
+    size TEXT NOT NULL,
+    avg_prob TEXT NOT NULL,
+    updated_ts_ns INTEGER NOT NULL,
+    PRIMARY KEY (venue, market_id, outcome_id)
+);
+CREATE TABLE IF NOT EXISTS exposures (
+    venue TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome_id TEXT NOT NULL,
+    dollars TEXT NOT NULL,
+    event_id TEXT,
+    updated_ts_ns INTEGER NOT NULL,
+    PRIMARY KEY (venue, market_id, outcome_id)
+);
+CREATE TABLE IF NOT EXISTS daily_pnl (
+    date TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    pnl TEXT NOT NULL,
+    PRIMARY KEY (date, strategy_id)
+);
+CREATE TABLE IF NOT EXISTS clip_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id TEXT NOT NULL,
+    gate TEXT NOT NULL,
+    original TEXT NOT NULL,
+    clipped TEXT NOT NULL,
+    ts_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kill_state (
+    scope TEXT NOT NULL,
+    key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    engaged_ts_ns INTEGER NOT NULL,
+    PRIMARY KEY (scope, key)
+);
+CREATE TABLE IF NOT EXISTS adverse_flags (
+    strategy_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    flagged_ts_ns INTEGER NOT NULL,
+    PRIMARY KEY (strategy_id, market_id)
+);
+CREATE TABLE IF NOT EXISTS config_hash (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    hash TEXT NOT NULL,
+    loaded_ts_ns INTEGER NOT NULL
+);
+"""
+
+
+@dataclass
+class ExposureRecord:
+    venue: str
+    market_id: str
+    outcome_id: str
+    dollars: Decimal
+    event_id: str | None = None
+
+
+def utc_midnight_ns(now_ns: int | None = None) -> int:
+    now_ns = now_ns or time.time_ns()
+    dt = datetime.fromtimestamp(now_ns / 1e9, tz=timezone.utc)
+    midnight = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+    return int(midnight.timestamp() * 1_000_000_000)
+
+
+def utc_date_str(now_ns: int | None = None) -> str:
+    now_ns = now_ns or time.time_ns()
+    return datetime.fromtimestamp(now_ns / 1e9, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+class RiskState:
+    """Persistent + in-memory risk state. Always call .load() before use."""
+
+    def __init__(self, *, db_path: str | os.PathLike[str]) -> None:
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
+        # In-memory caches (SQLite is the durable backing store).
+        self._exposures: dict[tuple[str, str, str], ExposureRecord] = {}
+        self._daily_pnl: dict[tuple[str, str], Decimal] = {}   # (date, strategy_id) -> pnl
+        self._positions: dict[tuple[str, str, str], Position] = {}
+        self._strategy_exposure: dict[str, Decimal] = {}
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def load(
+        self,
+        *,
+        venues: dict[str, Any] | None = None,
+        audit_db_path: str | os.PathLike[str] | None = None,
+    ) -> str:
+        """
+        Open the SQLite cache. On corruption, delete + rebuild from venues.
+        Returns one of: "loaded", "rebuilt_venues", "rebuilt_audit_fallback".
+        """
+        outcome = await asyncio.to_thread(self._try_open)
+        if outcome == "ok":
+            self._load_caches()
+            self._started = True
+            log.info("risk.state.loaded", db=str(self._db_path))
+            return "loaded"
+
+        # Corrupt / missing — rebuild.
+        log.warning("risk.state.cache_corrupt_rebuilding", reason=outcome, db=str(self._db_path))
+        try:
+            if self._db_path.exists():
+                self._db_path.unlink()
+        except OSError:
+            pass
+        await asyncio.to_thread(self._fresh_open)
+        rebuilt_from = "none"
+        if venues:
+            try:
+                rebuilt_from = await self._rebuild_from_venues(venues)
+            except Exception as exc:
+                log.error("risk.state.venue_rebuild_failed", error=str(exc))
+                rebuilt_from = "none"
+        if rebuilt_from == "none" and audit_db_path is not None:
+            replayed = await asyncio.to_thread(self._replay_audit_fallback, Path(audit_db_path))
+            if replayed:
+                rebuilt_from = "audit"
+        self._load_caches()
+        self._started = True
+        log.info("risk.state.rebuilt", source=rebuilt_from, db=str(self._db_path))
+        return "rebuilt_venues" if rebuilt_from == "venues" else "rebuilt_audit_fallback"
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.commit()
+            finally:
+                self._conn.close()
+            self._conn = None
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Open / schema
+    # ------------------------------------------------------------------
+
+    def _try_open(self) -> str:
+        """Return "ok" if file opens + passes integrity_check, else a reason string."""
+        if not self._db_path.exists():
+            self._fresh_open()
+            return "ok"
+        try:
+            conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            cur = conn.execute("PRAGMA integrity_check")
+            row = cur.fetchone()
+            if not row or str(row[0]).lower() != "ok":
+                conn.close()
+                return f"integrity_check:{row}"
+            conn.executescript(SCHEMA_SQL)  # idempotent
+            self._conn = conn
+            return "ok"
+        except sqlite3.DatabaseError as exc:
+            return f"db_error:{exc}"
+
+    def _fresh_open(self) -> None:
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+        self._conn = conn
+
+    def _load_caches(self) -> None:
+        assert self._conn is not None
+        for row in self._conn.execute(
+            "SELECT venue, market_id, outcome_id, dollars, event_id FROM exposures"
+        ):
+            rec = ExposureRecord(row[0], row[1], row[2], Decimal(row[3]), row[4])
+            self._exposures[(row[0], row[1], row[2])] = rec
+        for row in self._conn.execute(
+            "SELECT date, strategy_id, pnl FROM daily_pnl"
+        ):
+            self._daily_pnl[(row[0], row[1])] = Decimal(row[2])
+
+    # ------------------------------------------------------------------
+    # Rebuild from venues
+    # ------------------------------------------------------------------
+
+    async def _rebuild_from_venues(self, venues: dict[str, Any]) -> str:
+        """venues: dict venue_id -> VenueAdapter. Uses get_account + get_positions."""
+        assert self._conn is not None
+        any_position = False
+        for venue_id, adapter in venues.items():
+            try:
+                await adapter.get_account()
+            except Exception as exc:
+                log.warning("risk.state.rebuild.get_account_failed", venue=venue_id, error=str(exc))
+            try:
+                positions = await adapter.get_positions()
+            except NotImplementedError:
+                log.warning("risk.state.rebuild.no_get_positions", venue=venue_id)
+                continue
+            except Exception as exc:
+                log.warning("risk.state.rebuild.get_positions_failed", venue=venue_id, error=str(exc))
+                continue
+            for p in positions:
+                any_position = True
+                abs_size = abs(p.size)
+                price = p.avg_price_prob
+                dollars = (abs_size * price).quantize(Decimal("0.01"))
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO positions VALUES (?, ?, ?, ?, ?, ?)",
+                    (p.venue, p.market_id, p.outcome_id, str(p.size), str(p.avg_price_prob), int(p.as_of_ts)),
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO exposures VALUES (?, ?, ?, ?, ?, ?)",
+                    (p.venue, p.market_id, p.outcome_id, str(dollars), None, int(p.as_of_ts)),
+                )
+        self._conn.commit()
+        return "venues" if any_position else "none"
+
+    def _replay_audit_fallback(self, audit_db_path: Path) -> bool:
+        """Sum FILL events since 00:00 UTC into daily_pnl[("", "")] as portfolio-level.
+        Returns True if at least one event was replayed."""
+        if not audit_db_path.exists():
+            return False
+        try:
+            src = sqlite3.connect(str(audit_db_path))
+        except sqlite3.DatabaseError:
+            return False
+        since_ns = utc_midnight_ns()
+        n = 0
+        pnl = Decimal("0")
+        try:
+            for row in src.execute(
+                "SELECT payload_json, strategy_id FROM events "
+                "WHERE event_type='FILL' AND ts_ns >= ?",
+                (since_ns,),
+            ):
+                try:
+                    payload = json.loads(row[0])
+                except Exception:
+                    continue
+                # Conservative: just record -fee as pnl delta (realized pnl is Phase 4 attribution).
+                fee = Decimal(str(payload.get("fee", "0")))
+                pnl -= fee
+                n += 1
+        finally:
+            src.close()
+        if n == 0:
+            return False
+        assert self._conn is not None
+        date = utc_date_str()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO daily_pnl VALUES (?, ?, ?)",
+            (date, "", str(pnl)),
+        )
+        self._conn.commit()
+        log.info("risk.state.audit_replay", n=n, pnl=str(pnl))
+        return True
+
+    # ------------------------------------------------------------------
+    # Exposures
+    # ------------------------------------------------------------------
+
+    def exposure(self, venue: str, market_id: str, outcome_id: str) -> Decimal:
+        rec = self._exposures.get((venue, market_id, outcome_id))
+        return rec.dollars if rec else Decimal("0")
+
+    def exposure_by_market(self, venue: str, market_id: str) -> Decimal:
+        return sum(
+            (r.dollars for (v, m, _), r in self._exposures.items() if v == venue and m == market_id),
+            Decimal("0"),
+        )
+
+    def exposure_by_venue(self, venue: str) -> Decimal:
+        return sum(
+            (r.dollars for (v, _, _), r in self._exposures.items() if v == venue),
+            Decimal("0"),
+        )
+
+    def exposure_by_event(self, event_id: str) -> Decimal:
+        return sum(
+            (r.dollars for r in self._exposures.values() if r.event_id == event_id),
+            Decimal("0"),
+        )
+
+    def total_exposure(self) -> Decimal:
+        return sum((r.dollars for r in self._exposures.values()), Decimal("0"))
+
+    def add_exposure(
+        self,
+        *,
+        venue: str,
+        market_id: str,
+        outcome_id: str,
+        dollars: Decimal,
+        event_id: str | None = None,
+        now_ns: int | None = None,
+    ) -> None:
+        now_ns = now_ns or time.time_ns()
+        key = (venue, market_id, outcome_id)
+        prev = self._exposures.get(key)
+        new = (prev.dollars if prev else Decimal("0")) + dollars
+        rec = ExposureRecord(venue, market_id, outcome_id, new, event_id or (prev.event_id if prev else None))
+        self._exposures[key] = rec
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO exposures VALUES (?, ?, ?, ?, ?, ?)",
+            (venue, market_id, outcome_id, str(new), rec.event_id, now_ns),
+        )
+        self._conn.commit()
+
+    def set_event_id(self, venue: str, market_id: str, outcome_id: str, event_id: str | None) -> None:
+        key = (venue, market_id, outcome_id)
+        rec = self._exposures.get(key)
+        if rec is None:
+            # Seed a zero record so we can remember the mapping.
+            rec = ExposureRecord(venue, market_id, outcome_id, Decimal("0"), event_id)
+            self._exposures[key] = rec
+        else:
+            rec.event_id = event_id
+        assert self._conn is not None
+        self._conn.execute(
+            "UPDATE exposures SET event_id=? WHERE venue=? AND market_id=? AND outcome_id=?",
+            (event_id, venue, market_id, outcome_id),
+        )
+        self._conn.commit()
+
+    def strategy_exposure(self, strategy_id: str) -> Decimal:
+        return self._strategy_exposure.get(strategy_id, Decimal("0"))
+
+    def add_strategy_exposure(self, strategy_id: str, dollars: Decimal) -> None:
+        self._strategy_exposure[strategy_id] = (
+            self._strategy_exposure.get(strategy_id, Decimal("0")) + dollars
+        )
+
+    # ------------------------------------------------------------------
+    # Daily PnL
+    # ------------------------------------------------------------------
+
+    def daily_pnl(self, strategy_id: str = "", *, now_ns: int | None = None) -> Decimal:
+        key = (utc_date_str(now_ns), strategy_id)
+        return self._daily_pnl.get(key, Decimal("0"))
+
+    def record_pnl(self, strategy_id: str, pnl: Decimal, *, now_ns: int | None = None) -> None:
+        date = utc_date_str(now_ns)
+        key = (date, strategy_id)
+        new = self._daily_pnl.get(key, Decimal("0")) + pnl
+        self._daily_pnl[key] = new
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO daily_pnl VALUES (?, ?, ?)",
+            (date, strategy_id, str(new)),
+        )
+        self._conn.commit()
+
+    def reset_if_new_day(self, *, now_ns: int | None = None) -> None:
+        """Drop in-memory daily_pnl entries that aren't today. SQLite keeps full history."""
+        today = utc_date_str(now_ns)
+        self._daily_pnl = {k: v for k, v in self._daily_pnl.items() if k[0] == today}
+
+    # ------------------------------------------------------------------
+    # Clip history
+    # ------------------------------------------------------------------
+
+    def record_clip(
+        self,
+        *,
+        intent_id: str,
+        gate: str,
+        original: Decimal,
+        clipped: Decimal,
+        now_ns: int | None = None,
+    ) -> None:
+        now_ns = now_ns or time.time_ns()
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT INTO clip_history (intent_id, gate, original, clipped, ts_ns) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (intent_id, gate, str(original), str(clipped), now_ns),
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Config hash
+    # ------------------------------------------------------------------
+
+    def record_config_hash(self, config_hash: str, *, now_ns: int | None = None) -> None:
+        now_ns = now_ns or time.time_ns()
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO config_hash (id, hash, loaded_ts_ns) VALUES (1, ?, ?)",
+            (config_hash, now_ns),
+        )
+        self._conn.commit()
+
+    def current_config_hash(self) -> tuple[str | None, int | None]:
+        assert self._conn is not None
+        row = self._conn.execute("SELECT hash, loaded_ts_ns FROM config_hash WHERE id=1").fetchone()
+        if row is None:
+            return None, None
+        return row[0], row[1]

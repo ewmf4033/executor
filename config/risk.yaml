@@ -1,0 +1,56 @@
+# Risk policy overrides. See executor/risk/config.py for shape + defaults.
+# Code defaults are deliberately conservative; override here to go live.
+#
+# Reload: send SIGHUP to the executor process, or issue /risk reload via
+# Telegram (Phase 4). A CONFIG_RELOADED audit event is emitted on every
+# successful reload with the new config's SHA256 fingerprint.
+
+structural:
+  min_edge_default: "0.01"
+  per_strategy_min_edge: {}
+
+venue_health:
+  window_sec: 60
+  trip_threshold: 2
+  pause_sec: 120
+
+per_intent:
+  max_intent_dollars: "250.00"
+
+liquidity:
+  depth_levels: 3
+  min_remainder_contracts: "1"
+
+market_exposure:
+  default_ceiling_dollars: "500.00"
+  per_key: {}
+
+event_concentration:
+  default_ceiling_dollars: "1000.00"
+  per_key: {}
+
+venue_exposure:
+  default_ceiling_dollars: "2500.00"
+  per_key: {}
+
+global_portfolio_dollars: "10000.00"
+
+strategy_allocation:
+  default_ceiling_dollars: "1000.00"
+  per_key: {}
+
+daily_loss:
+  default_max_loss_dollars: "200.00"
+  per_strategy: {}
+
+clip_floor:
+  min_final_ratio: "0.5"
+
+poisoning:
+  enabled: true
+  detector: "zscore"
+  window_sec: 3600
+  z_threshold: 5.0
+  pause_sec: 300
+  min_samples: 20
+  detector_kwargs: {}
