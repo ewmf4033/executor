@@ -67,6 +67,9 @@ class EventType(str, Enum):
     VENUE_HEALTH_RECOVERED = "VENUE_HEALTH_RECOVERED"
     VENUE_CONNECTION = "VENUE_CONNECTION"
     EXECUTOR_LIFECYCLE = "EXECUTOR_LIFECYCLE"
+    # Phase 4: telegram + kill switch lifecycle
+    KILL_COMMAND_RECEIVED = "KILL_COMMAND_RECEIVED"
+    KILL_STATE_CHANGED = "KILL_STATE_CHANGED"
 
     # Observations (2)
     ACCOUNT_SNAPSHOT = "ACCOUNT_SNAPSHOT"
@@ -81,8 +84,10 @@ class EventType(str, Enum):
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
 # explicitly lists. See DECISIONS.md "2026-04-19 — Event type count" for
-# the reconciliation. Guard against silent drift:
-assert len(EventType) == 34, f"EventType count drift: {len(EventType)}"
+# the reconciliation. Phase 4 added KILL_COMMAND_RECEIVED + KILL_STATE_CHANGED
+# (telegram bot + kill-switch lifecycle), bringing the total to 36.
+# Guard against silent drift:
+assert len(EventType) == 36, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------

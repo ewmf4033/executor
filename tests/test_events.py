@@ -18,6 +18,8 @@ def test_event_type_count_and_uniqueness():
         "VENUE_CONNECTION", "EXECUTOR_LIFECYCLE",
         "ACCOUNT_SNAPSHOT", "POSITIONS_SNAPSHOT",
         "ANOMALY_DETECTED", "WARN", "ERROR",
+        # Phase 4 — kill switch / telegram lifecycle
+        "KILL_COMMAND_RECEIVED", "KILL_STATE_CHANGED",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"

@@ -84,6 +84,25 @@ class PoisoningCfg:
 
 
 @dataclass(frozen=True, slots=True)
+class AdverseSelectionCfg:
+    window: int = 20
+    adverse_threshold: float = 0.60
+    move_threshold_sigma: float = 2.0
+    pause_sec: int = 300
+
+
+@dataclass(frozen=True, slots=True)
+class KillSwitchCfg:
+    auto_resume_strike_limit: int = 3
+    panic_cooldown_sec: int = 300
+
+
+@dataclass(frozen=True, slots=True)
+class AttributionCfg:
+    exit_horizon_sec: int = 300
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     structural: StructuralCfg = field(default_factory=StructuralCfg)
     venue_health: VenueHealthCfg = field(default_factory=VenueHealthCfg)
@@ -105,6 +124,9 @@ class RiskConfig:
     daily_loss: DailyLossCfg = field(default_factory=DailyLossCfg)
     clip_floor: ClipFloorCfg = field(default_factory=ClipFloorCfg)
     poisoning: PoisoningCfg = field(default_factory=PoisoningCfg)
+    adverse_selection: AdverseSelectionCfg = field(default_factory=AdverseSelectionCfg)
+    kill_switch: KillSwitchCfg = field(default_factory=KillSwitchCfg)
+    attribution: AttributionCfg = field(default_factory=AttributionCfg)
 
     def fingerprint(self) -> str:
         """Stable SHA256 of the config; used for CONFIG_RELOADED payload."""
@@ -164,6 +186,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
             daily_loss=_parse_daily_loss(raw.get("daily_loss", {})),
             clip_floor=_parse_clip_floor(raw.get("clip_floor", {})),
             poisoning=_parse_poisoning(raw.get("poisoning", {})),
+            adverse_selection=_parse_adverse_selection(raw.get("adverse_selection", {})),
+            kill_switch=_parse_kill_switch(raw.get("kill_switch", {})),
+            attribution=_parse_attribution(raw.get("attribution", {})),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
@@ -232,6 +257,26 @@ def _parse_poisoning(d: dict[str, Any]) -> PoisoningCfg:
         min_samples=int(d.get("min_samples", 20)),
         detector_kwargs=dict(d.get("detector_kwargs", {}) or {}),
     )
+
+
+def _parse_adverse_selection(d: dict[str, Any]) -> AdverseSelectionCfg:
+    return AdverseSelectionCfg(
+        window=int(d.get("window", 20)),
+        adverse_threshold=float(d.get("adverse_threshold", 0.60)),
+        move_threshold_sigma=float(d.get("move_threshold_sigma", 2.0)),
+        pause_sec=int(d.get("pause_sec", 300)),
+    )
+
+
+def _parse_kill_switch(d: dict[str, Any]) -> KillSwitchCfg:
+    return KillSwitchCfg(
+        auto_resume_strike_limit=int(d.get("auto_resume_strike_limit", 3)),
+        panic_cooldown_sec=int(d.get("panic_cooldown_sec", 300)),
+    )
+
+
+def _parse_attribution(d: dict[str, Any]) -> AttributionCfg:
+    return AttributionCfg(exit_horizon_sec=int(d.get("exit_horizon_sec", 300)))
 
 
 # ---------------------------------------------------------------------------

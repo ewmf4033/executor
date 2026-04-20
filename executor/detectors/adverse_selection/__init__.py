@@ -1,14 +1,16 @@
 """
-0e adverse-selection detector — interface-only stub for Phase 3.
+0e adverse-selection detector.
 
-Phase 4 will implement the real fill-vs-post-fill logic. Gate 3 uses this
-stub shape so the call-site code lands once and the real detector drops
-in without gate changes.
+Phase 3 shipped the AdverseSelectionDetector interface + Null implementation.
+Phase 4 adds WindowAdverseSelectionDetector — sliding-window fill-vs-post-fill
+detection that pauses venues showing systematic adverse selection.
 """
 from .base import AdverseSelectionDetector, AdverseSelectionFlag, NullAdverseSelectionDetector
+from .window import WindowAdverseSelectionDetector
 
 __all__ = [
     "AdverseSelectionDetector",
     "AdverseSelectionFlag",
     "NullAdverseSelectionDetector",
+    "WindowAdverseSelectionDetector",
 ]
