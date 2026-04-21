@@ -26,3 +26,15 @@ the "29" number in the overview prose appears to be a stale count.
 `assert len(EventType) == 34` guard. If the authoritative count is meant
 to be 29, the spec must name which 5 enumerated types to drop; flag on
 spec re-review.
+
+## 2026-04-21 — Event type additions for Phase 4.5 daemon
+**Spec reference:** Decision 4 ("new behavior = new event type"), Phase 4.5 task
+**Deviation:** Added `SELF_CHECK_OK`, `SELF_CHECK_FAIL`, `STATE_SAVED` to
+the `EventType` enum. Count now 39.
+**Forced by:** The startup self-check must write a first-class audit event so
+the Phase 4 "all 167 intents flowed end-to-end" type of unverifiable claim
+cannot recur — a WARN-with-kind-payload would not be greppable. STATE_SAVED
+is written on graceful shutdown so recovery tooling has a durable marker
+that the process terminated cleanly rather than crashed.
+**Impact:** `assert len(EventType) == 39`. Audit readers that enumerate all
+event types (none today) would need to accept three new names.

@@ -87,6 +87,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_RISK_YAML,
         help="path to risk.yaml (default: %(default)s)",
     )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="run as long-running daemon (paper-mode pipeline, no auto-shutdown)",
+    )
+    parser.add_argument(
+        "--self-check-only",
+        action="store_true",
+        help="start the daemon, run the startup pipeline self-check, then exit",
+    )
+    parser.add_argument(
+        "--audit-dir",
+        default=None,
+        help="override EXECUTOR_AUDIT_DIR (daemon mode writes to audit-logs/paper_live by default)",
+    )
+    parser.add_argument(
+        "--telemetry-port",
+        type=int,
+        default=9879,
+        help="telemetry HTTP port (default: %(default)s)",
+    )
     return parser.parse_args(argv)
 
 
@@ -110,9 +131,23 @@ def resolve_mode(args: argparse.Namespace, *, env: dict[str, str] | None = None)
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     mode = resolve_mode(args)
-    # Lazy import — keeps CLI cheap to test.
-    from .core.service import main as svc_main
     print(f"executor mode: {mode}", flush=True)
+    # --daemon / --self-check-only route through the paper daemon wiring.
+    if args.daemon or args.self_check_only:
+        import asyncio
+        from .core.daemon import run_daemon
+
+        rc = asyncio.run(
+            run_daemon(
+                self_check_only=args.self_check_only,
+                audit_dir=args.audit_dir,
+                risk_yaml=args.risk_yaml,
+                telemetry_port=args.telemetry_port,
+            )
+        )
+        sys.exit(rc)
+    # Legacy path: Phase 1 scaffolding service (no strategies, no risk policy).
+    from .core.service import main as svc_main
     svc_main()
 
 

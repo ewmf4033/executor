@@ -80,14 +80,22 @@ class EventType(str, Enum):
     WARN = "WARN"
     ERROR = "ERROR"
 
+    # Phase 4.5 — daemon lifecycle + startup self-check. Added per the
+    # "new behavior = new event type" rule so the pipeline-verification
+    # signal is first-class in the audit log (not buried in a WARN.kind).
+    SELF_CHECK_OK = "SELF_CHECK_OK"
+    SELF_CHECK_FAIL = "SELF_CHECK_FAIL"
+    STATE_SAVED = "STATE_SAVED"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
 # explicitly lists. See DECISIONS.md "2026-04-19 — Event type count" for
 # the reconciliation. Phase 4 added KILL_COMMAND_RECEIVED + KILL_STATE_CHANGED
-# (telegram bot + kill-switch lifecycle), bringing the total to 36.
+# (telegram bot + kill-switch lifecycle). Phase 4.5 added SELF_CHECK_OK,
+# SELF_CHECK_FAIL, STATE_SAVED (daemon lifecycle + pipeline self-check).
 # Guard against silent drift:
-assert len(EventType) == 36, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 39, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------

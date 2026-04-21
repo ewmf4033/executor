@@ -1,5 +1,5 @@
 [Unit]
-Description=Executor (Build Zero 0d) — Phase 1 scaffolding
+Description=Executor (Build Zero 0d) — paper-mode daemon
 Documentation=file:///root/trading-wiki/specs/0d-executor.md
 After=network-online.target
 Wants=network-online.target
@@ -10,18 +10,29 @@ User=root
 WorkingDirectory=/root/executor
 Environment=PYTHONUNBUFFERED=1
 Environment=EXECUTOR_LOG_LEVEL=INFO
-Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs
-ExecStart=/root/executor/.venv/bin/python -m executor
+Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs/paper_live
+Environment=PAPER_MODE=true
+ExecStart=/root/executor/.venv/bin/python -m executor --daemon
+
+# Restart policy — crash-loop guard: give up after 3 restarts in 60s so
+# systemd doesn't mask a broken pipeline the way Phase 4's burn-in did.
 Restart=on-failure
 RestartSec=5
-# Kill switch + Telegram bot run as a separate unit (executor-telegram.service, Phase 4)
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
-# Graceful shutdown: SIGTERM lets the event bus drain.
+# Graceful shutdown: SIGTERM triggers bus drain + audit flush + STATE_SAVED.
 KillSignal=SIGTERM
-TimeoutStopSec=15
+TimeoutStopSec=30
 
-StandardOutput=journal
-StandardError=journal
+# Append stdout/stderr to a single log file; journalctl still sees it via
+# systemd's stdlib wrapper.
+StandardOutput=append:/var/log/executor.log
+StandardError=append:/var/log/executor.log
+
+# Resource caps.
+MemoryMax=1G
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

@@ -20,6 +20,8 @@ def test_event_type_count_and_uniqueness():
         "ANOMALY_DETECTED", "WARN", "ERROR",
         # Phase 4 — kill switch / telegram lifecycle
         "KILL_COMMAND_RECEIVED", "KILL_STATE_CHANGED",
+        # Phase 4.5 — daemon lifecycle + startup pipeline self-check
+        "SELF_CHECK_OK", "SELF_CHECK_FAIL", "STATE_SAVED",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"
