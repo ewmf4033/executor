@@ -97,7 +97,11 @@ def reconcile(db_path: str, dry_run: bool = False) -> dict:
             size = float(f["size"])
             fill_price = float(f["fill_price"])
             fee = float(f["fee"]) if f["fee"] is not None else 0.0
-            cost_basis = float(f["cost_basis_dollars"]) if f["cost_basis_dollars"] is not None else 0.0
+            try:
+                cost_basis = float(f["cost_basis_dollars"]) if f["cost_basis_dollars"] is not None else 0.0
+            except (IndexError, KeyError):
+                # Pre-migration row without cost_basis_dollars column
+                cost_basis = (notional + fee) if side == "BUY" else (notional - fee)
             side = f["side"]
 
             notional = size * fill_price
@@ -155,7 +159,7 @@ def reconcile(db_path: str, dry_run: bool = False) -> dict:
         threshold = max(DELTA_ABS_THRESHOLD, DELTA_PCT_THRESHOLD * total_notional)
         # Sum of absolute deltas
         total_delta = sum(
-            abs(float(r["cost_basis_dollars"] or 0) - _expected_cost(r))
+            abs(_get_cost_basis(r) - _expected_cost(r))
             for r in rows
         )
         if total_delta > threshold:
@@ -169,6 +173,15 @@ def reconcile(db_path: str, dry_run: bool = False) -> dict:
             _send_telegram("\n".join(lines))
 
     return result
+
+
+def _get_cost_basis(row: sqlite3.Row) -> float:
+    try:
+        val = row["cost_basis_dollars"]
+        return float(val) if val is not None else 0.0
+    except (IndexError, KeyError):
+        # Pre-migration: recompute from raw fields
+        return _expected_cost(row)
 
 
 def _expected_cost(row: sqlite3.Row) -> float:
