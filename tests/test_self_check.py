@@ -257,7 +257,7 @@ async def test_self_check_run_daemon_returns_nonzero_on_gate_reject(tmp_path: Pa
     from executor.core import daemon as daemon_mod
 
     monkeypatch.setenv("PAPER_MODE", "true")
-    monkeypatch.setenv("EXECUTOR_ALLOW_NO_ORDERBOOK", "true")
+    monkeypatch.setenv("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", "true")
 
     # Replace register_self_check_markets with a version that deliberately
     # excludes the self-check markets, forcing the structural gate to reject.

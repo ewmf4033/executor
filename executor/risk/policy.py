@@ -140,10 +140,19 @@ class RiskPolicy:
         the synthetic self-check ones. Fixes the Phase 4.6 regression
         where K1/P1 intents were rejected as "market not found" because
         only self-check markets had been registered.
+
+        Raises ValueError if the strategy declares no markets — catches
+        misconfig at daemon startup rather than silently at first intent.
         """
+        markets = strategy.markets
+        if not markets:
+            raise ValueError(
+                f"strategy {strategy.strategy_id} declared no markets; "
+                f"at least one (venue, market_id) required"
+            )
         if self.market_universe is None:
             self.market_universe = set()
-        for venue, market_id in strategy.markets:
+        for venue, market_id in markets:
             self.market_universe.add((venue, market_id))
 
     def set_allow_universe_bootstrap(self, allow: bool) -> None:

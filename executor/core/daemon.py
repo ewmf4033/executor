@@ -161,15 +161,16 @@ class DaemonService:
         )
 
         # Phase 4.7 F3: require an orderbook provider OR the
-        # EXECUTOR_ALLOW_NO_ORDERBOOK escape hatch. The paper daemon
-        # runs on synthetic quotes, so it must opt in explicitly.
-        allow_no_ob = os.environ.get("EXECUTOR_ALLOW_NO_ORDERBOOK", "").lower() in (
+        # EXECUTOR_PAPER_MODE_NO_ORDERBOOK escape hatch. Paper daemon
+        # has no real orderbook subscription until Phase 5 wires venue
+        # adapters, so it must opt in explicitly.
+        allow_no_ob = os.environ.get("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", "").lower() in (
             "1", "true", "yes", "on"
         )
         if self.policy.orderbook_provider is None and not allow_no_ob:
             raise RuntimeError(
                 "liquidity provider not configured; "
-                "set EXECUTOR_ALLOW_NO_ORDERBOOK=true for test harnesses"
+                "set EXECUTOR_PAPER_MODE_NO_ORDERBOOK=true for paper/test harnesses"
             )
 
         # Bootstrap the self-check synthetic markets into the policy's
@@ -223,7 +224,7 @@ class DaemonService:
             ("self_check_no", "SCNO"): "SELF_CHECK_EVENT",
         }
         for venue, market_id in self.strategy.markets:
-            event_id_map[(venue, market_id)] = f"{venue}:{market_id}"
+            event_id_map[(venue, market_id)] = f"synth:{venue}:{market_id}"
         self.policy.set_event_id_map(event_id_map)
 
         await self.bus.publish(

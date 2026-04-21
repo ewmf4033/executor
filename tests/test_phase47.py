@@ -108,7 +108,7 @@ async def test_strategy_registers_markets_on_daemon_start(tmp_path):
     """daemon.start() populates market_universe with strategy + self-check."""
     from executor.core.daemon import DaemonService
     os.environ["PAPER_MODE"] = "true"
-    os.environ["EXECUTOR_ALLOW_NO_ORDERBOOK"] = "true"
+    os.environ["EXECUTOR_PAPER_MODE_NO_ORDERBOOK"] = "true"
     svc = DaemonService(
         audit_dir=tmp_path / "audit",
         risk_state_db=tmp_path / "rstate.sqlite",
@@ -165,6 +165,20 @@ async def test_unregistered_market_still_rejected(tmp_path):
                     policy=p, now_ns=time.time_ns()))
         assert r.decision == GateDecision.REJECT
         assert "market not found" in r.reason
+    finally:
+        state.close()
+
+
+async def test_register_strategy_markets_rejects_empty_markets(tmp_path):
+    """Phase 4.7.1: strategy with no markets raises at registration, not at first intent."""
+    p, state = await _policy(tmp_path, universe_bootstrap=False)
+    try:
+        p.register_self_check_markets()
+        mock_strategy = MagicMock()
+        mock_strategy.strategy_id = "empty_strat"
+        mock_strategy.markets = []
+        with pytest.raises(ValueError, match="declared no markets"):
+            p.register_strategy_markets(mock_strategy)
     finally:
         state.close()
 
@@ -417,7 +431,7 @@ async def test_event_id_does_not_clobber_existing_exposure(tmp_path):
 
 async def test_daemon_start_fails_without_orderbook_in_prod(tmp_path, monkeypatch):
     monkeypatch.setenv("PAPER_MODE", "true")
-    monkeypatch.delenv("EXECUTOR_ALLOW_NO_ORDERBOOK", raising=False)
+    monkeypatch.delenv("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", raising=False)
     from executor.core.daemon import DaemonService
     svc = DaemonService(
         audit_dir=tmp_path / "audit",
@@ -434,7 +448,7 @@ async def test_daemon_start_fails_without_orderbook_in_prod(tmp_path, monkeypatc
 
 async def test_daemon_start_succeeds_with_env_var_set(tmp_path, monkeypatch):
     monkeypatch.setenv("PAPER_MODE", "true")
-    monkeypatch.setenv("EXECUTOR_ALLOW_NO_ORDERBOOK", "true")
+    monkeypatch.setenv("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", "true")
     from executor.core.daemon import DaemonService
     svc = DaemonService(
         audit_dir=tmp_path / "audit",
@@ -451,7 +465,7 @@ async def test_daemon_start_succeeds_with_env_var_set(tmp_path, monkeypatch):
 
 async def test_daemon_start_succeeds_when_orderbook_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("PAPER_MODE", "true")
-    monkeypatch.delenv("EXECUTOR_ALLOW_NO_ORDERBOOK", raising=False)
+    monkeypatch.delenv("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", raising=False)
     from executor.core.daemon import DaemonService
     svc = DaemonService(
         audit_dir=tmp_path / "audit",
@@ -464,7 +478,7 @@ async def test_daemon_start_succeeds_when_orderbook_configured(tmp_path, monkeyp
     # Partially start (before the check) by injecting an orderbook provider
     # We need to override the check in start(). Since the check is right after
     # policy construction, we can monkeypatch the env var briefly.
-    monkeypatch.setenv("EXECUTOR_ALLOW_NO_ORDERBOOK", "true")
+    monkeypatch.setenv("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", "true")
     await svc.start()
     assert svc._started is True
     await svc.stop()

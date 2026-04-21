@@ -12,7 +12,11 @@ Environment=PYTHONUNBUFFERED=1
 Environment=EXECUTOR_LOG_LEVEL=INFO
 Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs/paper_live
 Environment=PAPER_MODE=true
-Environment=EXECUTOR_ALLOW_NO_ORDERBOOK=true
+# Phase 5 TODO: remove once venue adapter wires real orderbook subscriptions.
+# Paper daemon has no orderbook provider — this flag allows the liquidity gate
+# to be skipped. Without a real provider the gate silently approves, which is
+# acceptable for synthetic-quote paper runs but NOT for real capital.
+Environment=EXECUTOR_PAPER_MODE_NO_ORDERBOOK=true
 ExecStart=/root/executor/.venv/bin/python -m executor --daemon
 
 # Restart policy — crash-loop guard: give up after 3 restarts in 60s so

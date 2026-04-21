@@ -18,7 +18,7 @@ from executor.core.daemon import DaemonService, run_daemon
 @pytest.mark.asyncio
 async def test_daemon_self_check_only_returns_zero(tmp_path: Path):
     os.environ["PAPER_MODE"] = "true"
-    os.environ["EXECUTOR_ALLOW_NO_ORDERBOOK"] = "true"
+    os.environ["EXECUTOR_PAPER_MODE_NO_ORDERBOOK"] = "true"
     rc = await run_daemon(
         self_check_only=True,
         audit_dir=tmp_path / "audit",
@@ -59,7 +59,7 @@ def _subprocess_env(tmp_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PAPER_MODE"] = "true"
     env["EXECUTOR_AUDIT_DIR"] = str(tmp_path / "audit")
-    env["EXECUTOR_ALLOW_NO_ORDERBOOK"] = "true"
+    env["EXECUTOR_PAPER_MODE_NO_ORDERBOOK"] = "true"
     return env
 
 
