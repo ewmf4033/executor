@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS attribution (
     execution_cost TEXT,
     short_term_alpha TEXT,
     fee TEXT,
+    cost_basis_dollars TEXT,
+    venue_fee_bps TEXT,
     fill_ts_ns INTEGER NOT NULL,
     settled_ts_ns INTEGER NOT NULL,
     extra_json TEXT NOT NULL DEFAULT '{}'
@@ -92,6 +94,8 @@ class AttributionRecord:
     execution_cost: Decimal | None = None
     short_term_alpha: Decimal | None = None
     fee: Decimal | None = None
+    cost_basis_dollars: Decimal | None = None
+    venue_fee_bps: Decimal | None = None
     settled_ts_ns: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -224,6 +228,17 @@ class AttributionTracker:
             rec.strategy_edge = _signed(rec.side, decision - arrival)
         if arrival is not None:
             rec.execution_cost = _signed(rec.side, arrival - rec.fill_price)
+        # Cost basis and venue fee.
+        notional = rec.size * rec.fill_price
+        if rec.fee is not None:
+            if rec.side == Side.BUY:
+                rec.cost_basis_dollars = notional + rec.fee
+            else:
+                rec.cost_basis_dollars = notional - rec.fee
+            if notional > 0:
+                rec.venue_fee_bps = (rec.fee / notional) * Decimal("10000")
+        else:
+            rec.cost_basis_dollars = notional
         # Persist a partial row (no exit yet); we update at settlement.
         self._upsert(rec)
         # Schedule settlement.
@@ -289,7 +304,9 @@ class AttributionTracker:
             "SUM(CAST(strategy_edge AS REAL)) AS sum_edge, "
             "SUM(CAST(execution_cost AS REAL)) AS sum_exec, "
             "SUM(CAST(short_term_alpha AS REAL)) AS sum_alpha, "
-            "SUM(CAST(fee AS REAL)) AS sum_fee "
+            "SUM(CAST(fee AS REAL)) AS sum_fee, "
+            "SUM(CAST(cost_basis_dollars AS REAL)) AS sum_cost_basis, "
+            "AVG(CAST(venue_fee_bps AS REAL)) AS avg_fee_bps "
             "FROM attribution WHERE fill_ts_ns >= ?"
         )
         params: list[Any] = [int(since_ns)]
@@ -301,13 +318,15 @@ class AttributionTracker:
         out = {}
         total_n = 0
         for r in rows:
-            sid, n, e, c, a, fee = r
+            sid, n, e, c, a, fee, cost_basis, avg_bps = r
             out[sid] = {
                 "fills": int(n),
                 "strategy_edge_sum": float(e or 0.0),
                 "execution_cost_sum": float(c or 0.0),
                 "short_term_alpha_sum": float(a or 0.0),
                 "fee_sum": float(fee or 0.0),
+                "total_cost_basis_dollars": float(cost_basis or 0.0),
+                "avg_venue_fee_bps": float(avg_bps or 0.0),
             }
             total_n += int(n)
         return {"strategies": out, "total_fills": total_n, "since_ns": int(since_ns)}
@@ -317,6 +336,7 @@ class AttributionTracker:
             "SELECT fill_id, intent_id, leg_id, strategy_id, venue, market_id, "
             "side, size, intent_price, decision_price, arrival_price, fill_price, "
             "exit_price, strategy_edge, execution_cost, short_term_alpha, fee, "
+            "cost_basis_dollars, venue_fee_bps, "
             "fill_ts_ns, settled_ts_ns, extra_json FROM attribution WHERE fill_id=?",
             (fill_id,),
         ).fetchone()
@@ -340,9 +360,11 @@ class AttributionTracker:
             execution_cost=Decimal(row[14]) if row[14] is not None else None,
             short_term_alpha=Decimal(row[15]) if row[15] is not None else None,
             fee=Decimal(row[16]) if row[16] is not None else None,
-            fill_ts_ns=int(row[17]),
-            settled_ts_ns=int(row[18]),
-            extra=json.loads(row[19] or "{}"),
+            cost_basis_dollars=Decimal(row[17]) if row[17] is not None else None,
+            venue_fee_bps=Decimal(row[18]) if row[18] is not None else None,
+            fill_ts_ns=int(row[19]),
+            settled_ts_ns=int(row[20]),
+            extra=json.loads(row[21] or "{}"),
         )
 
     # ------------------------------------------------------------------
@@ -355,8 +377,9 @@ class AttributionTracker:
             "(fill_id, intent_id, leg_id, strategy_id, venue, market_id, side, "
             " size, intent_price, decision_price, arrival_price, fill_price, "
             " exit_price, strategy_edge, execution_cost, short_term_alpha, fee, "
+            " cost_basis_dollars, venue_fee_bps, "
             " fill_ts_ns, settled_ts_ns, extra_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rec.fill_id,
                 rec.intent_id,
@@ -375,6 +398,8 @@ class AttributionTracker:
                 str(rec.execution_cost) if rec.execution_cost is not None else None,
                 str(rec.short_term_alpha) if rec.short_term_alpha is not None else None,
                 str(rec.fee) if rec.fee is not None else None,
+                str(rec.cost_basis_dollars) if rec.cost_basis_dollars is not None else None,
+                str(rec.venue_fee_bps) if rec.venue_fee_bps is not None else None,
                 int(rec.fill_ts_ns),
                 int(rec.settled_ts_ns),
                 json.dumps(rec.extra, default=str),
