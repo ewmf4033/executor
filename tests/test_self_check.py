@@ -149,3 +149,147 @@ def test_build_synthetic_intent_is_all_or_none():
     assert intent.atomicity == Atomicity.ALL_OR_NONE
     total = sum((leg.price_limit for leg in intent.legs), Decimal("0"))
     assert total < Decimal("1.0"), "synthetic basket must be clearly profitable (sum < $1)"
+
+
+# -------------------------------------------------------------------------
+# Phase 4.6 — self-check must require INTENT_ADMITTED, not accept rejections.
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_self_check_ok_when_admittable(wired_bus):
+    """Happy path: SELF_CHECK_OK fires with all four stage latencies present."""
+    seen: list[Event] = []
+
+    async def cap(ev: Event) -> None:
+        seen.append(ev)
+
+    await wired_bus["bus"].subscribe("cap", on_event=cap)
+    try:
+        result = await run_self_check(
+            bus=wired_bus["bus"],
+            attribution=wired_bus["attribution"],
+            timeout_sec=5.0,
+        )
+        await asyncio.sleep(0.05)
+    finally:
+        await wired_bus["bus"].unsubscribe("cap")
+
+    assert result["kind"] == "ok", result
+    stages = result["stages_ms"]
+    for name in ("emitted_ms", "risk_ms", "fill_ms", "attribution_ms"):
+        assert name in stages, f"missing stage {name} in {stages}"
+    assert result["observed"]["risk_outcome"] == EventType.INTENT_ADMITTED.value
+    kinds = [e.event_type for e in seen]
+    assert EventType.SELF_CHECK_OK in kinds
+    assert EventType.SELF_CHECK_FAIL not in kinds
+
+
+@pytest.mark.asyncio
+async def test_self_check_fails_on_gate_reject(tmp_path: Path):
+    """If any risk gate rejects the synthetic intent (e.g. structural gate with
+    mismatched market_universe), self-check must FAIL with the gate name,
+    not silently pass."""
+    bus = EventBus()
+    await bus.start()
+    cfg = ConfigManager(None)
+    state = RiskState(db_path=tmp_path / "rstate.sqlite")
+    await state.load()
+    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    # Populate market_universe with something that excludes the self-check
+    # markets — this makes the structural gate reject the synthetic intent.
+    policy.set_market_universe([("some_other_venue", "SOMETHING_ELSE")])
+    policy.set_venue_capabilities({
+        "self_check_yes": frozenset({"supports_limit"}),
+        "self_check_no": frozenset({"supports_limit"}),
+    })
+    orch = Orchestrator(bus=bus, policy=policy, attribution=None, paper_mode=True)
+    await orch.start()
+
+    seen: list[Event] = []
+
+    async def cap(ev: Event) -> None:
+        seen.append(ev)
+
+    await bus.subscribe("cap", on_event=cap)
+    try:
+        result = await run_self_check(bus=bus, attribution=None, timeout_sec=1.5)
+        await asyncio.sleep(0.05)
+    finally:
+        await bus.unsubscribe("cap")
+        await orch.stop()
+        await bus.stop()
+        state.close()
+
+    assert result["kind"] == "fail", result
+    assert "misconfigured" in result["reason"]
+    assert "structural" in result["reason"]
+    kinds = [e.event_type for e in seen]
+    assert EventType.SELF_CHECK_FAIL in kinds
+    assert EventType.SELF_CHECK_OK not in kinds
+
+
+@pytest.mark.asyncio
+async def test_self_check_run_daemon_returns_nonzero_on_gate_reject(tmp_path: Path, monkeypatch):
+    """run_daemon must exit non-zero when the self-check fails on a gate reject."""
+    from executor.core import daemon as daemon_mod
+
+    monkeypatch.setenv("PAPER_MODE", "true")
+
+    # Replace register_self_check_markets with a version that deliberately
+    # excludes the self-check markets, forcing the structural gate to reject.
+    def _bad_register(self) -> None:
+        self.market_universe = {("some_other_venue", "SOMETHING_ELSE")}
+
+    monkeypatch.setattr(daemon_mod.RiskPolicy, "register_self_check_markets", _bad_register)
+
+    rc = await daemon_mod.run_daemon(
+        self_check_only=True,
+        audit_dir=tmp_path / "audit",
+        risk_state_db=tmp_path / "rstate.sqlite",
+        kill_db=tmp_path / "kill.sqlite",
+        attribution_db=tmp_path / "attr.sqlite",
+        telemetry_port=0,
+        enable_quote_feeder=False,
+    )
+    assert rc != 0
+
+
+@pytest.mark.asyncio
+async def test_self_check_fails_on_crash(tmp_path: Path):
+    """If risk.evaluate raises, orchestrator emits ORCHESTRATOR_CRASH and risk
+    stage never signals ADMITTED/REJECTED → self-check times out → FAIL."""
+    bus = EventBus()
+    await bus.start()
+
+    class _CrashPolicy:
+        async def evaluate(self, intent):  # noqa: ARG002
+            raise RuntimeError("risk subsystem crashed")
+
+    orch = Orchestrator(bus=bus, policy=_CrashPolicy(), attribution=None, paper_mode=True)  # type: ignore[arg-type]
+    await orch.start()
+
+    seen: list[Event] = []
+
+    async def cap(ev: Event) -> None:
+        seen.append(ev)
+
+    await bus.subscribe("cap", on_event=cap)
+    try:
+        result = await run_self_check(bus=bus, attribution=None, timeout_sec=0.75)
+        await asyncio.sleep(0.05)
+    finally:
+        await bus.unsubscribe("cap")
+        await orch.stop()
+        await bus.stop()
+
+    assert result["kind"] == "fail", result
+    # ORCHESTRATOR_CRASH must have been published by the orchestrator.
+    crashes = [
+        e for e in seen
+        if e.event_type is EventType.ERROR
+        and e.payload.get("kind") == "ORCHESTRATOR_CRASH"
+    ]
+    assert len(crashes) >= 1
+    kinds = [e.event_type for e in seen]
+    assert EventType.SELF_CHECK_FAIL in kinds

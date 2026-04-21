@@ -10,8 +10,15 @@ exits non-zero and systemd surfaces the failure.
 
 Verification (all must fire within ``timeout_sec`` of injection):
   (a) INTENT_EMITTED     — for the self-check intent_id
-  (b) INTENT_ADMITTED or GATE_REJECTED — risk policy ran
-  (c) FILL               — paper fill produced (only if admitted)
+  (b) INTENT_ADMITTED    — risk policy ran AND admitted. A GATE_REJECTED
+                           on the synthetic intent means the risk policy
+                           is misconfigured (the synthetic basket is
+                           constructed to clear all 14 gates); self-check
+                           MUST fail in that case. Phase 4.6 fix:
+                           previously GATE_REJECTED short-circuited the
+                           fill waiter and the daemon reported healthy
+                           while nothing downstream ran.
+  (c) FILL               — paper fill produced
   (d) attribution row    — via AttributionTracker.get_record
 
 On success publishes SELF_CHECK_OK with per-stage latencies.
@@ -129,10 +136,16 @@ async def run_self_check(
                 and not stage_events["risk"].is_set():
             stages["risk_ms"] = (time.perf_counter() - t0) * 1000.0
             observed["risk_outcome"] = ev.event_type.value
-            stage_events["risk"].set()
             if ev.event_type is EventType.GATE_REJECTED:
-                # No fill will come; unblock fill waiter to short-circuit.
-                stage_events["fill"].set()
+                # Record the rejecting gate so the failure message is
+                # actionable. We intentionally do NOT unblock the fill
+                # waiter here — the correctly-configured synthetic intent
+                # should be admitted. A reject is a failure of the
+                # pipeline verification, and the timeout path will report
+                # the gate name below.
+                observed["reject_gate"] = ev.payload.get("gate")
+                observed["reject_reason"] = ev.payload.get("reason")
+            stage_events["risk"].set()
         elif ev.event_type is EventType.FILL and not stage_events["fill"].is_set():
             stages["fill_ms"] = (time.perf_counter() - t0) * 1000.0
             stage_events["fill"].set()
@@ -163,6 +176,26 @@ async def run_self_check(
                 timeout=timeout_sec,
             )
         except asyncio.TimeoutError:
+            # If risk fired but with GATE_REJECTED, prefer the actionable
+            # "gate rejected" message over the generic timeout list.
+            if observed.get("risk_outcome") == EventType.GATE_REJECTED.value:
+                reject_gate = observed.get("reject_gate") or "<unknown>"
+                reason = (
+                    f"synthetic intent was rejected — risk gates are "
+                    f"misconfigured: {reject_gate}"
+                )
+                if observed.get("reject_reason"):
+                    reason += f" ({observed['reject_reason']})"
+                result = {
+                    "kind": "fail",
+                    "reason": reason,
+                    "stages_ms": dict(stages),
+                    "observed": dict(observed),
+                    "intent_id": intent.intent_id,
+                    "timeout_sec": timeout_sec,
+                }
+                await _emit_fail(bus, result)
+                return result
             missing = [k for k, e in stage_events.items() if not e.is_set()]
             result = {
                 "kind": "fail",
@@ -171,6 +204,27 @@ async def run_self_check(
                 "observed": dict(observed),
                 "intent_id": intent.intent_id,
                 "timeout_sec": timeout_sec,
+            }
+            await _emit_fail(bus, result)
+            return result
+
+        # Risk stage must have ADMITTED (not rejected) — the synthetic
+        # basket is constructed to clear all 14 gates, so a rejection
+        # means the policy is misconfigured and the daemon must fail.
+        if observed.get("risk_outcome") != EventType.INTENT_ADMITTED.value:
+            reject_gate = observed.get("reject_gate") or "<unknown>"
+            reason = (
+                f"synthetic intent was rejected — risk gates are "
+                f"misconfigured: {reject_gate}"
+            )
+            if observed.get("reject_reason"):
+                reason += f" ({observed['reject_reason']})"
+            result = {
+                "kind": "fail",
+                "reason": reason,
+                "stages_ms": dict(stages),
+                "observed": dict(observed),
+                "intent_id": intent.intent_id,
             }
             await _emit_fail(bus, result)
             return result

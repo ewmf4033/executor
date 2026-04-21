@@ -100,6 +100,7 @@ class Orchestrator:
         self.n_admitted = 0
         self.n_rejected = 0
         self.n_filled_legs = 0
+        self.n_intent_crashes = 0
         self._subscription = None
 
     async def start(self) -> None:
@@ -120,20 +121,55 @@ class Orchestrator:
         try:
             intent = deserialize_intent(event.payload)
         except Exception as exc:
+            # Undecodable — never a valid intent, so do NOT increment
+            # n_intents_received. Still publish an ERROR so the gap is
+            # visible downstream (self-check, audit queries).
             log.error("orchestrator.decode_failed", error=str(exc), event_id=event.event_id)
+            payload_intent_id = None
+            try:
+                payload_intent_id = event.payload.get("intent_id")
+            except Exception:
+                pass
+            await self._emit_crash(
+                stage="deserialize",
+                intent_id=event.intent_id or payload_intent_id,
+                exc=exc,
+                strategy_id=event.strategy_id,
+            )
             return
         self.n_intents_received += 1
         try:
-            if self._attr is not None:
+            if self._attr is not None and intent.legs:
                 # Use the YES leg's price_limit as the "decision_price" proxy.
-                if intent.legs:
+                try:
                     self._attr.note_decision(intent.intent_id, intent.legs[0].price_limit)
+                except Exception as exc:
+                    self.n_intent_crashes += 1
+                    log.error(
+                        "orchestrator.note_decision.crash",
+                        intent_id=intent.intent_id,
+                        error=str(exc),
+                    )
+                    await self._emit_crash(
+                        stage="note_decision",
+                        intent_id=intent.intent_id,
+                        exc=exc,
+                        strategy_id=intent.strategy_id,
+                    )
+                    return
             verdict: RiskVerdict = await self._policy.evaluate(intent)
         except Exception as exc:
+            self.n_intent_crashes += 1
             log.error(
                 "orchestrator.risk.crash",
                 intent_id=intent.intent_id,
                 error=str(exc),
+            )
+            await self._emit_crash(
+                stage="risk_evaluate",
+                intent_id=intent.intent_id,
+                exc=exc,
+                strategy_id=intent.strategy_id,
             )
             return
         if not verdict.admitted:
@@ -142,6 +178,37 @@ class Orchestrator:
         self.n_admitted += 1
         if self._paper_mode:
             await self._paper_fill(verdict.intent)
+
+    async def _emit_crash(
+        self,
+        *,
+        stage: str,
+        intent_id: str | None,
+        exc: BaseException,
+        strategy_id: str | None = None,
+        gate: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "kind": "ORCHESTRATOR_CRASH",
+            "stage": stage,
+            "intent_id": intent_id,
+            "error": str(exc),
+            "exc_type": type(exc).__name__,
+        }
+        if gate is not None:
+            payload["gate"] = gate
+        try:
+            await self._bus.publish(
+                Event.make(
+                    EventType.ERROR,
+                    source=Source.EXECUTOR,
+                    intent_id=intent_id,
+                    strategy_id=strategy_id,
+                    payload=payload,
+                )
+            )
+        except Exception as publish_exc:  # pragma: no cover
+            log.error("orchestrator.crash_emit_failed", error=str(publish_exc))
 
     async def _paper_fill(self, intent: BasketIntent) -> None:
         """
@@ -233,9 +300,23 @@ class Orchestrator:
         )
 
     def stats(self) -> dict[str, int]:
+        # Invariant: every received intent ends up in exactly one of
+        # admitted / rejected / crashed. Violations indicate a dropped
+        # intent somewhere in _on_event.
+        assert (
+            self.n_intents_received
+            == self.n_admitted + self.n_rejected + self.n_intent_crashes
+        ), (
+            f"orchestrator stats invariant broken: "
+            f"received={self.n_intents_received} "
+            f"admitted={self.n_admitted} "
+            f"rejected={self.n_rejected} "
+            f"crashed={self.n_intent_crashes}"
+        )
         return {
             "intents_received": self.n_intents_received,
             "admitted": self.n_admitted,
             "rejected": self.n_rejected,
             "filled_legs": self.n_filled_legs,
+            "intent_crashes": self.n_intent_crashes,
         }

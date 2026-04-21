@@ -148,6 +148,11 @@ class DaemonService:
              "self_check_yes": frozenset({"supports_limit"}),
              "self_check_no": frozenset({"supports_limit"})}
         )
+        # Bootstrap the self-check synthetic markets into the policy's
+        # market_universe so the StructuralGate admits the synthetic
+        # intent deterministically. Phase 4.6: previously the self-check
+        # "passed" via GATE_REJECTED short-circuit, masking gate misconfig.
+        self.policy.register_self_check_markets()
 
         # Bus must be pumping before orchestrator subscribes.
         await self.bus.start()

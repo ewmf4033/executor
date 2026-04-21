@@ -107,6 +107,20 @@ class RiskPolicy:
     def set_market_universe(self, markets: Iterable[tuple[str, str]]) -> None:
         self.market_universe = set(markets)
 
+    def register_self_check_markets(self) -> None:
+        """Bootstrap concession for the startup self-check synthetic markets only.
+
+        Ensures (self_check_yes, SCYES) and (self_check_no, SCNO) clear the
+        StructuralGate's market-existence check so the synthetic basket is
+        deterministically admittable. Called from DaemonService.start()
+        before run_startup_self_check — real-market registration is wired
+        separately (and will land in a later phase). Do NOT rely on this
+        for production markets."""
+        if self.market_universe is None:
+            self.market_universe = set()
+        self.market_universe.add(("self_check_yes", "SCYES"))
+        self.market_universe.add(("self_check_no", "SCNO"))
+
     def set_venue_capabilities(self, caps: dict[str, Iterable[str]]) -> None:
         self.venue_capabilities = {v: frozenset(c) for v, c in caps.items()}
 
