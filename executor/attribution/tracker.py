@@ -151,6 +151,8 @@ class AttributionTracker:
         # Decision/arrival prices we've recorded ahead of fills.
         self._decision: dict[str, Decimal] = {}             # intent_id -> mid
         self._arrival: dict[tuple[str, str], Decimal] = {}  # (intent_id, leg_id) -> mid
+        # Phase 4.9 Item 3: per-intent insertion ts for the max-age sweeper.
+        self._decision_ts_ns: dict[str, int] = {}
         self._latest_mid: dict[tuple[str, str], Decimal] = {}  # (venue, market_id) -> mid
         self._pending: list[_PendingFill] = []
         self._lock = asyncio.Lock()
@@ -174,9 +176,58 @@ class AttributionTracker:
 
     def note_decision(self, intent_id: str, decision_price: Decimal) -> None:
         self._decision[intent_id] = Decimal(str(decision_price))
+        self._decision_ts_ns[intent_id] = time.time_ns()
 
     def note_arrival(self, intent_id: str, leg_id: str, arrival_price: Decimal) -> None:
         self._arrival[(intent_id, leg_id)] = Decimal(str(arrival_price))
+        # Treat arrival as extending the intent's "active" window.
+        self._decision_ts_ns.setdefault(intent_id, time.time_ns())
+
+    # ------------------------------------------------------------------
+    # Phase 4.9 Item 3: pruning — prevent unbounded growth of the decision
+    # / arrival in-memory caches. Called from the orchestrator whenever an
+    # intent reaches a terminal state (FILLED / REJECTED_FINAL / EXPIRED).
+    # ------------------------------------------------------------------
+
+    def prune_intent(self, intent_id: str) -> int:
+        """Remove all cached decision + arrival prices for this intent.
+        Returns the number of entries removed (useful for tests). Safe to
+        call with an unknown intent_id — it's a no-op then."""
+        removed = 0
+        if self._decision.pop(intent_id, None) is not None:
+            removed += 1
+        self._decision_ts_ns.pop(intent_id, None)
+        # Remove every (intent_id, leg_id) key for this intent.
+        dead = [k for k in self._arrival if k[0] == intent_id]
+        for k in dead:
+            self._arrival.pop(k, None)
+            removed += 1
+        return removed
+
+    def prune_older_than(
+        self, *, max_age_sec: float, now_ns: int | None = None
+    ) -> int:
+        """Sweep intents whose decision/arrival records are older than
+        `max_age_sec`. Used as a safety net for the rare case where a
+        terminal-state notification is dropped (bus crash, orchestrator
+        bug). Returns count of intents pruned."""
+        now_ns = now_ns or time.time_ns()
+        cutoff_ns = now_ns - int(max_age_sec * 1_000_000_000)
+        stale = [iid for iid, ts in self._decision_ts_ns.items() if ts < cutoff_ns]
+        total = 0
+        for iid in stale:
+            total += self.prune_intent(iid)
+        # Also sweep orphaned (intent, leg) pairs whose intent has no
+        # decision_ts anchor — these can only exist if note_arrival was
+        # called without note_decision, which is not expected, but guard.
+        orphan_intents = {
+            k[0] for k in self._arrival if k[0] not in self._decision_ts_ns
+        }
+        for iid in orphan_intents:
+            # Best-effort: we don't know ts for these, so sweep
+            # unconditionally when their owning intent is gone.
+            self.prune_intent(iid)
+        return total
 
     def update_mid(self, venue: str, market_id: str, mid: Decimal) -> None:
         self._latest_mid[(venue, market_id)] = Decimal(str(mid))

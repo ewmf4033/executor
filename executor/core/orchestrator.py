@@ -179,10 +179,31 @@ class Orchestrator:
             return
         if not verdict.admitted:
             self.n_rejected += 1
+            # Phase 4.9 Item 3: terminal state — prune attribution caches
+            # so rejected intents don't accumulate forever in _decision.
+            if self._attr is not None:
+                try:
+                    self._attr.prune_intent(intent.intent_id)
+                except Exception as exc:  # pragma: no cover
+                    log.warning(
+                        "orchestrator.prune_on_reject_failed",
+                        intent_id=intent.intent_id,
+                        error=str(exc),
+                    )
             return
         self.n_admitted += 1
         if self._paper_mode:
             await self._paper_fill(verdict.intent)
+            # Phase 4.9 Item 3: paper fill is immediate/complete → terminal.
+            if self._attr is not None:
+                try:
+                    self._attr.prune_intent(verdict.intent.intent_id)
+                except Exception as exc:  # pragma: no cover
+                    log.warning(
+                        "orchestrator.prune_on_fill_failed",
+                        intent_id=verdict.intent.intent_id,
+                        error=str(exc),
+                    )
 
     async def _emit_crash(
         self,
@@ -193,6 +214,13 @@ class Orchestrator:
         strategy_id: str | None = None,
         gate: str | None = None,
     ) -> None:
+        # Phase 4.9 Item 3: a crashed intent won't receive further lifecycle
+        # events, so prune the attribution caches to avoid leaks.
+        if intent_id is not None and self._attr is not None:
+            try:
+                self._attr.prune_intent(intent_id)
+            except Exception:  # pragma: no cover
+                pass
         payload: dict[str, Any] = {
             "kind": "ORCHESTRATOR_CRASH",
             "stage": stage,

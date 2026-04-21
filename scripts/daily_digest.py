@@ -13,14 +13,64 @@ Exit codes: 0 = success, 1 = error.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import errno
+import fcntl
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
+
+
+DEFAULT_LOCKFILE = "/var/run/executor-digest.lock"
+DEFAULT_TG_FAIL_FLAG = "/var/run/executor-digest-telegram-last-failed"
+
+
+@contextlib.contextmanager
+def _acquire_lock(lockfile: str):
+    """Acquire an exclusive non-blocking flock on `lockfile`.
+
+    Yields True if the lock was acquired, False if another digest is
+    already running. Does not raise on EACCES (e.g., unwritable
+    /var/run in tests) — logs a warning and proceeds without locking.
+    """
+    fd = None
+    got_lock = False
+    try:
+        try:
+            fd = os.open(lockfile, os.O_CREAT | os.O_WRONLY, 0o644)
+        except OSError as exc:
+            print(
+                f"warn: cannot open lockfile {lockfile}: {exc}; proceeding without lock",
+                file=sys.stderr,
+            )
+            yield True
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got_lock = True
+            yield True
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                yield False
+            else:
+                raise
+    finally:
+        if fd is not None:
+            if got_lock:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            try:
+                os.close(fd)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +376,10 @@ def main() -> int:
                         help="Directory to save digest JSON files")
     parser.add_argument("--date", default=None,
                         help="Target date YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--lockfile", default=DEFAULT_LOCKFILE,
+                        help="Lockfile path for run-at-a-time enforcement")
+    parser.add_argument("--tg-fail-flag", default=DEFAULT_TG_FAIL_FLAG,
+                        help="Flag file written when Telegram send fails")
     args = parser.parse_args()
 
     # Determine target date (yesterday by default)
@@ -334,31 +388,42 @@ def main() -> int:
     else:
         target_date = dt.date.today() - dt.timedelta(days=1)
 
-    try:
-        # Collect data
-        audit = collect_audit_data(args.audit_dir, target_date)
-        attr = collect_attribution_data(args.attr_db, target_date)
-        system = collect_system_data() if not args.dry_run else {
-            "executor_uptime_h": None, "data_recorder_status": None,
-        }
-        trend = load_rolling_history(args.digest_dir, target_date,
-                                     {**audit, "fill_count": attr["fill_count"]})
+    # Phase 4.9 Item 4: serialize runs via flock. A concurrent run exits
+    # cleanly (0) — not an error — since the other process is doing the work.
+    with _acquire_lock(args.lockfile) as got_lock:
+        if not got_lock:
+            print("digest already running, exiting", file=sys.stderr)
+            return 0
 
-        # Format message
-        message = format_message(target_date, audit, attr, system, trend)
+        # Phase 4.9 Item 5: data-collection / write failures return 1;
+        # Telegram notification failures do NOT — they log a flag file.
+        try:
+            audit = collect_audit_data(args.audit_dir, target_date)
+            attr = collect_attribution_data(args.attr_db, target_date)
+            system = collect_system_data() if not args.dry_run else {
+                "executor_uptime_h": None, "data_recorder_status": None,
+            }
+            trend = load_rolling_history(args.digest_dir, target_date,
+                                         {**audit, "fill_count": attr["fill_count"]})
+            message = format_message(target_date, audit, attr, system, trend)
 
-        # Save digest JSON
-        digest_data = {
-            **audit,
-            **{k: v for k, v in attr.items()},
-            "system": system,
-            "target_date": target_date.isoformat(),
-        }
-        digest_path = Path(args.digest_dir)
-        digest_path.mkdir(parents=True, exist_ok=True)
-        json_file = digest_path / f"digest-{target_date.isoformat()}.json"
-        with open(json_file, "w") as f:
-            json.dump(digest_data, f, indent=2)
+            # Save digest JSON — atomic temp-rename so a concurrent reader
+            # never sees a half-written file.
+            digest_data = {
+                **audit,
+                **{k: v for k, v in attr.items()},
+                "system": system,
+                "target_date": target_date.isoformat(),
+            }
+            digest_path = Path(args.digest_dir)
+            digest_path.mkdir(parents=True, exist_ok=True)
+            json_file = digest_path / f"digest-{target_date.isoformat()}.json"
+            _write_json_atomic(json_file, digest_data)
+        except Exception as exc:
+            print(f"ERROR: digest collection/write failed: {exc}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return 1
 
         # Output
         print(f"Digest for {target_date.isoformat()}")
@@ -367,12 +432,22 @@ def main() -> int:
         print("=" * 50)
         print(f"Digest JSON saved to {json_file}")
 
-        # Send Telegram
+        # Telegram — best-effort; failure here does NOT fail the run.
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         if token and chat_id and not args.dry_run:
-            _send_telegram(message, token, chat_id)
-            print("Telegram message sent.")
+            try:
+                _send_telegram(message, token, chat_id)
+                print("Telegram message sent.")
+                # Clear the flag on success so monitors can notice the
+                # recovery (persistent failure = flag remains).
+                _clear_flag(args.tg_fail_flag)
+            except Exception as exc:
+                print(
+                    f"warn: telegram send failed: {exc}; digest JSON was still written",
+                    file=sys.stderr,
+                )
+                _write_flag(args.tg_fail_flag, str(exc))
         elif args.dry_run:
             print("Dry run — Telegram skipped.")
         else:
@@ -380,11 +455,39 @@ def main() -> int:
 
         return 0
 
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Write JSON via temp file + os.rename so readers never see a partial file."""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        delete=False,
+        dir=str(path.parent),
+        prefix=path.name + ".",
+        suffix=".tmp",
+    )
+    try:
+        json.dump(data, tmp, indent=2)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    finally:
+        tmp.close()
+    os.rename(tmp.name, str(path))
+
+
+def _write_flag(flag_path: str, reason: str) -> None:
+    try:
+        p = Path(flag_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{dt.datetime.now(dt.timezone.utc).isoformat()} {reason}\n")
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        return 1
+        print(f"warn: could not write flag {flag_path}: {exc}", file=sys.stderr)
+
+
+def _clear_flag(flag_path: str) -> None:
+    try:
+        Path(flag_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

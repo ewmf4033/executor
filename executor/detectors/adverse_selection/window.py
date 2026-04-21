@@ -31,10 +31,20 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Awaitable, Callable, Deque, Optional
 
+from typing import TYPE_CHECKING
+
 from ...core.events import Event, EventType, Source
 from ...core.logging import get_logger
 from ...core.types import Side
 from .base import AdverseSelectionDetector, AdverseSelectionFlag
+
+if TYPE_CHECKING:
+    from ...risk.state import RiskState
+
+
+# Sentinel used for durable (no-TTL) pauses. ~2262-04-11; larger than any
+# realistic now_ns so is_venue_paused returns True indefinitely.
+_DURABLE_PAUSED_SENTINEL_NS = 2**62
 
 
 log = get_logger("executor.detectors.adverse_selection")
@@ -79,6 +89,7 @@ class WindowAdverseSelectionDetector(AdverseSelectionDetector):
         move_threshold_sigma: float = 2.0,
         pause_sec: int = 300,
         publish: Publish | None = None,
+        state: "RiskState | None" = None,
     ) -> None:
         self.window = window
         self.adverse_threshold = adverse_threshold
@@ -90,6 +101,34 @@ class WindowAdverseSelectionDetector(AdverseSelectionDetector):
         # We only track per-market flags here; broader strategy/market scoping
         # is the caller's job.
         self._flagged_markets: set[str] = set()
+        # Phase 4.9 Item 2: durable pause persistence. When a RiskState is
+        # attached, every pause/clear mirrors into adverse_selection_pauses
+        # so pauses survive daemon restart.
+        self._state: "RiskState | None" = state
+
+    def set_state(self, state: "RiskState") -> None:
+        """Late-binding for DaemonService: detector is constructed before
+        RiskState.load() completes."""
+        self._state = state
+
+    def load_from_state(self, state: "RiskState") -> None:
+        """Rehydrate in-memory pause set from the durable table. Called by
+        DaemonService at startup so venues paused before a restart stay paused.
+        Rehydrated pauses have no TTL — paused_until_ns is a far-future
+        sentinel so is_venue_paused stays True until clear_venue() runs."""
+        self._state = state
+        rows = state.list_adverse_pauses()
+        for row in rows:
+            venue = row["venue"]
+            rec = self._venues.setdefault(venue, _VenueWindow())
+            rec.paused_until_ns = _DURABLE_PAUSED_SENTINEL_NS
+            log.warning(
+                "risk.adverse_selection.rehydrated",
+                venue=venue,
+                paused_at_ns=row["paused_at_ns"],
+                reason=row["reason"],
+                source_market_id=row["source_market_id"],
+            )
 
     # ------------------------------------------------------------------
     # Gate-3 interface
@@ -126,6 +165,16 @@ class WindowAdverseSelectionDetector(AdverseSelectionDetector):
         if rec is not None:
             rec.paused_until_ns = 0
             rec.last_anomaly_score = 0.0
+        # Phase 4.9 Item 2: remove durable pause row if present.
+        if self._state is not None:
+            try:
+                self._state.clear_adverse_pause(venue)
+            except Exception as exc:
+                log.warning(
+                    "risk.adverse_selection.clear_persist_failed",
+                    venue=venue,
+                    error=str(exc),
+                )
 
     # ------------------------------------------------------------------
     # Observation feeds
@@ -236,10 +285,32 @@ class WindowAdverseSelectionDetector(AdverseSelectionDetector):
         # Already paused? Don't re-fire.
         if rec.paused_until_ns > now_ns:
             return None
-        rec.paused_until_ns = now_ns + self.pause_sec * 1_000_000_000
+        # Phase 4.9 Item 2: pauses are durable (no automatic TTL). A paused
+        # venue stays paused until an operator explicitly calls clear_venue.
+        # The sentinel keeps is_venue_paused() True across any realistic
+        # wall-clock, including tests that pass an old now_ns.
+        rec.paused_until_ns = _DURABLE_PAUSED_SENTINEL_NS
         rec.last_anomaly_score = ratio
         # Flag the market that triggered the latest decision for the gate too.
         self._flagged_markets.add(market_id)
+        # Phase 4.9 Item 2: persist the pause so it survives daemon restart.
+        if self._state is not None:
+            try:
+                self._state.save_adverse_pause(
+                    venue=venue,
+                    paused_at_ns=now_ns,
+                    reason=(
+                        f"{adverse_count}/{len(decided)} fills "
+                        f">= {self.move_threshold_sigma}σ adverse"
+                    ),
+                    source_market_id=market_id,
+                )
+            except Exception as exc:
+                log.warning(
+                    "risk.adverse_selection.persist_failed",
+                    venue=venue,
+                    error=str(exc),
+                )
         flag = AdverseSelectionFlag(
             strategy_id="*",
             market_id=market_id,

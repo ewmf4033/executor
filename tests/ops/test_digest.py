@@ -230,3 +230,175 @@ def test_digest_saves_json(tmp_path: Path) -> None:
     assert data["target_date"] == target_date.isoformat()
     assert data["event_counts"]["INTENT_EMITTED"] == 3
     assert data["fill_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.9 Items 4 + 5: lock contention, atomic writes, exit status.
+# ---------------------------------------------------------------------------
+
+
+def _run_digest_with_lock(
+    tmp_path: Path, target_date: dt.date, *, lockfile: Path, tg_fail_flag: Path,
+    env_overrides: dict | None = None,
+) -> subprocess.CompletedProcess:
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir(exist_ok=True)
+    digest_dir = tmp_path / "digests"
+    digest_dir.mkdir(exist_ok=True)
+    attr_db = tmp_path / "attribution.sqlite"
+    if not (audit_dir / f"audit-{target_date.isoformat()}.sqlite").exists():
+        _create_audit_db(audit_dir / f"audit-{target_date.isoformat()}.sqlite", target_date)
+        _create_attribution_db(attr_db, target_date)
+    env = dict(_BASE_ENV)
+    if env_overrides:
+        env.update(env_overrides)
+    return subprocess.run(
+        [
+            VENV_PYTHON, DIGEST_SCRIPT, "--dry-run",
+            "--audit-dir", str(audit_dir),
+            "--attr-db", str(attr_db),
+            "--digest-dir", str(digest_dir),
+            "--date", target_date.isoformat(),
+            "--lockfile", str(lockfile),
+            "--tg-fail-flag", str(tg_fail_flag),
+        ],
+        capture_output=True, text=True, timeout=30,
+        env=env,
+    )
+
+
+@pytest.mark.slow
+def test_digest_acquires_lock_successfully(tmp_path: Path) -> None:
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    lockfile = tmp_path / "digest.lock"
+    tg_flag = tmp_path / "tg.flag"
+    result = _run_digest_with_lock(tmp_path, target_date, lockfile=lockfile, tg_fail_flag=tg_flag)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert lockfile.exists()
+
+
+@pytest.mark.slow
+def test_second_digest_run_fails_lock_exits_zero(tmp_path: Path) -> None:
+    import fcntl as _fcntl
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    lockfile = tmp_path / "digest.lock"
+    tg_flag = tmp_path / "tg.flag"
+    # Hold the lock in this process while we invoke digest.
+    with open(lockfile, "w") as held:
+        _fcntl.flock(held.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        result = _run_digest_with_lock(
+            tmp_path, target_date, lockfile=lockfile, tg_fail_flag=tg_flag,
+        )
+    assert result.returncode == 0, f"expected 0 on lock contention, got {result.returncode}: {result.stderr}"
+    assert "already running" in (result.stdout + result.stderr)
+
+
+@pytest.mark.slow
+def test_digest_writes_atomically_via_temp_rename(tmp_path: Path) -> None:
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    lockfile = tmp_path / "digest.lock"
+    tg_flag = tmp_path / "tg.flag"
+    result = _run_digest_with_lock(tmp_path, target_date, lockfile=lockfile, tg_fail_flag=tg_flag)
+    assert result.returncode == 0
+    json_path = tmp_path / "digests" / f"digest-{target_date.isoformat()}.json"
+    assert json_path.exists()
+    # No leftover tmp files in digests dir.
+    tmps = list((tmp_path / "digests").glob("*.tmp"))
+    assert tmps == [], f"stray tmp files: {tmps}"
+
+
+@pytest.mark.slow
+def test_digest_exits_zero_on_telegram_failure(tmp_path: Path) -> None:
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    lockfile = tmp_path / "digest.lock"
+    tg_flag = tmp_path / "tg.flag"
+    # Provide bogus token/chat_id + disable --dry-run so Telegram path
+    # actually runs and fails. Point token at an unreachable host via env.
+    env = {
+        **_BASE_ENV,
+        "TELEGRAM_BOT_TOKEN": "bogus",
+        "TELEGRAM_CHAT_ID": "1",
+    }
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir(exist_ok=True)
+    digest_dir = tmp_path / "digests"
+    digest_dir.mkdir(exist_ok=True)
+    attr_db = tmp_path / "attribution.sqlite"
+    _create_audit_db(audit_dir / f"audit-{target_date.isoformat()}.sqlite", target_date)
+    _create_attribution_db(attr_db, target_date)
+    # Run without --dry-run to exercise the Telegram branch. The bogus
+    # token will cause api.telegram.org to return an error — which must
+    # still yield exit 0 since the JSON was written.
+    result = subprocess.run(
+        [
+            VENV_PYTHON, DIGEST_SCRIPT,
+            "--audit-dir", str(audit_dir),
+            "--attr-db", str(attr_db),
+            "--digest-dir", str(digest_dir),
+            "--date", target_date.isoformat(),
+            "--lockfile", str(lockfile),
+            "--tg-fail-flag", str(tg_flag),
+        ],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert result.returncode == 0, f"expected 0 despite tg failure: {result.stderr}"
+
+
+@pytest.mark.slow
+def test_digest_exits_one_on_collection_failure(tmp_path: Path) -> None:
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    lockfile = tmp_path / "digest.lock"
+    tg_flag = tmp_path / "tg.flag"
+    # Use a digest-dir path that cannot be created (a file, not a dir).
+    bad_digest = tmp_path / "blocker"
+    bad_digest.write_text("not a directory")
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir(exist_ok=True)
+    _create_audit_db(audit_dir / f"audit-{target_date.isoformat()}.sqlite", target_date)
+    attr_db = tmp_path / "attribution.sqlite"
+    _create_attribution_db(attr_db, target_date)
+    result = subprocess.run(
+        [
+            VENV_PYTHON, DIGEST_SCRIPT, "--dry-run",
+            "--audit-dir", str(audit_dir),
+            "--attr-db", str(attr_db),
+            "--digest-dir", str(bad_digest),
+            "--date", target_date.isoformat(),
+            "--lockfile", str(lockfile),
+            "--tg-fail-flag", str(tg_flag),
+        ],
+        capture_output=True, text=True, timeout=30, env=_BASE_ENV,
+    )
+    assert result.returncode == 1, f"expected 1 on collection failure: rc={result.returncode}"
+
+
+@pytest.mark.slow
+def test_digest_writes_telegram_flag_on_failure(tmp_path: Path) -> None:
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    lockfile = tmp_path / "digest.lock"
+    tg_flag = tmp_path / "tg.flag"
+    env = {
+        **_BASE_ENV,
+        "TELEGRAM_BOT_TOKEN": "bogus",
+        "TELEGRAM_CHAT_ID": "1",
+    }
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir(exist_ok=True)
+    digest_dir = tmp_path / "digests"
+    digest_dir.mkdir(exist_ok=True)
+    attr_db = tmp_path / "attribution.sqlite"
+    _create_audit_db(audit_dir / f"audit-{target_date.isoformat()}.sqlite", target_date)
+    _create_attribution_db(attr_db, target_date)
+    subprocess.run(
+        [
+            VENV_PYTHON, DIGEST_SCRIPT,
+            "--audit-dir", str(audit_dir),
+            "--attr-db", str(attr_db),
+            "--digest-dir", str(digest_dir),
+            "--date", target_date.isoformat(),
+            "--lockfile", str(lockfile),
+            "--tg-fail-flag", str(tg_flag),
+        ],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert tg_flag.exists(), "telegram failure flag should have been written"

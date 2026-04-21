@@ -19,13 +19,19 @@ import gzip
 import json
 import os
 import sqlite3
+import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..core.events import Event
 from ..core.logging import get_logger
+
+if TYPE_CHECKING:
+    from ..kill.manager import KillManager
 
 
 log = get_logger("executor.audit")
@@ -54,20 +60,51 @@ CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(event_type, ts_ns);
 
 GZIP_AFTER_DAYS = 30
 
+DEFAULT_FAIL_THRESHOLD = 3
+
 
 class AuditWriter:
     """
     One writer per executor process. Owns a single sqlite3.Connection that
     is swapped at UTC-midnight rotation.
+
+    Phase 4.9 Item 1 (fail-closed): on.event tracks consecutive write
+    failures. After EXECUTOR_AUDIT_FAIL_THRESHOLD failures in a row (default
+    3), the kill switch is engaged (panic) so new intents stop flowing.
+    Escalation is emitted via stderr + direct Telegram (bypassing audit,
+    which is broken). Recovery is manual — operator restarts the daemon.
     """
 
-    def __init__(self, base_dir: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        base_dir: str | os.PathLike[str],
+        *,
+        kill_manager: "KillManager | None" = None,
+        fail_threshold: int | None = None,
+    ) -> None:
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._conn: sqlite3.Connection | None = None
         self._current_date: str | None = None     # YYYY-MM-DD
         self._lock = asyncio.Lock()
         self._started = False
+        # Fail-closed plumbing.
+        self._kill_manager: "KillManager | None" = kill_manager
+        if fail_threshold is None:
+            try:
+                fail_threshold = int(
+                    os.environ.get("EXECUTOR_AUDIT_FAIL_THRESHOLD", DEFAULT_FAIL_THRESHOLD)
+                )
+            except ValueError:
+                fail_threshold = DEFAULT_FAIL_THRESHOLD
+        self._fail_threshold = max(1, int(fail_threshold))
+        self._consecutive_write_failures = 0
+        self._audit_kill_engaged = False
+
+    def set_kill_manager(self, kill_manager: "KillManager") -> None:
+        """Late-binding for DaemonService: audit.start() runs before KillManager
+        exists, so we plumb the reference in afterwards."""
+        self._kill_manager = kill_manager
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -159,18 +196,72 @@ class AuditWriter:
         _insert_row(self._conn, row)
 
     async def on_event(self, event: Event) -> None:
-        """Adapter for EventBus.subscribe(on_event=...)."""
+        """Adapter for EventBus.subscribe(on_event=...).
+
+        Phase 4.9 Item 1: fail-closed on persistent write errors.
+        Tracks consecutive failures; at threshold, engages the kill switch
+        (panic) and emits a stderr + Telegram alert bypassing audit.
+        """
         try:
             await self.write(event)
         except Exception as exc:
-            # Never let audit failure take down the bus — log loud and move on.
-            # If audit is offline we want to know, but we do not stop trading.
-            log.error(
+            self._consecutive_write_failures += 1
+            log.warning(
                 "audit.write.crash",
                 event_type=event.event_type.value,
                 event_id=event.event_id,
                 error=str(exc),
+                consecutive_failures=self._consecutive_write_failures,
+                threshold=self._fail_threshold,
             )
+            if (
+                self._consecutive_write_failures >= self._fail_threshold
+                and not self._audit_kill_engaged
+            ):
+                self._audit_kill_engaged = True
+                await self._trigger_audit_kill(exc)
+            return
+        # Success path — reset the counter.
+        if self._consecutive_write_failures != 0:
+            log.info(
+                "audit.write.recovered",
+                after_failures=self._consecutive_write_failures,
+            )
+        self._consecutive_write_failures = 0
+
+    async def _trigger_audit_kill(self, last_exc: BaseException) -> None:
+        """Engage kill switch + emit stderr ERROR + direct Telegram alert.
+        Called exactly once per process lifetime (guarded by
+        _audit_kill_engaged). Never raises."""
+        reason = "audit_write_failed_threshold_exceeded"
+        msg = (
+            f"AUDIT_WRITE_FAILED: {self._consecutive_write_failures} consecutive "
+            f"audit write failures (threshold {self._fail_threshold}); "
+            f"last error: {last_exc!r}. Kill switch engaging (panic)."
+        )
+        # stderr first — guaranteed observable via systemd journal even if
+        # logging and telegram both fail.
+        try:
+            print(f"ERROR [executor.audit] {msg}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        log.error("audit.kill.triggered", reason=reason, msg=msg)
+        # Engage the kill switch (panic=True -> manual_only pinned).
+        if self._kill_manager is not None:
+            try:
+                await self._kill_manager.engage(
+                    _audit_kill_mode(),
+                    reason,
+                    source="audit",
+                    panic=True,
+                    cancel_open_orders=False,
+                )
+            except Exception as exc:
+                log.error("audit.kill.engage_failed", error=str(exc))
+        else:
+            log.error("audit.kill.no_kill_manager")
+        # Direct Telegram alert — bypasses the bus/audit entirely.
+        await asyncio.to_thread(_send_telegram_alert_direct, msg)
 
     # ------------------------------------------------------------------
     # Rotation + reaping
@@ -269,6 +360,45 @@ _INSERT_SQL = (
 
 def _insert_row(conn: sqlite3.Connection, row: tuple[Any, ...]) -> None:
     conn.execute(_INSERT_SQL, row)
+
+
+def _audit_kill_mode():
+    """Deferred import so audit/writer.py does not create an import cycle
+    with kill/manager.py at module load. Returns SOFT — the audit-kill
+    should stop new intents but not attempt venue cancels (which may
+    themselves be broken)."""
+    from ..kill.state import KillMode
+
+    return KillMode.SOFT
+
+
+def _send_telegram_alert_direct(text: str) -> None:
+    """Synchronous, best-effort Telegram send that does NOT touch the bus
+    or audit. Used when audit itself is the failure — everything normal is
+    broken so we do the most primitive thing possible: stdlib urllib POST
+    with a short timeout. Env vars TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+    must be set or we no-op."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        body = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as exc:
+        # stderr fallback — do not re-enter log.error path (structlog may
+        # itself rely on channels that are unhealthy right now).
+        try:
+            print(
+                f"ERROR [executor.audit] telegram alert send failed: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
 
 
 def _gzip_file(src: Path, dst: Path) -> None:

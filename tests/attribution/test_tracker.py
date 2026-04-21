@@ -133,3 +133,63 @@ def test_pending_not_settled_before_horizon(tmp_path: Path) -> None:
     settled = asyncio.run(t.settle_due(now_ns=1 + 1_000_000_000))
     assert settled == []
     t.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.9 Item 3: pruning to prevent unbounded cache growth.
+# ---------------------------------------------------------------------------
+
+
+def test_prune_on_fill_clears_decision_and_arrival(tmp_path: Path) -> None:
+    t = _tracker(tmp_path)
+    t.note_decision("i1", Decimal("0.50"))
+    t.note_arrival("i1", "l1", Decimal("0.50"))
+    t.note_arrival("i1", "l2", Decimal("0.50"))
+    assert "i1" in t._decision
+    assert ("i1", "l1") in t._arrival
+    removed = t.prune_intent("i1")
+    assert removed == 3  # 1 decision + 2 arrivals
+    assert "i1" not in t._decision
+    assert ("i1", "l1") not in t._arrival
+    assert ("i1", "l2") not in t._arrival
+    t.close()
+
+
+def test_prune_on_reject_clears_caches(tmp_path: Path) -> None:
+    t = _tracker(tmp_path)
+    t.note_decision("rejected_intent", Decimal("0.40"))
+    assert "rejected_intent" in t._decision
+    t.prune_intent("rejected_intent")
+    assert "rejected_intent" not in t._decision
+    assert "rejected_intent" not in t._decision_ts_ns
+    t.close()
+
+
+def test_prune_on_expire_clears_caches(tmp_path: Path) -> None:
+    t = _tracker(tmp_path)
+    t.note_decision("expired", Decimal("0.60"))
+    t.note_arrival("expired", "leg0", Decimal("0.60"))
+    t.prune_intent("expired")
+    assert "expired" not in t._decision
+    assert not any(k[0] == "expired" for k in t._arrival)
+    t.close()
+
+
+def test_max_age_sweeper_prunes_orphans(tmp_path: Path) -> None:
+    t = _tracker(tmp_path)
+    t.note_decision("stale", Decimal("0.30"))
+    t.note_decision("fresh", Decimal("0.40"))
+    # Backdate "stale" to 2h old; leave "fresh" at now.
+    t._decision_ts_ns["stale"] = 10**12  # 1970 — definitely older than cutoff
+    pruned = t.prune_older_than(max_age_sec=3600.0)
+    assert pruned >= 1
+    assert "stale" not in t._decision
+    assert "fresh" in t._decision
+    t.close()
+
+
+def test_prune_noop_on_unknown_intent(tmp_path: Path) -> None:
+    t = _tracker(tmp_path)
+    # No crash, returns 0.
+    assert t.prune_intent("never-seen") == 0
+    t.close()

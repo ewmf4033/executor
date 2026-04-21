@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -80,3 +81,128 @@ async def test_rotation_uses_new_file_on_date_change():
         assert first == second or first.name != second.name
         # A file for 1999 should NOT exist (we rotated FROM it, but never wrote to it).
         assert not (Path(td) / "audit-1999-01-01.sqlite").exists() or True
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.9 Item 1: fail-closed on write errors.
+# ---------------------------------------------------------------------------
+
+
+class _FakeKillManager:
+    """Minimal KillManager stand-in: records engage() calls."""
+
+    def __init__(self) -> None:
+        self.engage_calls: list[dict] = []
+
+    async def engage(self, mode, reason, *, source="operator", panic=False, cancel_open_orders=True):
+        self.engage_calls.append(
+            {
+                "mode": mode,
+                "reason": reason,
+                "source": source,
+                "panic": panic,
+                "cancel_open_orders": cancel_open_orders,
+            }
+        )
+
+
+def _event() -> Event:
+    return Event.make(
+        EventType.INTENT_EMITTED,
+        source=Source.EXECUTOR,
+        payload={"x": 1},
+    )
+
+
+async def test_audit_write_failure_increments_counter():
+    with tempfile.TemporaryDirectory() as td:
+        w = AuditWriter(td, fail_threshold=99)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("disk full")):
+            await w.on_event(_event())
+            assert w._consecutive_write_failures == 1
+            await w.on_event(_event())
+            assert w._consecutive_write_failures == 2
+        assert w._audit_kill_engaged is False
+        await w.stop()
+
+
+async def test_audit_write_failure_resets_on_success():
+    with tempfile.TemporaryDirectory() as td:
+        w = AuditWriter(td, fail_threshold=99)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            await w.on_event(_event())
+            await w.on_event(_event())
+            assert w._consecutive_write_failures == 2
+        # Next call takes the real (working) path — counter resets.
+        await w.on_event(_event())
+        assert w._consecutive_write_failures == 0
+        await w.stop()
+
+
+async def test_audit_threshold_exceeded_triggers_kill():
+    with tempfile.TemporaryDirectory() as td:
+        km = _FakeKillManager()
+        w = AuditWriter(td, kill_manager=km, fail_threshold=3)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            await w.on_event(_event())
+            await w.on_event(_event())
+            assert len(km.engage_calls) == 0
+            await w.on_event(_event())
+        assert w._audit_kill_engaged is True
+        assert len(km.engage_calls) == 1
+        call = km.engage_calls[0]
+        assert call["panic"] is True
+        assert call["source"] == "audit"
+        assert "threshold" in call["reason"]
+        await w.stop()
+
+
+async def test_audit_kill_engaged_suppresses_rekill():
+    with tempfile.TemporaryDirectory() as td:
+        km = _FakeKillManager()
+        w = AuditWriter(td, kill_manager=km, fail_threshold=2)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            for _ in range(10):
+                await w.on_event(_event())
+        # engage() should have been invoked exactly once despite many failures.
+        assert len(km.engage_calls) == 1
+        await w.stop()
+
+
+async def test_telegram_alert_sent_on_audit_threshold(monkeypatch):
+    calls: list[str] = []
+
+    def fake_send(text: str) -> None:
+        calls.append(text)
+
+    monkeypatch.setattr(
+        "executor.audit.writer._send_telegram_alert_direct", fake_send
+    )
+    with tempfile.TemporaryDirectory() as td:
+        km = _FakeKillManager()
+        w = AuditWriter(td, kill_manager=km, fail_threshold=2)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            await w.on_event(_event())
+            await w.on_event(_event())
+        assert len(calls) == 1
+        assert "AUDIT_WRITE_FAILED" in calls[0]
+        await w.stop()
+
+
+async def test_set_kill_manager_late_binding():
+    """DaemonService wires kill_manager after audit.start()."""
+    with tempfile.TemporaryDirectory() as td:
+        km = _FakeKillManager()
+        w = AuditWriter(td, fail_threshold=2)
+        await w.start()
+        w.set_kill_manager(km)
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            await w.on_event(_event())
+            await w.on_event(_event())
+        assert len(km.engage_calls) == 1
+        await w.stop()

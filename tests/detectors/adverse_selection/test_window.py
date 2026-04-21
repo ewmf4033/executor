@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from pathlib import Path
+
+import pytest
 
 from executor.core.events import Event, EventType
 from executor.core.types import Side
 from executor.detectors.adverse_selection.window import (
     WindowAdverseSelectionDetector,
 )
+from executor.risk.state import RiskState
 
 
 def test_initial_state_unflagged() -> None:
@@ -165,3 +169,84 @@ def test_sell_side_adverse_direction_inverted() -> None:
         ))
         flag = flag or f
     assert flag is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.9 Item 2: durable pause persistence.
+# ---------------------------------------------------------------------------
+
+
+def _trip_pause(d: WindowAdverseSelectionDetector, venue: str = "kalshi") -> None:
+    """Helper — trip an adverse-selection pause for `venue`."""
+    for v in (Decimal("0.50"), Decimal("0.51"), Decimal("0.49"),
+              Decimal("0.50"), Decimal("0.51"), Decimal("0.50")):
+        d.observe_mid(venue, v)
+    base_ns = 10**12
+    for i in range(d.window):
+        asyncio.run(d.observe_fill(
+            venue=venue, market_id="m1", side=Side.BUY,
+            fill_price=Decimal("0.50"), fill_ts_ns=base_ns + i,
+        ))
+    drop_ns = base_ns + 70_000_000_000
+    for i in range(d.window):
+        asyncio.run(d.update_mark(
+            venue=venue, market_id="m1",
+            mid=Decimal("0.30"), now_ns=drop_ns + i,
+        ))
+
+
+async def _make_state(tmp_path: Path) -> RiskState:
+    state = RiskState(db_path=tmp_path / "risk.sqlite")
+    await state.load()
+    return state
+
+
+def test_pause_persists_across_restart(tmp_path: Path) -> None:
+    state_a = asyncio.run(_make_state(tmp_path))
+    d_a = WindowAdverseSelectionDetector(
+        window=2, adverse_threshold=0.5, move_threshold_sigma=0.5, state=state_a,
+    )
+    _trip_pause(d_a)
+    assert d_a.is_venue_paused("kalshi") is True
+    state_a.close()
+
+    # Detector B opens the same state DB fresh — no in-memory carry-over.
+    state_b = asyncio.run(_make_state(tmp_path))
+    d_b = WindowAdverseSelectionDetector(
+        window=2, adverse_threshold=0.5, move_threshold_sigma=0.5,
+    )
+    assert d_b.is_venue_paused("kalshi") is False  # before rehydrate
+    d_b.load_from_state(state_b)
+    assert d_b.is_venue_paused("kalshi") is True
+    state_b.close()
+
+
+def test_resume_clears_persisted_state(tmp_path: Path) -> None:
+    state_a = asyncio.run(_make_state(tmp_path))
+    d_a = WindowAdverseSelectionDetector(
+        window=2, adverse_threshold=0.5, move_threshold_sigma=0.5, state=state_a,
+    )
+    _trip_pause(d_a)
+    assert d_a.is_venue_paused("kalshi") is True
+    d_a.clear_venue("kalshi")
+    state_a.close()
+
+    state_b = asyncio.run(_make_state(tmp_path))
+    d_b = WindowAdverseSelectionDetector(
+        window=2, adverse_threshold=0.5, move_threshold_sigma=0.5,
+    )
+    d_b.load_from_state(state_b)
+    assert d_b.is_venue_paused("kalshi") is False
+    state_b.close()
+
+
+def test_load_from_empty_state_is_noop(tmp_path: Path) -> None:
+    state = asyncio.run(_make_state(tmp_path))
+    d = WindowAdverseSelectionDetector(
+        window=2, adverse_threshold=0.5, move_threshold_sigma=0.5,
+    )
+    # Should not crash on a fresh DB with no rows.
+    d.load_from_state(state)
+    assert d.is_venue_paused("kalshi") is False
+    assert state.list_adverse_pauses() == []
+    state.close()

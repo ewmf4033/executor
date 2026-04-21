@@ -95,6 +95,14 @@ CREATE TABLE IF NOT EXISTS strategy_exposures (
     dollars TEXT NOT NULL,
     updated_ts_ns INTEGER NOT NULL
 );
+-- Phase 4.9 Item 2: durable adverse-selection venue pauses. Pauses stay
+-- until explicit operator resume; no automatic TTL on the persisted row.
+CREATE TABLE IF NOT EXISTS adverse_selection_pauses (
+    venue TEXT PRIMARY KEY,
+    paused_at_ns INTEGER NOT NULL,
+    reason TEXT,
+    source_market_id TEXT
+);
 """
 
 
@@ -474,3 +482,48 @@ class RiskState:
         if row is None:
             return None, None
         return row[0], row[1]
+
+    # ------------------------------------------------------------------
+    # Phase 4.9 Item 2: durable adverse-selection venue pauses.
+    # Kept small + sync because pauses are rare and the detector is the
+    # only writer. No TTL — pauses remain until clear_adverse_pause.
+    # ------------------------------------------------------------------
+
+    def list_adverse_pauses(self) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT venue, paused_at_ns, reason, source_market_id "
+            "FROM adverse_selection_pauses"
+        ).fetchall()
+        return [
+            {
+                "venue": r[0],
+                "paused_at_ns": int(r[1]),
+                "reason": r[2],
+                "source_market_id": r[3],
+            }
+            for r in rows
+        ]
+
+    def save_adverse_pause(
+        self,
+        *,
+        venue: str,
+        paused_at_ns: int,
+        reason: str | None = None,
+        source_market_id: str | None = None,
+    ) -> None:
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO adverse_selection_pauses "
+            "(venue, paused_at_ns, reason, source_market_id) VALUES (?, ?, ?, ?)",
+            (venue, int(paused_at_ns), reason, source_market_id),
+        )
+        self._conn.commit()
+
+    def clear_adverse_pause(self, venue: str) -> None:
+        assert self._conn is not None
+        self._conn.execute(
+            "DELETE FROM adverse_selection_pauses WHERE venue = ?", (venue,)
+        )
+        self._conn.commit()

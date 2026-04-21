@@ -134,6 +134,9 @@ class DaemonService:
 
         self.kill_store = KillStateStore(self.kill_db)
         self.kill_mgr = KillManager(store=self.kill_store, publish=self.bus.publish)
+        # Phase 4.9 Item 1: plumb kill_mgr into AuditWriter so persistent
+        # audit write failures can engage the kill switch (fail-closed).
+        self.audit.set_kill_manager(self.kill_mgr)
 
         self.attribution = AttributionTracker(
             db_path=self.attribution_db,
@@ -144,9 +147,13 @@ class DaemonService:
         # Phase 4.7 F4: explicit adverse-selection detector required by
         # RiskPolicy. Use the real WindowAdverseSelectionDetector so the
         # venue-pause plumbing is exercised end-to-end.
+        # Phase 4.9 Item 2: pass risk_state so pauses persist to disk.
         self.adverse_selection = WindowAdverseSelectionDetector(
             publish=self.bus.publish,
+            state=self.risk_state,
         )
+        # Rehydrate any pauses that were active before daemon restart.
+        self.adverse_selection.load_from_state(self.risk_state)
         self.policy = RiskPolicy(
             config_manager=self.config_mgr,
             state=self.risk_state,
@@ -299,6 +306,10 @@ class DaemonService:
         self._bg_tasks.append(
             asyncio.create_task(self._attribution_settle_loop(), name="attribution-settle")
         )
+        # Phase 4.9 Item 3: periodic cache sweep for attribution leaks.
+        self._bg_tasks.append(
+            asyncio.create_task(self._attribution_sweep_loop(), name="attribution-sweep")
+        )
         await self._stop_event.wait()
 
     async def _quote_feeder(self) -> None:
@@ -358,6 +369,39 @@ class DaemonService:
                     return
                 except asyncio.TimeoutError:
                     pass
+        except asyncio.CancelledError:
+            raise
+
+    async def _attribution_sweep_loop(self) -> None:
+        """Phase 4.9 Item 3: periodic orphan pruner. Sweeps any intent whose
+        decision/arrival caches are older than EXECUTOR_ATTRIBUTION_MAX_AGE_HOURS
+        (default 48h). This is belt-and-suspenders — the orchestrator also
+        prunes on terminal states inline; the sweep only catches the edge
+        case where the terminal-state emit was missed."""
+        assert self.attribution is not None
+        try:
+            hours_env = os.environ.get("EXECUTOR_ATTRIBUTION_MAX_AGE_HOURS", "48")
+            try:
+                max_age_sec = float(hours_env) * 3600.0
+            except ValueError:
+                max_age_sec = 48.0 * 3600.0
+            # Run every 5 minutes per spec; first sweep after initial delay
+            # so startup isn't noisy.
+            interval_sec = 300.0
+            while not self._stop_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=interval_sec
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    pruned = self.attribution.prune_older_than(max_age_sec=max_age_sec)
+                    if pruned:
+                        log.info("daemon.attribution.swept", pruned=pruned)
+                except Exception as exc:
+                    log.warning("daemon.attribution.sweep_error", error=str(exc))
         except asyncio.CancelledError:
             raise
 
