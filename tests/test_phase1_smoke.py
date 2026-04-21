@@ -33,6 +33,10 @@ class FakeStrategy(Strategy):
     required_capabilities = {"kalshi": frozenset({"supports_limit"})}
     kelly_cap = Decimal("0.25")
 
+    @property
+    def markets(self) -> list[tuple[str, str]]:
+        return [("kalshi", "SMOKE-MARKET-1")]
+
     async def run(self) -> None:
         return None
 

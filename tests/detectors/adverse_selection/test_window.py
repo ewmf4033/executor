@@ -14,8 +14,9 @@ from executor.detectors.adverse_selection.window import (
 def test_initial_state_unflagged() -> None:
     d = WindowAdverseSelectionDetector(window=5, adverse_threshold=0.6, move_threshold_sigma=2.0)
     assert d.is_flagged(strategy_id="x", market_id="m1") is False
-    paused, _ = d.is_venue_paused("kalshi")
+    paused, _ = d.venue_pause_detail("kalshi")
     assert paused is False
+    assert d.is_venue_paused("kalshi") is False
 
 
 def test_threshold_trips_after_window_full() -> None:
@@ -43,7 +44,7 @@ def test_threshold_trips_after_window_full() -> None:
             mid=Decimal("0.30"), now_ns=drop_ns + i,
         ))
         last_flag = last_flag or flag
-    paused, _ = d.is_venue_paused("kalshi", now_ns=drop_ns + 1000)
+    paused, _ = d.venue_pause_detail("kalshi", now_ns=drop_ns + 1000)
     assert paused is True
     assert last_flag is not None
     assert d.is_flagged(strategy_id="x", market_id="m1") is True
@@ -67,7 +68,7 @@ def test_no_trip_when_movement_below_sigma() -> None:
             venue="kalshi", market_id="m1",
             mid=Decimal("0.495"), now_ns=drop_ns + i,
         ))
-    paused, _ = d.is_venue_paused("kalshi", now_ns=drop_ns + 100)
+    paused, _ = d.venue_pause_detail("kalshi", now_ns=drop_ns + 100)
     assert paused is False
 
 
@@ -87,10 +88,10 @@ def test_clear_venue_releases_pause() -> None:
             venue="kalshi", market_id="m1",
             mid=Decimal("0.30"), now_ns=drop_ns + i,
         ))
-    paused, _ = d.is_venue_paused("kalshi", now_ns=drop_ns + 1)
+    paused, _ = d.venue_pause_detail("kalshi", now_ns=drop_ns + 1)
     if paused:
         d.clear_venue("kalshi")
-    paused2, _ = d.is_venue_paused("kalshi", now_ns=drop_ns + 1)
+    paused2, _ = d.venue_pause_detail("kalshi", now_ns=drop_ns + 1)
     assert paused2 is False
 
 

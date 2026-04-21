@@ -45,6 +45,23 @@ class Strategy(ABC):
         self._log = get_logger(f"executor.strategy.{self.strategy_id}")
 
     # ------------------------------------------------------------------
+    # Market declaration — consumed by RiskPolicy.register_strategy_markets
+    # so the StructuralGate knows which (venue, market_id) pairs the
+    # strategy can legitimately trade. Phase 4.7: previously only the
+    # self-check synthetic markets were registered, causing K1/P1 etc.
+    # to be rejected as "market not found".
+    # ------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def markets(self) -> list[tuple[str, str]]:
+        """Return (venue, market_id) pairs this strategy can trade.
+
+        Each subclass must declare its markets. RiskPolicy adds these to
+        market_universe so the StructuralGate admits them.
+        """
+
+    # ------------------------------------------------------------------
     # Wiring — the executor calls this once at registration.
     # ------------------------------------------------------------------
 

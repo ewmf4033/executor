@@ -95,6 +95,15 @@ class YESNOCrossDetect(Strategy):
     # Quote intake
     # ------------------------------------------------------------------
 
+    @property
+    def markets(self) -> list[tuple[str, str]]:
+        """Both legs of each cross pair: YES venue and NO venue."""
+        out: list[tuple[str, str]] = []
+        for pair in self._pairs:
+            out.append((pair.yes_venue, pair.yes_market_id))
+            out.append((pair.no_venue, pair.no_market_id))
+        return out
+
     def accept_quote(
         self,
         *,

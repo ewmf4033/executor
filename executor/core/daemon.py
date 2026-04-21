@@ -34,6 +34,10 @@ from typing import Any
 
 from ..attribution.tracker import AttributionTracker
 from ..audit.writer import AuditWriter
+from ..detectors.adverse_selection import (
+    NullAdverseSelectionDetector,
+    WindowAdverseSelectionDetector,
+)
 from ..kill.manager import KillManager
 from ..kill.state import KillStateStore
 from ..risk.config import ConfigManager
@@ -137,9 +141,16 @@ class DaemonService:
             publish=self.bus.publish,
         )
 
+        # Phase 4.7 F4: explicit adverse-selection detector required by
+        # RiskPolicy. Use the real WindowAdverseSelectionDetector so the
+        # venue-pause plumbing is exercised end-to-end.
+        self.adverse_selection = WindowAdverseSelectionDetector(
+            publish=self.bus.publish,
+        )
         self.policy = RiskPolicy(
             config_manager=self.config_mgr,
             state=self.risk_state,
+            adverse_selection=self.adverse_selection,
             publish=self.bus.publish,
         )
         self.policy.set_venue_capabilities(
@@ -148,6 +159,19 @@ class DaemonService:
              "self_check_yes": frozenset({"supports_limit"}),
              "self_check_no": frozenset({"supports_limit"})}
         )
+
+        # Phase 4.7 F3: require an orderbook provider OR the
+        # EXECUTOR_ALLOW_NO_ORDERBOOK escape hatch. The paper daemon
+        # runs on synthetic quotes, so it must opt in explicitly.
+        allow_no_ob = os.environ.get("EXECUTOR_ALLOW_NO_ORDERBOOK", "").lower() in (
+            "1", "true", "yes", "on"
+        )
+        if self.policy.orderbook_provider is None and not allow_no_ob:
+            raise RuntimeError(
+                "liquidity provider not configured; "
+                "set EXECUTOR_ALLOW_NO_ORDERBOOK=true for test harnesses"
+            )
+
         # Bootstrap the self-check synthetic markets into the policy's
         # market_universe so the StructuralGate admits the synthetic
         # intent deterministically. Phase 4.6: previously the self-check
@@ -158,10 +182,13 @@ class DaemonService:
         await self.bus.start()
 
         # Orchestrator: INTENT_EMITTED → risk → paper FILL → attribution.
+        # Phase 4.7 R3: pass audit so crash emits can fall back to a
+        # direct audit write if the bus is unavailable.
         self.orchestrator = Orchestrator(
             bus=self.bus,
             policy=self.policy,
             attribution=self.attribution,
+            audit=self.audit,
             paper_mode=True,
         )
         await self.orchestrator.start()
@@ -179,6 +206,25 @@ class DaemonService:
             emit_cooldown_sec=2.0,
         )
         self.strategy.attach(self.bus.publish)
+
+        # Phase 4.7 F1 (K1/P1 regression): register the strategy's
+        # declared markets so the StructuralGate admits real intents.
+        # Additive with register_self_check_markets — both populate the
+        # same market_universe set.
+        self.policy.register_strategy_markets(self.strategy)
+
+        # Phase 4.7 F5 (event concentration fail-closed): every leg
+        # must have an event_id. Map self-check + strategy markets to
+        # synthetic event ids here so the gate passes in paper mode.
+        # Real event-id wiring (Kalshi series/event lookup) lands in
+        # the Phase 5 venue-subscription path.
+        event_id_map: dict[tuple[str, str], str] = {
+            ("self_check_yes", "SCYES"): "SELF_CHECK_EVENT",
+            ("self_check_no", "SCNO"): "SELF_CHECK_EVENT",
+        }
+        for venue, market_id in self.strategy.markets:
+            event_id_map[(venue, market_id)] = f"{venue}:{market_id}"
+        self.policy.set_event_id_map(event_id_map)
 
         await self.bus.publish(
             Event.make(
@@ -319,8 +365,20 @@ class DaemonService:
     # ------------------------------------------------------------------
 
     async def stop(self) -> None:
+        """Phase 4.7 Q6 shutdown order (drain before unsubscribe):
+
+            1. Signal + cancel strategy/background tasks (no new intents).
+            2. Short sleep to let in-flight emits reach the bus.
+            3. Publish STOPPING + STATE_SAVED lifecycle events.
+            4. Drain the bus inbox so pending events reach orchestrator.
+            5. orchestrator.stop() — unsubscribe AFTER drain.
+            6. telemetry.stop().
+            7. bus.stop() — final close / sentinel delivery.
+            8. audit.stop() — flush last (so STATE_SAVED lands).
+            9. Close attribution / risk_state / kill_store.
+        """
         self._stop_event.set()
-        # Cancel background tasks.
+        # (1) Cancel background tasks so no new intents are produced.
         for t in self._bg_tasks:
             t.cancel()
         for t in self._bg_tasks:
@@ -330,7 +388,13 @@ class DaemonService:
                 pass
         self._bg_tasks.clear()
 
-        # Final lifecycle event before we tear down publishers.
+        # (2) Brief settle window for any in-flight publishes.
+        try:
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+        # (3) Final lifecycle events before we tear down publishers.
         try:
             await self.bus.publish(
                 Event.make(
@@ -354,24 +418,40 @@ class DaemonService:
         except Exception as exc:  # pragma: no cover
             log.warning("daemon.final_events_failed", error=str(exc))
 
+        # (4) Drain the bus inbox while orchestrator is still subscribed.
+        try:
+            drained, timed_out = await self.bus.drain_inbox(timeout_sec=5.0)
+            log.info(
+                "daemon.stop.drain",
+                drained=drained,
+                timed_out=timed_out,
+            )
+        except Exception as exc:
+            log.warning("daemon.stop.drain_failed", error=str(exc))
+
+        # (5) Now safe to unsubscribe orchestrator.
         if self.orchestrator is not None:
             try:
                 await self.orchestrator.stop()
             except Exception:
                 pass
+        # (6) Telemetry.
         if self.telemetry is not None:
             try:
                 await self.telemetry.stop()
             except Exception:
                 pass
+        # (7) Bus final close.
         try:
             await self.bus.stop()
         except Exception:
             pass
+        # (8) Audit flush/close.
         try:
             await self.audit.stop()
         except Exception:
             pass
+        # (9) Close backing stores.
         if self.attribution is not None:
             try:
                 self.attribution.close()

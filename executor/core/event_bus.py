@@ -66,6 +66,23 @@ class EventBus:
         self._pump_task = asyncio.create_task(self._pump(), name="event-bus-pump")
         log.info("event_bus.start")
 
+    async def drain_inbox(self, *, timeout_sec: float = 5.0) -> tuple[int, bool]:
+        """Wait until the inbox empties or timeout elapses.
+
+        Phase 4.7 Q6: exposed so DaemonService can drain the bus
+        *before* unsubscribing the orchestrator — otherwise tail intents
+        get delivered to audit only, not to orchestrator.
+
+        Returns (drained_event_count, timed_out).
+        """
+        start = self._inbox.qsize()
+        try:
+            await asyncio.wait_for(self._inbox.join(), timeout=timeout_sec)
+            return (start, False)
+        except asyncio.TimeoutError:
+            remaining = self._inbox.qsize()
+            return (max(0, start - remaining), True)
+
     async def stop(self, *, drain_timeout_sec: float = 5.0) -> None:
         if not self._running:
             return
@@ -82,12 +99,31 @@ class EventBus:
             except (asyncio.CancelledError, Exception):
                 pass
         # Close subscriber queues so any iterators exit cleanly.
+        # Phase 4.7 Q12: if a subscriber's queue is full, drain one item
+        # first so the sentinel always lands. Previously QueueFull was
+        # swallowed and pull-style stream() callers blocked forever.
         for sub in list(self._subs.values()):
             sub.closed = True
             try:
-                sub.queue.put_nowait(_SENTINEL)  # wake any awaiter
+                sub.queue.put_nowait(_SENTINEL)
             except asyncio.QueueFull:
-                pass
+                try:
+                    discarded = sub.queue.get_nowait()
+                    sub.queue.task_done()
+                    log.warning(
+                        "event_bus.stop.discarded_to_deliver_sentinel",
+                        subscriber_id=sub.subscriber_id,
+                        event_type=getattr(discarded, "event_type", None),
+                    )
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    sub.queue.put_nowait(_SENTINEL)
+                except asyncio.QueueFull:
+                    log.error(
+                        "event_bus.stop.sentinel_undeliverable",
+                        subscriber_id=sub.subscriber_id,
+                    )
         log.info("event_bus.stop")
 
     # ------------------------------------------------------------------

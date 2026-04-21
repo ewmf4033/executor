@@ -12,6 +12,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=EXECUTOR_LOG_LEVEL=INFO
 Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs/paper_live
 Environment=PAPER_MODE=true
+Environment=EXECUTOR_ALLOW_NO_ORDERBOOK=true
 ExecStart=/root/executor/.venv/bin/python -m executor --daemon
 
 # Restart policy — crash-loop guard: give up after 3 restarts in 60s so

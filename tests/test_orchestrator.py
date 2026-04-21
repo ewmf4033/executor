@@ -12,10 +12,27 @@ from executor.core.events import Event, EventType
 from executor.core.intent import Atomicity, BasketIntent, Leg
 from executor.core.orchestrator import Orchestrator, deserialize_intent
 from executor.core.types import Side
+from executor.detectors.adverse_selection import NullAdverseSelectionDetector
 from executor.risk.config import ConfigManager
 from executor.risk.policy import RiskPolicy
 from executor.risk.state import RiskState
 from executor.strategies.base import _serialize_intent
+
+
+def _make_test_policy(*, cfg, state, publish=None):
+    """Helper: build a RiskPolicy pre-wired for orchestrator unit tests."""
+    p = RiskPolicy(
+        config_manager=cfg,
+        state=state,
+        adverse_selection=NullAdverseSelectionDetector(),
+        publish=publish,
+    )
+    p.set_allow_universe_bootstrap(True)
+    p.set_event_id_map({
+        ("v1", "m1"): "EVT-v1-m1",
+        ("v2", "m2"): "EVT-v2-m2",
+    })
+    return p
 
 
 def _synth_intent(now_ns: int) -> BasketIntent:
@@ -66,7 +83,7 @@ async def test_orchestrator_admits_and_fills(tmp_path: Path):
     cfg = ConfigManager(None)
     state = RiskState(db_path=tmp_path / "state.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    policy = _make_test_policy(cfg=cfg, state=state, publish=bus.publish)
     policy.set_venue_capabilities({
         "v1": frozenset({"supports_limit"}),
         "v2": frozenset({"supports_limit"}),
@@ -252,7 +269,7 @@ async def test_orchestrator_stats_invariant_holds_under_mixed_traffic(tmp_path: 
     cfg = ConfigManager(None)
     state = RiskState(db_path=tmp_path / "state.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    policy = _make_test_policy(cfg=cfg, state=state, publish=bus.publish)
     policy.set_venue_capabilities({
         "v1": frozenset({"supports_limit"}),
         "v2": frozenset({"supports_limit"}),
@@ -309,7 +326,7 @@ async def test_orchestrator_counts_rejections(tmp_path: Path):
     cfg = ConfigManager(None)
     state = RiskState(db_path=tmp_path / "state.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    policy = _make_test_policy(cfg=cfg, state=state, publish=bus.publish)
     policy.set_venue_capabilities({"v1": frozenset({"supports_limit"})})
     orch = Orchestrator(bus=bus, policy=policy, attribution=None, paper_mode=True)
     await orch.start()

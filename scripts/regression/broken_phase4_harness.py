@@ -1,13 +1,20 @@
 """
-Phase 4 burn-in: run YESNOCrossDetect in paper-mode against a deterministic
-mock quote feed for the requested number of seconds. Exits non-zero if any
-unexpected exception escapes the loop.
+DO NOT RUN — known-broken Phase 4 test harness, preserved as a negative example.
 
-Usage:
-  PAPER_MODE=true python -m scripts.burn_in_yes_no_cross --seconds 600
+This script reproduces the Phase 4 failure mode that Phase 4.5 fixed: the
+strategy emits INTENT_EMITTED events but nothing is subscribed to consume
+them through risk / fill / attribution. Running this produces hundreds of
+intent events with no downstream pipeline activity — the exact silent-gap
+bug the self-check was built to prevent from shipping again.
 
-Writes structured log lines to stdout (capturable via journalctl when run
-under systemd, or tee'd to a file when run by hand).
+For actual paper runs, use the daemon:
+  PAPER_MODE=true python -m executor --daemon
+
+Entry point: executor/core/daemon.py :: DaemonService / run_daemon.
+
+History: moved to scripts/regression/ in Phase 4.7 (Review 2 Q9) so the
+file isn't accidentally picked up by operators looking for "burn-in" tools
+in scripts/.
 """
 from __future__ import annotations
 

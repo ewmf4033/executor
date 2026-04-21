@@ -21,6 +21,7 @@ from executor.core.intent import Atomicity
 from executor.core.types import Side
 from executor.kill.manager import KillManager
 from executor.kill.state import KillMode, KillStateStore
+from executor.detectors.adverse_selection import NullAdverseSelectionDetector
 from executor.risk import ConfigManager, RiskPolicy, RiskState
 from executor.strategies.yes_no_cross.strategy import (
     CrossPair,
@@ -54,11 +55,20 @@ async def test_yes_no_cross_through_gates_then_kill(tmp_path: Path) -> None:
     cfg = ConfigManager(path=None)
     state = RiskState(db_path=tmp_path / "risk_state.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state)
+    policy = RiskPolicy(
+        config_manager=cfg,
+        state=state,
+        adverse_selection=NullAdverseSelectionDetector(),
+    )
     policy.set_publish(bus.publish)
+    policy.set_allow_universe_bootstrap(True)
     policy.set_venue_capabilities({
         "kalshi": {"supports_limit", "supports_market"},
         "polymarket": {"supports_limit", "supports_market"},
+    })
+    policy.set_event_id_map({
+        ("kalshi", "K-RAINS"): "EVT-RAINS",
+        ("polymarket", "P-RAINS"): "EVT-RAINS",
     })
 
     kstore = KillStateStore(tmp_path / "kill.sqlite")

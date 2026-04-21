@@ -1,5 +1,5 @@
 """
-13 risk gates.
+14 risk gates.
 
 Each Gate subclass has an async `check(ctx)` returning a GateResult. Gates are
 stateless — they read policy + ctx but do not mutate shared state. The policy
@@ -11,7 +11,7 @@ Gate order (per Decision 3):
   2   KillSwitch
   2.5 VenueHealth
   2.6 Poisoning          (0g — extended from the spec's adverse-selection slot)
-  3   AdverseSelection   (0e stub)
+  3   AdverseSelection   (0e — venue-level pause since Phase 4.7)
   4   PerIntentDollarCap
   4.5 Liquidity
   5   MarketExposure
@@ -63,6 +63,15 @@ class Gate(ABC):
 
 
 class StructuralGate(Gate):
+    """Gate 1 — basic sanity + market/capability existence.
+
+    Phase 4.7 F2: when market_universe is None, this gate default-REJECTS
+    with "market_universe not configured" rather than silently allowing
+    every market. Tests that don't need a registered universe must flip
+    RiskPolicy.set_allow_universe_bootstrap(True) — that path logs a
+    warning and is never taken from DaemonService.
+    """
+
     name = "structural"
     order = "1"
 
@@ -77,8 +86,14 @@ class StructuralGate(Gate):
         min_edge = cfg.per_strategy_min_edge.get(
             intent.strategy_id, cfg.min_edge_default
         )
+        # Phase 4.7 F2: default-deny when no universe is registered
+        # (unless the test-only bootstrap flag is explicitly set).
+        if pol.market_universe is None and not pol._allow_universe_bootstrap:
+            return GateResult.reject(
+                "structural_gate: market_universe not configured"
+            )
         for leg in intent.legs:
-            # market existence (if universe registered)
+            # market existence
             if pol.market_universe is not None:
                 if (leg.venue, leg.market_id) not in pol.market_universe:
                     return GateResult.reject(
@@ -180,6 +195,14 @@ class PoisoningGate(Gate):
 
 
 class AdverseSelectionGate(Gate):
+    """Gate 3 — venue-level adverse-selection pause.
+
+    Phase 4.7 F9: checks is_venue_paused(venue), not is_flagged(market).
+    Rationale: adverse selection is typically driven by venue-side
+    latency or information asymmetry, so a tripped signal should pause
+    the whole venue, not just one market that tripped the metric.
+    """
+
     name = "adverse_selection"
     order = "3"
 
@@ -189,9 +212,9 @@ class AdverseSelectionGate(Gate):
             return GateResult.approve()
         intent = ctx.current_intent
         for leg in intent.legs:
-            if det.is_flagged(strategy_id=intent.strategy_id, market_id=leg.market_id):
+            if det.is_venue_paused(leg.venue):
                 return GateResult.reject(
-                    f"adverse_selection flag on {intent.strategy_id}/{leg.market_id}"
+                    f"adverse_selection: venue {leg.venue} paused"
                 )
         return GateResult.approve()
 
@@ -320,6 +343,15 @@ class MarketExposureGate(Gate):
 
 
 class EventConcentrationGate(Gate):
+    """Gate 5.5 — event-level concentration ceiling.
+
+    Phase 4.7 F5: fails closed when any leg has no event_id. Previously
+    the gate silently skipped unmapped legs, which meant missing event
+    metadata disabled the check entirely. Now: every leg must have an
+    event_id registered via policy.set_event_id_map() or the intent is
+    rejected.
+    """
+
     name = "event_concentration"
     order = "5.5"
 
@@ -327,12 +359,16 @@ class EventConcentrationGate(Gate):
         intent = ctx.current_intent
         pol = ctx.policy
         cfg = pol.config.event_concentration
-        # Group legs by event_id.
+        # Group legs by event_id; fail closed on any leg without one.
         by_event: dict[str, list[Leg]] = {}
         for leg in intent.legs:
             event_id = pol.event_id_for(leg.venue, leg.market_id)
             if event_id is None:
-                continue
+                return GateResult.reject(
+                    f"event_concentration: leg {leg.leg_id} "
+                    f"({leg.venue}:{leg.market_id}) missing event_id "
+                    f"(required for concentration check)"
+                )
             by_event.setdefault(event_id, []).append(leg)
         new_sizes: dict[str, Decimal] = {}
         any_clip = False

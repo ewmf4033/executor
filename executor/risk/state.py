@@ -90,6 +90,11 @@ CREATE TABLE IF NOT EXISTS config_hash (
     hash TEXT NOT NULL,
     loaded_ts_ns INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS strategy_exposures (
+    strategy_id TEXT PRIMARY KEY,
+    dollars TEXT NOT NULL,
+    updated_ts_ns INTEGER NOT NULL
+);
 """
 
 
@@ -222,6 +227,10 @@ class RiskState:
             "SELECT date, strategy_id, pnl FROM daily_pnl"
         ):
             self._daily_pnl[(row[0], row[1])] = Decimal(row[2])
+        for row in self._conn.execute(
+            "SELECT strategy_id, dollars FROM strategy_exposures"
+        ):
+            self._strategy_exposure[row[0]] = Decimal(row[1])
 
     # ------------------------------------------------------------------
     # Rebuild from venues
@@ -353,18 +362,25 @@ class RiskState:
         self._conn.commit()
 
     def set_event_id(self, venue: str, market_id: str, outcome_id: str, event_id: str | None) -> None:
+        """Persist the (venue, market, outcome) -> event_id mapping.
+
+        Phase 4.7 F12: uses INSERT OR REPLACE so a fresh mapping (no row
+        yet) is persisted rather than silently dropped by an UPDATE on a
+        missing row. Existing dollars are preserved from the in-memory
+        record so this never clobbers a booked position.
+        """
         key = (venue, market_id, outcome_id)
         rec = self._exposures.get(key)
+        now_ns = time.time_ns()
         if rec is None:
-            # Seed a zero record so we can remember the mapping.
             rec = ExposureRecord(venue, market_id, outcome_id, Decimal("0"), event_id)
             self._exposures[key] = rec
         else:
             rec.event_id = event_id
         assert self._conn is not None
         self._conn.execute(
-            "UPDATE exposures SET event_id=? WHERE venue=? AND market_id=? AND outcome_id=?",
-            (event_id, venue, market_id, outcome_id),
+            "INSERT OR REPLACE INTO exposures VALUES (?, ?, ?, ?, ?, ?)",
+            (venue, market_id, outcome_id, str(rec.dollars), event_id, now_ns),
         )
         self._conn.commit()
 
@@ -372,9 +388,25 @@ class RiskState:
         return self._strategy_exposure.get(strategy_id, Decimal("0"))
 
     def add_strategy_exposure(self, strategy_id: str, dollars: Decimal) -> None:
-        self._strategy_exposure[strategy_id] = (
-            self._strategy_exposure.get(strategy_id, Decimal("0")) + dollars
+        new = self._strategy_exposure.get(strategy_id, Decimal("0")) + dollars
+        self._strategy_exposure[strategy_id] = new
+        self._persist_strategy_exposure(strategy_id, new)
+
+    def set_strategy_exposure(self, strategy_id: str, dollars: Decimal) -> None:
+        """Phase 4.7 F13: persists via INSERT OR REPLACE so an allocation
+        set on a fresh strategy_id survives restart. Previously UPDATE
+        silently dropped writes for strategies without existing rows."""
+        self._strategy_exposure[strategy_id] = Decimal(dollars)
+        self._persist_strategy_exposure(strategy_id, Decimal(dollars))
+
+    def _persist_strategy_exposure(self, strategy_id: str, dollars: Decimal) -> None:
+        assert self._conn is not None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO strategy_exposures "
+            "(strategy_id, dollars, updated_ts_ns) VALUES (?, ?, ?)",
+            (strategy_id, str(dollars), time.time_ns()),
         )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Daily PnL

@@ -105,7 +105,9 @@ class WindowAdverseSelectionDetector(AdverseSelectionDetector):
     def set_publish(self, publish: Publish) -> None:
         self._publish = publish
 
-    def is_venue_paused(self, venue: str, *, now_ns: int | None = None) -> tuple[bool, int]:
+    def venue_pause_detail(self, venue: str, *, now_ns: int | None = None) -> tuple[bool, int]:
+        """Full pause detail: (is_paused, paused_until_ns). Used by tests
+        and observers that want the expiry timestamp."""
         rec = self._venues.get(venue)
         if rec is None:
             return False, 0
@@ -113,6 +115,11 @@ class WindowAdverseSelectionDetector(AdverseSelectionDetector):
         if rec.paused_until_ns > now_ns:
             return True, rec.paused_until_ns
         return False, rec.paused_until_ns
+
+    def is_venue_paused(self, venue: str) -> bool:
+        """Gate-3 interface — bool-only per AdverseSelectionDetector."""
+        paused, _ = self.venue_pause_detail(venue)
+        return paused
 
     def clear_venue(self, venue: str) -> None:
         rec = self._venues.get(venue)

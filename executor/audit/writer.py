@@ -131,6 +131,33 @@ class AuditWriter:
             event_id=event.event_id,
         )
 
+    def write_direct(self, event: Event) -> None:
+        """Emergency synchronous write — bypasses the event bus.
+
+        Phase 4.7 Review 3 Issue 2: used by Orchestrator._emit_crash as
+        a fallback when bus.publish() itself raises (bus stopping, queue
+        full). This is best-effort: caller must wrap in try/except; a
+        failure here means we've lost observability of one crash event
+        but haven't lost the intent state.
+        """
+        if self._conn is None:
+            raise RuntimeError("audit writer not started")
+        self._rotate_if_needed()
+        row = (
+            event.event_id,
+            int(event.ts_ns),
+            event.event_type.value,
+            event.source,
+            event.intent_id,
+            event.leg_id,
+            event.venue,
+            event.market_id,
+            event.strategy_id,
+            json.dumps(event.payload, default=_json_default, separators=(",", ":")),
+            int(event.schema_version),
+        )
+        _insert_row(self._conn, row)
+
     async def on_event(self, event: Event) -> None:
         """Adapter for EventBus.subscribe(on_event=...)."""
         try:
@@ -164,7 +191,15 @@ class AuditWriter:
         path = self._path_for(date_str)
         conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        # Phase 4.7 Q7: default to synchronous=FULL for durability. FULL
+        # fsyncs after every commit (~2-3x slower) but never loses a
+        # committed event under SIGKILL/OOM/power loss — important for
+        # the audit log's "keep forever" contract. Tests can set
+        # EXECUTOR_AUDIT_DURABILITY=NORMAL to regain speed.
+        durability = os.environ.get("EXECUTOR_AUDIT_DURABILITY", "FULL").upper()
+        if durability not in ("NORMAL", "FULL"):
+            durability = "FULL"
+        conn.execute(f"PRAGMA synchronous={durability}")
         conn.executescript(SCHEMA_SQL)
         self._conn = conn
         self._current_date = date_str

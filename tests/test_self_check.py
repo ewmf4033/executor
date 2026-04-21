@@ -19,9 +19,21 @@ from executor.core.event_bus import EventBus
 from executor.core.events import Event, EventType, Source
 from executor.core.orchestrator import Orchestrator
 from executor.core.self_check import build_synthetic_intent, run_self_check
+from executor.detectors.adverse_selection import NullAdverseSelectionDetector
 from executor.risk.config import ConfigManager
 from executor.risk.policy import RiskPolicy
 from executor.risk.state import RiskState
+
+
+def _test_policy(*, cfg, state, publish):
+    """Create a test RiskPolicy wired for self-check tests."""
+    p = RiskPolicy(
+        config_manager=cfg,
+        state=state,
+        adverse_selection=NullAdverseSelectionDetector(),
+        publish=publish,
+    )
+    return p
 
 
 @pytest.fixture
@@ -33,10 +45,15 @@ async def wired_bus(tmp_path: Path):
     cfg = ConfigManager(None)
     state = RiskState(db_path=tmp_path / "rstate.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    policy = _test_policy(cfg=cfg, state=state, publish=bus.publish)
     policy.set_venue_capabilities({
         "self_check_yes": frozenset({"supports_limit"}),
         "self_check_no": frozenset({"supports_limit"}),
+    })
+    policy.register_self_check_markets()
+    policy.set_event_id_map({
+        ("self_check_yes", "SCYES"): "SELF_CHECK_EVENT",
+        ("self_check_no", "SCNO"): "SELF_CHECK_EVENT",
     })
     attr = AttributionTracker(db_path=tmp_path / "attr.sqlite", publish=bus.publish)
     orch = Orchestrator(bus=bus, policy=policy, attribution=attr, paper_mode=True)
@@ -116,10 +133,15 @@ async def test_self_check_fail_when_fill_silent(tmp_path: Path):
     cfg = ConfigManager(None)
     state = RiskState(db_path=tmp_path / "rstate.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    policy = _test_policy(cfg=cfg, state=state, publish=bus.publish)
     policy.set_venue_capabilities({
         "self_check_yes": frozenset({"supports_limit"}),
         "self_check_no": frozenset({"supports_limit"}),
+    })
+    policy.register_self_check_markets()
+    policy.set_event_id_map({
+        ("self_check_yes", "SCYES"): "SELF_CHECK_EVENT",
+        ("self_check_no", "SCNO"): "SELF_CHECK_EVENT",
     })
 
     # Subscribe a "risk runner" that consumes INTENT_EMITTED and runs evaluate,
@@ -195,7 +217,7 @@ async def test_self_check_fails_on_gate_reject(tmp_path: Path):
     cfg = ConfigManager(None)
     state = RiskState(db_path=tmp_path / "rstate.sqlite")
     await state.load()
-    policy = RiskPolicy(config_manager=cfg, state=state, publish=bus.publish)
+    policy = _test_policy(cfg=cfg, state=state, publish=bus.publish)
     # Populate market_universe with something that excludes the self-check
     # markets — this makes the structural gate reject the synthetic intent.
     policy.set_market_universe([("some_other_venue", "SOMETHING_ELSE")])
@@ -235,6 +257,7 @@ async def test_self_check_run_daemon_returns_nonzero_on_gate_reject(tmp_path: Pa
     from executor.core import daemon as daemon_mod
 
     monkeypatch.setenv("PAPER_MODE", "true")
+    monkeypatch.setenv("EXECUTOR_ALLOW_NO_ORDERBOOK", "true")
 
     # Replace register_self_check_markets with a version that deliberately
     # excludes the self-check markets, forcing the structural gate to reject.

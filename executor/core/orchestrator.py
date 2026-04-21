@@ -28,6 +28,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..attribution.tracker import AttributionTracker
+from ..audit.writer import AuditWriter
 from ..core.event_bus import EventBus
 from ..core.events import Event, EventType, Source
 from ..core.intent import Atomicity, BasketIntent, Intent, Leg
@@ -89,11 +90,13 @@ class Orchestrator:
         bus: EventBus,
         policy: RiskPolicy,
         attribution: AttributionTracker | None = None,
+        audit: AuditWriter | None = None,
         paper_mode: bool = True,
     ) -> None:
         self._bus = bus
         self._policy = policy
         self._attr = attribution
+        self._audit = audit
         self._paper_mode = paper_mode
         # Counters — useful for telemetry and the self-check.
         self.n_intents_received = 0
@@ -101,6 +104,8 @@ class Orchestrator:
         self.n_rejected = 0
         self.n_filled_legs = 0
         self.n_intent_crashes = 0
+        # Phase 4.7 R3: counts crash events that failed BOTH bus and audit.
+        self.n_crash_emit_failures = 0
         self._subscription = None
 
     async def start(self) -> None:
@@ -197,18 +202,48 @@ class Orchestrator:
         }
         if gate is not None:
             payload["gate"] = gate
+        crash_event = Event.make(
+            EventType.ERROR,
+            source=Source.EXECUTOR,
+            intent_id=intent_id,
+            strategy_id=strategy_id,
+            payload=payload,
+        )
+        # Phase 4.7 R3: try bus first; if bus.publish raises (stopping,
+        # queue full, crash), fall back to synchronous audit write_direct
+        # so the crash evidence isn't lost. If both fail, bump counter
+        # and log — we've still produced a log line but lost the event.
         try:
-            await self._bus.publish(
-                Event.make(
-                    EventType.ERROR,
-                    source=Source.EXECUTOR,
-                    intent_id=intent_id,
-                    strategy_id=strategy_id,
-                    payload=payload,
-                )
+            await self._bus.publish(crash_event)
+            return
+        except Exception as publish_exc:
+            log.error(
+                "orchestrator.crash_emit.bus_failed",
+                error=str(publish_exc),
+                intent_id=intent_id,
             )
-        except Exception as publish_exc:  # pragma: no cover
-            log.error("orchestrator.crash_emit_failed", error=str(publish_exc))
+        if self._audit is not None:
+            try:
+                self._audit.write_direct(crash_event)
+                log.warning(
+                    "orchestrator.crash_emit.audit_fallback_ok",
+                    intent_id=intent_id,
+                )
+                return
+            except Exception as audit_exc:
+                log.error(
+                    "orchestrator.crash_emit.audit_failed",
+                    error=str(audit_exc),
+                    intent_id=intent_id,
+                )
+        self.n_crash_emit_failures += 1
+        log.error(
+            "orchestrator.crash_emit.all_paths_failed",
+            intent_id=intent_id,
+            stage=stage,
+            exc_type=type(exc).__name__,
+            error=str(exc),
+        )
 
     async def _paper_fill(self, intent: BasketIntent) -> None:
         """
@@ -319,4 +354,5 @@ class Orchestrator:
             "rejected": self.n_rejected,
             "filled_legs": self.n_filled_legs,
             "intent_crashes": self.n_intent_crashes,
+            "crash_emit_failures": self.n_crash_emit_failures,
         }

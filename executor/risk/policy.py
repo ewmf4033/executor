@@ -16,12 +16,12 @@ import asyncio
 import time
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable
 
 from ..core.events import Event, EventType, Source
 from ..core.intent import BasketIntent, Leg
 from ..core.logging import get_logger
-from ..detectors.adverse_selection import AdverseSelectionDetector, NullAdverseSelectionDetector
+from ..detectors.adverse_selection import AdverseSelectionDetector
 from ..detectors.poisoning import PoisoningTracker, build_detector
 from .config import ConfigManager, RiskConfig
 from .exposure import intent_notional_dollars, leg_notional_dollars
@@ -30,6 +30,9 @@ from .kill import KillSwitch
 from .state import RiskState
 from .types import GateCtx, GateDecision, GateResult, RiskVerdict
 from .venue_health import VenueHealth
+
+if TYPE_CHECKING:
+    from ..strategies.base import Strategy
 
 
 log = get_logger("executor.risk.policy")
@@ -48,7 +51,7 @@ class RiskPolicy:
         kill_switch: KillSwitch | None = None,
         venue_health: VenueHealth | None = None,
         poisoning: PoisoningTracker | None = None,
-        adverse_selection: AdverseSelectionDetector | None = None,
+        adverse_selection: AdverseSelectionDetector,
         publish: Publish | None = None,
         gates: list[Gate] | None = None,
     ) -> None:
@@ -74,7 +77,12 @@ class RiskPolicy:
             )
         else:
             self.poisoning = poisoning
-        self.adverse_selection = adverse_selection or NullAdverseSelectionDetector()
+        if adverse_selection is None:
+            raise ValueError(
+                "RiskPolicy: adverse_selection detector is required; "
+                "pass NullAdverseSelectionDetector() explicitly for tests/self-check"
+            )
+        self.adverse_selection = adverse_selection
         self._publish = publish
         self.gates: list[Gate] = gates if gates is not None else default_gate_chain()
 
@@ -83,6 +91,10 @@ class RiskPolicy:
         self.venue_capabilities: dict[str, frozenset[str]] = {}
         self._event_id_map: dict[tuple[str, str], str] = {}
         self.orderbook_provider: OrderbookProvider | None = None
+        # Phase 4.7 F2: StructuralGate default-denies when market_universe
+        # is unset. Tests that don't need a registered universe can flip
+        # this via set_allow_universe_bootstrap(True).
+        self._allow_universe_bootstrap: bool = False
 
         # Wire config hooks.
         self._cfg_mgr.register_reload_hook(self._on_config_reload)
@@ -113,13 +125,37 @@ class RiskPolicy:
         Ensures (self_check_yes, SCYES) and (self_check_no, SCNO) clear the
         StructuralGate's market-existence check so the synthetic basket is
         deterministically admittable. Called from DaemonService.start()
-        before run_startup_self_check — real-market registration is wired
-        separately (and will land in a later phase). Do NOT rely on this
-        for production markets."""
+        before run_startup_self_check. Additive with register_strategy_markets
+        — both populate the same market_universe set."""
         if self.market_universe is None:
             self.market_universe = set()
         self.market_universe.add(("self_check_yes", "SCYES"))
         self.market_universe.add(("self_check_no", "SCNO"))
+
+    def register_strategy_markets(self, strategy: "Strategy") -> None:
+        """Register a strategy's declared markets into market_universe.
+
+        Additive with register_self_check_markets — populates the same
+        set so the StructuralGate admits real strategy markets alongside
+        the synthetic self-check ones. Fixes the Phase 4.6 regression
+        where K1/P1 intents were rejected as "market not found" because
+        only self-check markets had been registered.
+        """
+        if self.market_universe is None:
+            self.market_universe = set()
+        for venue, market_id in strategy.markets:
+            self.market_universe.add((venue, market_id))
+
+    def set_allow_universe_bootstrap(self, allow: bool) -> None:
+        """Test-only escape hatch: re-enable the pre-Phase-4.7 default-allow
+        behavior in StructuralGate when market_universe is None. Logs a
+        warning so the bypass is visible. Not called from DaemonService."""
+        self._allow_universe_bootstrap = bool(allow)
+        if allow:
+            log.warning(
+                "risk.policy.universe_bootstrap_enabled",
+                note="StructuralGate will default-ALLOW when market_universe is None. Test-only.",
+            )
 
     def set_venue_capabilities(self, caps: dict[str, Iterable[str]]) -> None:
         self.venue_capabilities = {v: frozenset(c) for v, c in caps.items()}
@@ -201,6 +237,30 @@ class RiskPolicy:
                     reject_reason=result.reason,
                     reject_gate=gate.name,
                 )
+
+            # Phase 4.7 F6: re-check kill switch after the gate loop.
+            # KillGate at gate 2 fails fast, but the remaining 12 gates can
+            # take 10-100ms — a kill signal that fires during that window
+            # must not allow admission.
+            for leg in ctx.current_intent.legs:
+                killed, reason = self.kill_switch.is_killed(
+                    strategy_id=ctx.current_intent.strategy_id, venue=leg.venue
+                )
+                if killed:
+                    await self._emit_reject(
+                        _KillSwitchRecheckGate(),
+                        GateResult.reject(f"kill_switch: {reason}"),
+                        ctx,
+                    )
+                    return RiskVerdict(
+                        admitted=False,
+                        intent=ctx.current_intent,
+                        gates_passed=tuple(ctx.gates_passed),
+                        gate_timings_ms=dict(ctx.gate_timings_ms),
+                        clip_history=tuple(ctx.clip_history),
+                        reject_reason=f"kill_switch: {reason}",
+                        reject_gate="kill_switch_recheck",
+                    )
 
             # All gates passed.
             await self._emit_admitted(ctx)
@@ -284,7 +344,7 @@ class RiskPolicy:
                     "reason": result.reason,
                     "gates_passed": list(ctx.gates_passed),
                     "gate_timings_ms": dict(ctx.gate_timings_ms),
-                    "gate_ms": ctx.gate_timings_ms[gate.name],
+                    "gate_ms": ctx.gate_timings_ms.get(gate.name, 0.0),
                 },
             )
         )
@@ -339,3 +399,13 @@ class RiskPolicy:
         self.state.add_strategy_exposure(
             intent.strategy_id, intent_notional_dollars(intent)
         )
+
+
+class _KillSwitchRecheckGate:
+    """Marker-gate used to emit GATE_REJECTED with a recognizable name
+    when the kill switch fires between the gate loop and admission.
+    Not part of the normal chain — instantiated only at reject time so
+    the audit payload carries gate=kill_switch_recheck."""
+
+    name = "kill_switch_recheck"
+    order = "2.post"

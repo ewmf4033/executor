@@ -158,11 +158,13 @@ async def test_adverse_selection_null_detector_approves(policy):
 
 
 async def test_adverse_selection_flagged_rejects(policy):
-    class FlagAll:
+    class PauseAll:
         def is_flagged(self, *, strategy_id, market_id): return True
-    policy.adverse_selection = FlagAll()
+        def is_venue_paused(self, venue): return True
+    policy.adverse_selection = PauseAll()
     r = await AdverseSelectionGate().check(await _ctx(policy, make_intent()))
     assert r.decision == GateDecision.REJECT
+    assert "venue kalshi paused" in r.reason
 
 
 # --- 4 Per-intent cap -----------------------------------------------------
@@ -250,10 +252,12 @@ async def test_event_concentration_clips(policy):
     assert r.decision == GateDecision.CLIP
 
 
-async def test_event_concentration_ignores_unmapped(policy):
+async def test_event_concentration_rejects_unmapped(policy):
+    """Phase 4.7 F5: legs without event_id are now rejected (fail-closed)."""
     intent = make_intent(legs=[make_leg()])
     r = await EventConcentrationGate().check(await _ctx(policy, intent))
-    assert r.decision == GateDecision.APPROVE
+    assert r.decision == GateDecision.REJECT
+    assert "missing event_id" in r.reason
 
 
 # --- 6 Venue exposure -----------------------------------------------------
