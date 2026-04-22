@@ -71,3 +71,39 @@ async def test_pipeline_stats_includes_orchestrator_block():
         assert body["orchestrator"]["filled_legs"] == 10
     finally:
         await srv.stop()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_stats_includes_audit_writer_block():
+    """Phase 4.10 (4.9.1-a): audit fail-closed counters surfaced in /pipeline_stats."""
+    srv = TelemetryServer(host="127.0.0.1", port=0, daemon_mode=True)
+    await srv.start()
+    actual_port = srv._site._server.sockets[0].getsockname()[1]
+
+    class _FakeAudit:
+        _consecutive_write_failures = 3
+        _audit_kill_engaged = False
+
+    srv.set_audit_writer(_FakeAudit())
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{actual_port}/pipeline_stats") as r:
+                body = await r.json()
+        assert body["audit_writer"]["consecutive_write_failures"] == 3
+        assert body["audit_writer"]["kill_engaged"] is False
+    finally:
+        await srv.stop()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_stats_omits_audit_writer_when_unset():
+    srv = TelemetryServer(host="127.0.0.1", port=0, daemon_mode=True)
+    await srv.start()
+    actual_port = srv._site._server.sockets[0].getsockname()[1]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{actual_port}/pipeline_stats") as r:
+                body = await r.json()
+        assert "audit_writer" not in body
+    finally:
+        await srv.stop()

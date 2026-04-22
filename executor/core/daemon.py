@@ -124,6 +124,8 @@ class DaemonService:
 
         # Telemetry — subscribes to everything; safe to start early.
         self.telemetry = TelemetryServer(port=self.telemetry_port, daemon_mode=True)
+        # Phase 4.10 (4.9.1-a): surface audit-writer fail-closed counters in /pipeline_stats.
+        self.telemetry.set_audit_writer(self.audit)
         await self.bus.subscribe("telemetry", on_event=self.telemetry.on_event, queue_maxsize=10_000)
         await self.telemetry.start()
 
@@ -214,6 +216,23 @@ class DaemonService:
             emit_cooldown_sec=2.0,
         )
         self.strategy.attach(self.bus.publish)
+
+        # Phase 4.10 (4.9.1-c): route GATE_REJECTED + INTENT_ADMITTED back
+        # to the emitting strategy so the cooldown helpers in the base
+        # class observe outcomes. Single subscriber; filter by strategy_id
+        # on our side rather than adding per-strategy queues.
+        async def _strategy_feedback(event: Event) -> None:
+            if event.strategy_id != self.strategy.strategy_id:
+                return
+            if event.event_type == EventType.GATE_REJECTED:
+                await self.strategy.on_gate_rejected(event)
+            elif event.event_type == EventType.INTENT_ADMITTED:
+                await self.strategy.on_intent_admitted(event)
+        await self.bus.subscribe(
+            "strategy-feedback",
+            on_event=_strategy_feedback,
+            queue_maxsize=10_000,
+        )
 
         # Phase 4.7 F1 (K1/P1 regression): register the strategy's
         # declared markets so the StructuralGate admits real intents.

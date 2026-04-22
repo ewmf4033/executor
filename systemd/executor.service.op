@@ -1,0 +1,53 @@
+[Unit]
+Description=Executor (Build Zero 0d) — paper-mode daemon
+Documentation=file:///root/trading-wiki/specs/0d-executor.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/executor
+Environment=PYTHONUNBUFFERED=1
+Environment=EXECUTOR_LOG_LEVEL=INFO
+Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs/paper_live
+Environment=PAPER_MODE=true
+# Phase 5 TODO: remove once venue adapter wires real orderbook subscriptions.
+Environment=EXECUTOR_PAPER_MODE_NO_ORDERBOOK=true
+
+# Phase 4.10 (0k): 1Password service account token. Root-only file; no
+# raw secrets in this unit. `op run` below resolves op:// URIs from op.env
+# using this token.
+EnvironmentFile=/etc/executor/op-service-account-token
+
+# Phase 4.10 (0k): wrap ExecStart with `op run --env-file=/etc/executor/op.env`.
+# op resolves each op:// URI and injects the resolved value into the child
+# process's env. If op fails (network, token revoked, vault item missing)
+# the daemon won't start — preferred over silently running with stale or
+# empty secrets. Emergency fallback path is documented at
+# trading-wiki/ops/secrets.md.
+ExecStart=/usr/local/bin/op run --env-file=/etc/executor/op.env -- \
+    /root/executor/.venv/bin/python -m executor --daemon
+
+# Restart policy — crash-loop guard: give up after 3 restarts in 60s so
+# systemd doesn't mask a broken pipeline the way Phase 4's burn-in did.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Graceful shutdown: SIGTERM triggers bus drain + audit flush + STATE_SAVED.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Append stdout/stderr to a single log file; journalctl still sees it via
+# systemd's stdlib wrapper.
+StandardOutput=append:/var/log/executor.log
+StandardError=append:/var/log/executor.log
+
+# Resource caps.
+MemoryMax=1G
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

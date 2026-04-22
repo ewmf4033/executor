@@ -1,32 +1,18 @@
-# Backfill: cost_basis_dollars and venue_fee_bps
+# Backfill: cost_basis_dollars and venue_fee_bps — COMPLETED 2026-04-22
 
-Rows inserted before the 2026-04-21 migration have NULL for
-`cost_basis_dollars` and `venue_fee_bps`.
+Completed in Phase 4.10 via `scripts/backfill_attribution.py`.
 
-To backfill BUY rows:
+All 328 pre-migration rows had NULL `cost_basis_dollars` and `venue_fee_bps`
+populated from `size`, `fill_price`, `fee`, and `side`. Post-backfill:
 
-```sql
-UPDATE attribution
-SET cost_basis_dollars = CAST(size AS REAL) * CAST(fill_price AS REAL)
-                         + COALESCE(CAST(fee AS REAL), 0)
-WHERE cost_basis_dollars IS NULL AND side = 'BUY';
+```
+sqlite3 state/attribution.sqlite \
+  "SELECT COUNT(*) FROM attribution WHERE cost_basis_dollars IS NULL"
+# -> 0
 ```
 
-To backfill SELL rows:
+The script is idempotent (COALESCE, only touches NULL rows) and remains in
+the repo so the same procedure applies if another migration introduces new
+nullable-at-add columns in the future.
 
-```sql
-UPDATE attribution
-SET cost_basis_dollars = CAST(size AS REAL) * CAST(fill_price AS REAL)
-                         - COALESCE(CAST(fee AS REAL), 0)
-WHERE cost_basis_dollars IS NULL AND side = 'SELL';
-```
-
-To backfill venue_fee_bps (all sides):
-
-```sql
-UPDATE attribution
-SET venue_fee_bps = (CAST(fee AS REAL) / (CAST(size AS REAL) * CAST(fill_price AS REAL))) * 10000
-WHERE venue_fee_bps IS NULL
-  AND fee IS NOT NULL
-  AND CAST(size AS REAL) * CAST(fill_price AS REAL) > 0;
-```
+Log: /var/log/attribution-backfill.log
