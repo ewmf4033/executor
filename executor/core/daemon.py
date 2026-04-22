@@ -45,6 +45,7 @@ from ..risk.kill import KillSwitch
 from ..risk.policy import RiskPolicy
 from ..risk.state import RiskState
 from ..strategies.yes_no_cross.strategy import CrossPair, YESNOCrossDetect
+from ..telegram.bot import TelegramBot
 from .event_bus import EventBus
 from .events import Event, EventType, Source
 from .logging import configure, get_logger
@@ -104,6 +105,7 @@ class DaemonService:
         self.telemetry: TelemetryServer | None = None
         self.orchestrator: Orchestrator | None = None
         self.strategy: YESNOCrossDetect | None = None
+        self.telegram_bot: TelegramBot | None = None
 
         self._stop_event = asyncio.Event()
         self._bg_tasks: list[asyncio.Task[Any]] = []
@@ -178,6 +180,24 @@ class DaemonService:
         # Phase 4.9 Item 1: plumb kill_mgr into AuditWriter so persistent
         # audit write failures can engage the kill switch (fail-closed).
         self.audit.set_kill_manager(self.kill_mgr)
+
+        # Phase 4.11.1: wire TelegramBot into the daemon lifecycle so /kill
+        # commands land on the shared KillManager. The bot reads
+        # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from os.environ at __init__;
+        # if either is missing, start() silently no-ops (logs
+        # telegram.bot.disabled.no_token / .no_chat_id) and _task stays None.
+        self.telegram_bot = TelegramBot(kill_manager=self.kill_mgr)
+        await self.telegram_bot.start()
+        await self.bus.publish(
+            Event.make(
+                EventType.EXECUTOR_LIFECYCLE,
+                source=Source.EXECUTOR,
+                payload={
+                    "state": "TELEGRAM_BOT_STARTED",
+                    "enabled": self.telegram_bot._task is not None,
+                },
+            )
+        )
 
         self.attribution = AttributionTracker(
             db_path=self.attribution_db,
@@ -564,6 +584,13 @@ class DaemonService:
         if self.telemetry is not None:
             try:
                 await self.telemetry.stop()
+            except Exception:
+                pass
+        # Phase 4.11.1: stop the Telegram bot before closing the bus so its
+        # poll loop is torn down cleanly and can't race the sentinel.
+        if self.telegram_bot is not None:
+            try:
+                await self.telegram_bot.stop()
             except Exception:
                 pass
         # (7) Bus final close.

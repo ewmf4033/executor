@@ -3,6 +3,11 @@ Description=Executor (Build Zero 0d) — paper-mode daemon
 Documentation=file:///root/trading-wiki/specs/0d-executor.md
 After=network-online.target
 Wants=network-online.target
+# Phase 4.11.1: crash-loop guard belongs under [Unit] per systemd.unit(5).
+# Previously these were in [Service], which systemd silently ignores (warns
+# "Unknown key" in the journal) — defeating the guard entirely.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -17,14 +22,18 @@ Environment=PAPER_MODE=true
 # to be skipped. Without a real provider the gate silently approves, which is
 # acceptable for synthetic-quote paper runs but NOT for real capital.
 Environment=EXECUTOR_PAPER_MODE_NO_ORDERBOOK=true
+# Phase 4.11.1: out-of-git secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, …)
+# live in /root/executor/.env (chmod 600, created out-of-band by ops). Leading
+# '-' makes the file optional so the unit still starts if .env is absent.
+# Interim measure — Phase 4.10.1 will migrate this to 1Password.
+EnvironmentFile=-/root/executor/.env
 ExecStart=/root/executor/.venv/bin/python -m executor --daemon
 
 # Restart policy — crash-loop guard: give up after 3 restarts in 60s so
 # systemd doesn't mask a broken pipeline the way Phase 4's burn-in did.
+# (StartLimit* keys live in [Unit]; see above.)
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
 
 # Graceful shutdown: SIGTERM triggers bus drain + audit flush + STATE_SAVED.
 KillSignal=SIGTERM
