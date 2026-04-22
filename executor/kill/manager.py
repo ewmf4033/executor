@@ -108,6 +108,20 @@ class KillManager:
     def set_publish(self, publish: Publish) -> None:
         self._publish = publish
 
+    def update_kill_switch_config(
+        self,
+        *,
+        auto_resume_strike_limit: int | None = None,
+        panic_cooldown_sec: int | None = None,
+    ) -> None:
+        """Phase 4.11 (Review 8 finding 0c-6): live-update the values that
+        were previously only consumed at construction, so SIGHUP reloads
+        of risk.yaml actually take effect on an already-running manager."""
+        if auto_resume_strike_limit is not None:
+            self._auto_resume_strike_limit = int(auto_resume_strike_limit)
+        if panic_cooldown_sec is not None:
+            self._panic_cooldown_sec = int(panic_cooldown_sec)
+
     def register_adapter(self, venue_id: str, adapter: _MinimalAdapter) -> None:
         self._adapters[venue_id] = adapter
         log.info("kill.manager.adapter_registered", venue=venue_id)

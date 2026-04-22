@@ -282,10 +282,77 @@ class Orchestrator:
         (FILL → attribution upsert → INTENT_COMPLETE). When a real venue
         subscription lands, the paper poller in KalshiAdapter takes over
         and this method is no longer called.
+
+        Phase 4.11 Item 3 (Review 9 finding #3): re-check the kill switch
+        at the start of _paper_fill and before every per-leg emit. The
+        policy.kill_switch_recheck gate closes the post-risk gap, but the
+        window between INTENT_ADMITTED and first ORDER_PLACED/FILL, as
+        well as between legs of a multi-leg basket, is still reachable.
+        If killed, we emit ORDER_CANCELLED_PRE_SEND and return without
+        placing further orders. Belt-and-suspenders with the policy-side
+        recheck — both layers are wanted.
         """
         now_ns = time.time_ns()
+        killed, kill_reason = self._policy.kill_switch.is_killed(
+            strategy_id=intent.strategy_id, venue=None
+        )
+        if killed:
+            await self._bus.publish(
+                Event.make(
+                    EventType.ORDER_CANCELLED_PRE_SEND,
+                    source=Source.EXECUTOR,
+                    intent_id=intent.intent_id,
+                    strategy_id=intent.strategy_id,
+                    payload={
+                        "kill_reason": kill_reason,
+                        "intent_id": intent.intent_id,
+                        "strategy_id": intent.strategy_id,
+                        "n_legs_skipped": len(intent.legs),
+                        "stage": "pre_first_leg",
+                    },
+                )
+            )
+            log.warning(
+                "orchestrator.paper_fill.kill_pre_send",
+                intent_id=intent.intent_id,
+                reason=kill_reason,
+                n_legs_skipped=len(intent.legs),
+            )
+            return
         filled_legs = 0
-        for leg in intent.legs:
+        for leg_idx, leg in enumerate(intent.legs):
+            # Re-check mid-basket: a kill can fire between legs, and an
+            # ALL_OR_NONE basket that's partially emitted produces an
+            # orphan. Skip the remaining legs and record how many were
+            # skipped so the audit + alerting can reason about it.
+            killed, kill_reason = self._policy.kill_switch.is_killed(
+                strategy_id=intent.strategy_id, venue=leg.venue
+            )
+            if killed:
+                await self._bus.publish(
+                    Event.make(
+                        EventType.ORDER_CANCELLED_PRE_SEND,
+                        source=Source.EXECUTOR,
+                        intent_id=intent.intent_id,
+                        strategy_id=intent.strategy_id,
+                        payload={
+                            "kill_reason": kill_reason,
+                            "intent_id": intent.intent_id,
+                            "strategy_id": intent.strategy_id,
+                            "n_legs_skipped": len(intent.legs) - leg_idx,
+                            "n_legs_emitted": leg_idx,
+                            "stage": "mid_basket",
+                        },
+                    )
+                )
+                log.warning(
+                    "orchestrator.paper_fill.kill_mid_basket",
+                    intent_id=intent.intent_id,
+                    reason=kill_reason,
+                    n_legs_skipped=len(intent.legs) - leg_idx,
+                    n_legs_emitted=leg_idx,
+                )
+                break
             fill_id = f"orch-paper-{uuid.uuid4().hex[:16]}"
             order_id = f"orch-order-{uuid.uuid4().hex[:12]}"
             # Emit ORDER_PLACED + FILL so the audit timeline is complete.

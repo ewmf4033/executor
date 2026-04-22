@@ -40,7 +40,8 @@ from ..detectors.adverse_selection import (
 )
 from ..kill.manager import KillManager
 from ..kill.state import KillStateStore
-from ..risk.config import ConfigManager
+from ..risk.config import ConfigManager, RiskConfig
+from ..risk.kill import KillSwitch
 from ..risk.policy import RiskPolicy
 from ..risk.state import RiskState
 from ..strategies.yes_no_cross.strategy import CrossPair, YESNOCrossDetect
@@ -135,7 +136,45 @@ class DaemonService:
         await self.risk_state.load()
 
         self.kill_store = KillStateStore(self.kill_db)
-        self.kill_mgr = KillManager(store=self.kill_store, publish=self.bus.publish)
+        # Phase 4.11 Item 1 (Review 8 0c-7, Review 9 #2): share a single
+        # KillSwitch instance between KillManager and RiskPolicy so a
+        # /kill hard command engages the same object both the gate chain
+        # and the post-admission recheck consult. Without this, the
+        # manager engaged its own KillSwitch and the policy continued to
+        # admit intents via a default, never-engaged instance ("split-brain").
+        self._shared_kill_switch = KillSwitch()
+        # Phase 4.11 Item 4 (Review 8 0c-6): propagate YAML overrides
+        # auto_resume_strike_limit + panic_cooldown_sec into the manager.
+        # Previously these were only honored at default values because the
+        # config values were never passed through.
+        kill_cfg = self.config_mgr.config.kill_switch
+        self.kill_mgr = KillManager(
+            store=self.kill_store,
+            kill_switch=self._shared_kill_switch,
+            publish=self.bus.publish,
+            auto_resume_strike_limit=kill_cfg.auto_resume_strike_limit,
+            panic_cooldown_sec=kill_cfg.panic_cooldown_sec,
+        )
+        # Phase 4.11 Item 5 (Review 8 0c-5): if the kill DB was corrupt and
+        # rebuilt, surface an ERROR event so the operator knows to
+        # investigate. The manager exists now so we have a bus reference.
+        if self.kill_store.rebuilt_from_corruption:
+            await self.bus.publish(
+                Event.make(
+                    EventType.ERROR,
+                    source=Source.KILL,
+                    payload={
+                        "kind": "KILL_DB_REBUILT_FROM_CORRUPTION",
+                        "kill_db_path": str(self.kill_db),
+                        "note": (
+                            "Corrupt kill_state.sqlite was renamed aside and "
+                            "a fresh DB was created in mode=NONE. Operator "
+                            "should inspect the .corrupt-* backup to decide "
+                            "whether a kill state needs to be re-engaged."
+                        ),
+                    },
+                )
+            )
         # Phase 4.9 Item 1: plumb kill_mgr into AuditWriter so persistent
         # audit write failures can engage the kill switch (fail-closed).
         self.audit.set_kill_manager(self.kill_mgr)
@@ -144,6 +183,9 @@ class DaemonService:
             db_path=self.attribution_db,
             exit_horizon_sec=self.config_mgr.config.attribution.exit_horizon_sec,
             publish=self.bus.publish,
+            # Phase 4.11 Item 2 (Review 8 0c-3): settlement records PnL
+            # delta against daily_pnl so gate_13 has a real counter.
+            risk_state=self.risk_state,
         )
 
         # Phase 4.7 F4: explicit adverse-selection detector required by
@@ -161,7 +203,26 @@ class DaemonService:
             state=self.risk_state,
             adverse_selection=self.adverse_selection,
             publish=self.bus.publish,
+            # Phase 4.11 Item 1: share the KillSwitch with KillManager so
+            # /kill hard engages the exact instance the gate chain and the
+            # kill_switch_recheck both consult.
+            kill_switch=self._shared_kill_switch,
         )
+        # Phase 4.11 Item 1: invariant assertion — catches regressions
+        # where a future refactor forgets to share the instance and silently
+        # re-creates a default KillSwitch() in one of the two constructors.
+        assert self.kill_mgr._kill_switch is self.policy.kill_switch, (
+            "KillSwitch split-brain regression — shared instance invariant broken"
+        )
+        # Phase 4.11 Item 4: also push kill_switch config updates through
+        # SIGHUP reloads. RiskPolicy already registers its own reload hook;
+        # ours is additive and runs after, so both subsystems resync.
+        async def _kill_mgr_reload(new_cfg: RiskConfig) -> None:
+            self.kill_mgr.update_kill_switch_config(
+                auto_resume_strike_limit=new_cfg.kill_switch.auto_resume_strike_limit,
+                panic_cooldown_sec=new_cfg.kill_switch.panic_cooldown_sec,
+            )
+        self.config_mgr.register_reload_hook(_kill_mgr_reload)
         self.policy.set_venue_capabilities(
             {"kalshi": frozenset({"supports_limit", "supports_market"}),
              "polymarket": frozenset({"supports_limit"}),

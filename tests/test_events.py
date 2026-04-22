@@ -22,6 +22,8 @@ def test_event_type_count_and_uniqueness():
         "KILL_COMMAND_RECEIVED", "KILL_STATE_CHANGED",
         # Phase 4.5 — daemon lifecycle + startup pipeline self-check
         "SELF_CHECK_OK", "SELF_CHECK_FAIL", "STATE_SAVED",
+        # Phase 4.11 — post-admission kill recheck (Review 9 #3)
+        "ORDER_CANCELLED_PRE_SEND",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"

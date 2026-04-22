@@ -40,6 +40,9 @@ from ..core.events import Event, EventType, Source
 from ..core.logging import get_logger
 from ..core.types import Side
 
+if False:  # TYPE_CHECKING — avoid circular import at runtime
+    from ..risk.state import RiskState
+
 
 log = get_logger("executor.attribution")
 
@@ -139,6 +142,7 @@ class AttributionTracker:
         db_path: str | Path,
         exit_horizon_sec: int = 300,
         publish=None,
+        risk_state: "RiskState | None" = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +152,11 @@ class AttributionTracker:
         self._conn.commit()
         self._exit_horizon_sec = exit_horizon_sec
         self._publish = publish
+        # Phase 4.11 (Review 8 finding 0c-3): settlement realized-PnL delta
+        # is written to RiskState so gate_13 (daily_loss) actually has a
+        # non-zero counter to evaluate. Optional at ctor time so unit
+        # tests that don't need PnL integration remain lightweight.
+        self._risk_state = risk_state
         # Decision/arrival prices we've recorded ahead of fills.
         self._decision: dict[str, Decimal] = {}             # intent_id -> mid
         self._arrival: dict[tuple[str, str], Decimal] = {}  # (intent_id, leg_id) -> mid
@@ -318,6 +327,30 @@ class AttributionTracker:
                 )
             p.record.settled_ts_ns = now_ns
             self._upsert(p.record)
+            # Phase 4.11 Item 2 (Review 8 0c-3): realized-alpha → daily PnL.
+            # _signed() already normalizes so that positive short_term_alpha
+            # means the strategy earned alpha (positive PnL). We write a
+            # delta = short_term_alpha * size, which is the strategy's
+            # realized PnL on that fill over the exit horizon. Done after
+            # the DB upsert so a record write failure doesn't desync.
+            if (
+                self._risk_state is not None
+                and p.record.short_term_alpha is not None
+            ):
+                try:
+                    pnl_delta = p.record.short_term_alpha * p.record.size
+                    self._risk_state.record_pnl(
+                        p.record.strategy_id,
+                        pnl_delta,
+                        now_ns=now_ns,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    log.warning(
+                        "attribution.record_pnl_failed",
+                        error=str(exc),
+                        strategy_id=p.record.strategy_id,
+                        fill_id=p.record.fill_id,
+                    )
             settled.append(p.record)
             if self._publish is not None:
                 try:

@@ -87,6 +87,11 @@ class EventType(str, Enum):
     SELF_CHECK_FAIL = "SELF_CHECK_FAIL"
     STATE_SAVED = "STATE_SAVED"
 
+    # Phase 4.11 — post-admission kill recheck (Review 9 #3). Distinct from
+    # BASKET_CANCELLED so Phase 5 alerting can separately track orders that
+    # were killed after risk admission but before venue emission.
+    ORDER_CANCELLED_PRE_SEND = "ORDER_CANCELLED_PRE_SEND"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
@@ -94,8 +99,10 @@ class EventType(str, Enum):
 # the reconciliation. Phase 4 added KILL_COMMAND_RECEIVED + KILL_STATE_CHANGED
 # (telegram bot + kill-switch lifecycle). Phase 4.5 added SELF_CHECK_OK,
 # SELF_CHECK_FAIL, STATE_SAVED (daemon lifecycle + pipeline self-check).
+# Phase 4.11 added ORDER_CANCELLED_PRE_SEND (Review 9 #3: kill switch
+# between risk admission and venue emit).
 # Guard against silent drift:
-assert len(EventType) == 39, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 40, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------
