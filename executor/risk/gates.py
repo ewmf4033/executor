@@ -178,6 +178,14 @@ class PoisoningGate(Gate):
     async def check(self, ctx: GateCtx) -> GateResult:
         tracker = ctx.policy.poisoning
         if tracker is None:
+            # Phase 4.13: fail-closed in capital mode. Paper mode preserves
+            # the pre-existing approve-on-None behavior so tests that don't
+            # wire a tracker keep working.
+            if ctx.policy.config.capital_mode:
+                return GateResult.reject(
+                    "poisoning_unavailable_capital_mode: "
+                    "poisoning tracker not configured while capital_mode=True"
+                )
             return GateResult.approve()
         intent = ctx.current_intent
         for leg in intent.legs:

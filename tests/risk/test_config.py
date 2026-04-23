@@ -91,3 +91,75 @@ def test_fingerprint_stable(tmp_path: Path):
     a = load_config(p)
     b = load_config(p)
     assert a.fingerprint() == b.fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Phase 4.13 — range validation on numeric config fields (Finding #6)
+# --------------------------------------------------------------------------
+
+
+def test_config_rejects_negative_window_sec(tmp_path: Path):
+    """Negative poisoning.window_sec must raise ConfigError at parse time."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"poisoning": {"window_sec": -5}}))
+    with pytest.raises(ConfigError, match="poisoning.window_sec"):
+        load_config(p)
+
+
+def test_config_rejects_zero_min_samples(tmp_path: Path):
+    """Zero poisoning.min_samples would disable the detector — reject."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"poisoning": {"min_samples": 0}}))
+    with pytest.raises(ConfigError, match="poisoning.min_samples"):
+        load_config(p)
+
+
+def test_config_rejects_out_of_range_z_threshold(tmp_path: Path):
+    """z_threshold must stay in [0.5, 20.0]: below = too-sensitive,
+    above = effectively disabled."""
+    p_low = tmp_path / "low.yaml"
+    p_low.write_text(yaml.safe_dump({"poisoning": {"z_threshold": 0.1}}))
+    with pytest.raises(ConfigError, match="poisoning.z_threshold"):
+        load_config(p_low)
+
+    p_high = tmp_path / "high.yaml"
+    p_high.write_text(yaml.safe_dump({"poisoning": {"z_threshold": 100.0}}))
+    with pytest.raises(ConfigError, match="poisoning.z_threshold"):
+        load_config(p_high)
+
+
+def test_config_rejects_negative_panic_cooldown(tmp_path: Path):
+    """kill_switch.panic_cooldown_sec must be >= 0."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"kill_switch": {"panic_cooldown_sec": -1}}))
+    with pytest.raises(ConfigError, match="kill_switch.panic_cooldown_sec"):
+        load_config(p)
+
+
+def test_config_accepts_valid_ranges_unchanged(tmp_path: Path):
+    """Smoke test: known-valid values still load with no regression on
+    default behavior or parsed values."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "poisoning": {
+            "window_sec": 1800,
+            "z_threshold": 3.5,
+            "min_samples": 50,
+            "pause_sec": 600,
+        },
+        "kill_switch": {
+            "auto_resume_strike_limit": 5,
+            "panic_cooldown_sec": 0,  # non-negative OK
+        },
+        "venue_health": {
+            "window_sec": 30,
+            "trip_threshold": 3,
+            "pause_sec": 60,
+        },
+    }))
+    cfg = load_config(p)
+    assert cfg.poisoning.window_sec == 1800
+    assert cfg.poisoning.z_threshold == 3.5
+    assert cfg.poisoning.min_samples == 50
+    assert cfg.kill_switch.panic_cooldown_sec == 0
+    assert cfg.venue_health.window_sec == 30

@@ -170,9 +170,12 @@ class DaemonService:
                         "kill_db_path": str(self.kill_db),
                         "note": (
                             "Corrupt kill_state.sqlite was renamed aside and "
-                            "a fresh DB was created in mode=NONE. Operator "
-                            "should inspect the .corrupt-* backup to decide "
-                            "whether a kill state needs to be re-engaged."
+                            "a fresh DB was seeded in mode=HARD with "
+                            "manual_only=True (reason=KILL_DB_CORRUPT_REBUILT). "
+                            "Trading is stopped until an operator inspects the "
+                            ".corrupt-* backup and explicitly resolves via "
+                            "KillManager. Set EXECUTOR_FORCE_RESET_KILL_STATE=1 "
+                            "at daemon startup to bypass (seeds NONE instead)."
                         ),
                     },
                 )

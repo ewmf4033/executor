@@ -104,6 +104,10 @@ class AttributionCfg:
 
 @dataclass(frozen=True, slots=True)
 class RiskConfig:
+    # Phase 4.13: when True, safety gates fail-closed rather than no-op when
+    # their backing detector/tracker is unavailable. Default False preserves
+    # paper-mode behavior for tests that disable subsystems.
+    capital_mode: bool = False
     structural: StructuralCfg = field(default_factory=StructuralCfg)
     venue_health: VenueHealthCfg = field(default_factory=VenueHealthCfg)
     per_intent: PerIntentCfg = field(default_factory=PerIntentCfg)
@@ -155,6 +159,48 @@ class ConfigError(Exception):
     """Raised on malformed risk.yaml."""
 
 
+def _require_positive_int(value: Any, field_name: str, *, max_val: int | None = None) -> int:
+    """Coerce to int; require value > 0; optional upper bound.
+
+    Raises ConfigError on type failure, non-positive value, or over-max.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be an integer, got {value!r}") from exc
+    if v <= 0:
+        raise ConfigError(f"{field_name} must be positive, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_non_negative_int(value: Any, field_name: str, *, max_val: int | None = None) -> int:
+    """Coerce to int; require value >= 0; optional upper bound."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be an integer, got {value!r}") from exc
+    if v < 0:
+        raise ConfigError(f"{field_name} must be non-negative, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_range_float(value: Any, field_name: str, min_val: float, max_val: float) -> float:
+    """Coerce to float; require min_val <= value <= max_val."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be a float, got {value!r}") from exc
+    if not (min_val <= v <= max_val):
+        raise ConfigError(
+            f"{field_name} must be in [{min_val}, {max_val}], got {v}"
+        )
+    return v
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
     """Load RiskConfig from YAML at `path`. Returns defaults if path is None/missing."""
     if path is None:
@@ -174,6 +220,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
 
     try:
         cfg = RiskConfig(
+            capital_mode=bool(raw.get("capital_mode", False)),
             structural=_parse_structural(raw.get("structural", {})),
             venue_health=_parse_venue_health(raw.get("venue_health", {})),
             per_intent=_parse_per_intent(raw.get("per_intent", {})),
@@ -210,9 +257,9 @@ def _parse_structural(d: dict[str, Any]) -> StructuralCfg:
 
 def _parse_venue_health(d: dict[str, Any]) -> VenueHealthCfg:
     return VenueHealthCfg(
-        window_sec=int(d.get("window_sec", 60)),
-        trip_threshold=int(d.get("trip_threshold", 2)),
-        pause_sec=int(d.get("pause_sec", 120)),
+        window_sec=_require_positive_int(d.get("window_sec", 60), "venue_health.window_sec", max_val=86400),
+        trip_threshold=_require_positive_int(d.get("trip_threshold", 2), "venue_health.trip_threshold", max_val=10000),
+        pause_sec=_require_positive_int(d.get("pause_sec", 120), "venue_health.pause_sec", max_val=86400),
     )
 
 
@@ -251,10 +298,10 @@ def _parse_poisoning(d: dict[str, Any]) -> PoisoningCfg:
     return PoisoningCfg(
         enabled=bool(d.get("enabled", True)),
         detector=str(d.get("detector", "zscore")),
-        window_sec=int(d.get("window_sec", 3600)),
-        z_threshold=float(d.get("z_threshold", 5.0)),
-        pause_sec=int(d.get("pause_sec", 300)),
-        min_samples=int(d.get("min_samples", 20)),
+        window_sec=_require_positive_int(d.get("window_sec", 3600), "poisoning.window_sec", max_val=86400),
+        z_threshold=_require_range_float(d.get("z_threshold", 5.0), "poisoning.z_threshold", 0.5, 20.0),
+        pause_sec=_require_positive_int(d.get("pause_sec", 300), "poisoning.pause_sec", max_val=86400),
+        min_samples=_require_positive_int(d.get("min_samples", 20), "poisoning.min_samples", max_val=10000),
         detector_kwargs=dict(d.get("detector_kwargs", {}) or {}),
     )
 
@@ -270,8 +317,16 @@ def _parse_adverse_selection(d: dict[str, Any]) -> AdverseSelectionCfg:
 
 def _parse_kill_switch(d: dict[str, Any]) -> KillSwitchCfg:
     return KillSwitchCfg(
-        auto_resume_strike_limit=int(d.get("auto_resume_strike_limit", 3)),
-        panic_cooldown_sec=int(d.get("panic_cooldown_sec", 300)),
+        auto_resume_strike_limit=_require_positive_int(
+            d.get("auto_resume_strike_limit", 3),
+            "kill_switch.auto_resume_strike_limit",
+            max_val=100,
+        ),
+        panic_cooldown_sec=_require_non_negative_int(
+            d.get("panic_cooldown_sec", 300),
+            "kill_switch.panic_cooldown_sec",
+            max_val=86400,
+        ),
     )
 
 

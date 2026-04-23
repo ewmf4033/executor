@@ -26,6 +26,8 @@ def test_event_type_count_and_uniqueness():
         "ORDER_CANCELLED_PRE_SEND",
         # Phase 4.12 — 0g hardening (Codex Review 7 v2 findings #3, #4)
         "POISONING_INPUT_REJECTED", "POISONING_DETECTOR_ERROR",
+        # Phase 4.13 — operator bypass of fail-closed kill-DB-corruption rebuild
+        "KILL_STATE_FORCE_RESET",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"

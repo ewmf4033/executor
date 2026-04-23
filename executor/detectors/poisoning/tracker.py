@@ -18,7 +18,11 @@ Phase 4.12 hardening (Codex Review 7 v2):
   POISONING_INPUT_REJECTED and return early.
 - Exception containment: detector.check() and publish() wrapped; detector
   exceptions fail-close the market (auto-pause) and emit
-  POISONING_DETECTOR_ERROR. observe() never raises to caller.
+  POISONING_DETECTOR_ERROR. observe() never raises EXCEPT for TypeError
+  when prob is not Decimal — this is a caller-bug tripwire (all internal
+  callers pass Decimal). All other invalid inputs (non-finite, out of
+  range, empty market_id, etc.) emit POISONING_INPUT_REJECTED and return
+  early without state mutation.
 - Bounded state: _last_prob and _paused LRU-capped at MAX_MARKETS; expired
   pauses pruned opportunistically on each observe().
 """
@@ -154,9 +158,13 @@ class PoisoningTracker:
     ) -> Optional[Anomaly]:
         """Feed a new price sample. Returns Anomaly if this sample tripped.
 
-        Never raises. Invalid inputs are rejected (audit event + early return).
-        Detector exceptions fail-close the market (auto-pause) but do not
-        propagate.
+        Raises TypeError if ``prob`` is not a Decimal — this is a caller-bug
+        tripwire (all internal callers pass Decimal; a non-Decimal here means
+        an internal type violation, not adversarial data). All other invalid
+        inputs (non-finite prob, out-of-range prob, empty/overlong market_id,
+        non-positive ts_ns, etc.) are rejected via POISONING_INPUT_REJECTED
+        with early return — no state mutation. Detector exceptions fail-close
+        the market (auto-pause) but do not propagate.
         """
         now_ns = ts_ns if ts_ns is not None else time.time_ns()
 

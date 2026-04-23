@@ -149,6 +149,28 @@ async def test_poisoning_gate_approves_no_pause(policy):
     assert r.decision == GateDecision.APPROVE
 
 
+async def test_poisoning_gate_rejects_when_tracker_none_in_capital_mode(policy):
+    """Phase 4.13 Finding #2: in capital mode, a missing poisoning tracker
+    must fail-closed rather than silently approve."""
+    from dataclasses import replace
+
+    policy.poisoning = None
+    policy._cfg_mgr._config = replace(policy._cfg_mgr._config, capital_mode=True)
+    r = await PoisoningGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert "poisoning_unavailable_capital_mode" in r.reason
+
+
+async def test_poisoning_gate_approves_when_tracker_none_in_paper_mode(policy):
+    """Paper-mode behavior (capital_mode=False) preserved: missing tracker
+    approves so tests that don't wire a tracker keep working."""
+    policy.poisoning = None
+    # Default RiskConfig has capital_mode=False.
+    assert policy.config.capital_mode is False
+    r = await PoisoningGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+
+
 # --- 3 Adverse selection --------------------------------------------------
 
 

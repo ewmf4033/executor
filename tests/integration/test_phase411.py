@@ -504,7 +504,11 @@ def test_item5_corrupt_db_renamed_and_rebuilt(tmp_path: Path) -> None:
 
     assert store.rebuilt_from_corruption is True
     snap = store.load()
-    assert snap.mode == KillMode.NONE
+    # Phase 4.13: rebuild now fail-closes into HARD+manual_only (was NONE).
+    # See docstring on KillStateStore for rationale.
+    assert snap.mode == KillMode.HARD
+    assert snap.manual_only is True
+    assert snap.reason == "KILL_DB_CORRUPT_REBUILT"
 
     pattern = re.compile(r"^kill_state\.sqlite\.corrupt-\d{19}$")
     siblings = [p.name for p in tmp_path.iterdir()]
