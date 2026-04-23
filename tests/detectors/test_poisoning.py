@@ -16,7 +16,6 @@ from executor.detectors.poisoning import (
 )
 
 
-pytestmark = pytest.mark.asyncio
 
 
 async def test_zscore_flags_outlier():
