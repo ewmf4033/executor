@@ -6,17 +6,25 @@ delta abs z-score > 5."
 
 Requires `min_samples` observations in the window before any flag. Deltas
 more than window_sec old are evicted at each observation.
+
+Phase 4.12 hardening: per-market _Window entries are LRU-capped at
+MAX_MARKETS to defend against adversarial feeds allocating unbounded
+market_ids. Oldest-by-last-access is evicted when the cap is hit.
 """
 from __future__ import annotations
 
 import math
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Deque, Optional
+from typing import Any, Deque, Optional
 
 from .base import Anomaly, PoisoningDetector
+
+
+# Aligned with tracker.MAX_MARKETS. See tracker.py for rationale.
+MAX_MARKETS = 10_000
 
 
 @dataclass
@@ -37,11 +45,29 @@ class ZScoreDetector(PoisoningDetector):
         self.window_sec = window_sec
         self.z_threshold = z_threshold
         self.min_samples = min_samples
-        self._windows: dict[str, _Window] = {}
+        # OrderedDict gives O(1) LRU eviction via move_to_end +
+        # popitem(last=False).
+        self._windows: "OrderedDict[str, _Window]" = OrderedDict()
+        self._evictions_total = 0
+
+    def _touch(self, market_id: str) -> _Window:
+        """Return window for market_id, updating LRU order. Evict oldest
+        if we would exceed MAX_MARKETS on a new insert.
+        """
+        w = self._windows.get(market_id)
+        if w is not None:
+            self._windows.move_to_end(market_id)
+            return w
+        if len(self._windows) >= MAX_MARKETS:
+            self._windows.popitem(last=False)
+            self._evictions_total += 1
+        w = _Window(samples=deque())
+        self._windows[market_id] = w
+        return w
 
     async def check(self, market_id: str, prob_delta: Decimal) -> Optional[Anomaly]:
         now_ns = time.time_ns()
-        w = self._windows.setdefault(market_id, _Window(samples=deque()))
+        w = self._touch(market_id)
         cutoff = now_ns - self.window_sec * 1_000_000_000
         while w.samples and w.samples[0][0] < cutoff:
             w.samples.popleft()
@@ -73,5 +99,11 @@ class ZScoreDetector(PoisoningDetector):
         else:
             self._windows.pop(market_id, None)
 
-    def snapshot(self) -> dict[str, dict[str, int]]:
-        return {m: {"n_samples": len(w.samples)} for m, w in self._windows.items()}
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "markets_tracked": len(self._windows),
+            "evictions_total": self._evictions_total,
+            "per_market": {
+                m: {"n_samples": len(w.samples)} for m, w in self._windows.items()
+            },
+        }

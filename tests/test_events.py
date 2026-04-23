@@ -24,6 +24,8 @@ def test_event_type_count_and_uniqueness():
         "SELF_CHECK_OK", "SELF_CHECK_FAIL", "STATE_SAVED",
         # Phase 4.11 — post-admission kill recheck (Review 9 #3)
         "ORDER_CANCELLED_PRE_SEND",
+        # Phase 4.12 — 0g hardening (Codex Review 7 v2 findings #3, #4)
+        "POISONING_INPUT_REJECTED", "POISONING_DETECTOR_ERROR",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"

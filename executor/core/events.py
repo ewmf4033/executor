@@ -92,6 +92,11 @@ class EventType(str, Enum):
     # were killed after risk admission but before venue emission.
     ORDER_CANCELLED_PRE_SEND = "ORDER_CANCELLED_PRE_SEND"
 
+    # Phase 4.12 — 0g hardening: reject malformed inputs at poisoning boundary.
+    POISONING_INPUT_REJECTED = "POISONING_INPUT_REJECTED"
+    # Phase 4.12 — 0g hardening: detector raised; tracker fail-closed the market.
+    POISONING_DETECTOR_ERROR = "POISONING_DETECTOR_ERROR"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
@@ -100,9 +105,11 @@ class EventType(str, Enum):
 # (telegram bot + kill-switch lifecycle). Phase 4.5 added SELF_CHECK_OK,
 # SELF_CHECK_FAIL, STATE_SAVED (daemon lifecycle + pipeline self-check).
 # Phase 4.11 added ORDER_CANCELLED_PRE_SEND (Review 9 #3: kill switch
-# between risk admission and venue emit).
+# between risk admission and venue emit). Phase 4.12 added
+# POISONING_INPUT_REJECTED + POISONING_DETECTOR_ERROR (0g hardening:
+# input validation + detector exception fail-closed).
 # Guard against silent drift:
-assert len(EventType) == 40, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 42, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------
