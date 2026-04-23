@@ -16,6 +16,23 @@ from executor.core.events import Event, EventType, Source
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Replace the Telegram sender with a no-op for all tests in this file.
+
+    The audit writer calls _send_telegram_alert_direct() on the panic
+    path. Without this fixture, tests that exercise the threshold/panic
+    path send real alerts to the live bot token. This autouse fixture
+    protects against that leak. Tests that want to capture alert calls
+    can still override via their own monkeypatch.setattr.
+    """
+    monkeypatch.setattr(
+        "executor.audit.writer._send_telegram_alert_direct",
+        lambda text: None,
+    )
+
+
+
 async def test_schema_and_insert_round_trip():
     with tempfile.TemporaryDirectory() as td:
         w = AuditWriter(td)
