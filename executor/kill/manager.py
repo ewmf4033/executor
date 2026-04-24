@@ -252,8 +252,21 @@ class KillManager:
 
             # Track the mode we will actually persist. When not
             # effective we keep the stricter prior mode + reason.
+            #
+            # Phase 4.14e — reason preservation on HARD → HARD+PANIC.
+            # Before 4.14e, ``final_reason`` was only updated on
+            # ``raises_severity`` — so a HARD → HARD+PANIC upgrade
+            # (sets_new_panic=True, raises_severity=False) kept the
+            # stale HARD reason in the persisted snapshot, hiding the
+            # operator's panic reason from ``kill_status`` and the
+            # audit trail. The fix: any *effective* engage updates the
+            # reason to the incoming one, while no-op engages still
+            # preserve the prior reason. ``engaged_ts_ns`` continues
+            # to refresh only on severity-raising transitions, so
+            # HARD → HARD+PANIC preserves the original HARD
+            # engagement time for forensics.
             final_mode = mode if raises_severity else prev_mode
-            final_reason = reason if raises_severity else self._snapshot.reason
+            final_reason = reason if effective else self._snapshot.reason
 
             if effective:
                 self._snapshot.mode = final_mode

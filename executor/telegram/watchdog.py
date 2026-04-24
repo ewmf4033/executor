@@ -84,6 +84,22 @@ class TelegramWatchdog:
         self._restart_ts: deque[float] = deque()
         self._stop_event = asyncio.Event()
         self._escalated = False
+        # Phase 4.14e (H8) — once-only escalation latch needs a bounded
+        # reset. Prior versions set ``_escalated=True`` and never cleared
+        # it, so a recovered bot (subsequent healthy windows) still
+        # counted the watchdog as "fired"; a second genuine stall in
+        # the same daemon lifetime would emit no kill signal. The reset
+        # rule, spelled out: clear ``_escalated`` only after
+        #   (a) the rolling restart-timestamp deque is empty
+        #       (pruned of everything inside ``restart_window_sec``), AND
+        #   (b) a full ``stall_threshold_sec`` has elapsed since we first
+        #       observed a healthy gap following the escalation.
+        # ``_healthy_since_ts`` is set the first time we see a healthy
+        # gap while ``_escalated`` is True, and reset to ``None`` on any
+        # subsequent stall. Gating on (a) prevents oscillation: a bot
+        # that flaps between stall and brief recovery cannot drain the
+        # latch.
+        self._healthy_since_ts: float | None = None
 
     async def run(self) -> None:
         """Main watchdog loop. Runs until :meth:`stop` is called."""
@@ -123,7 +139,36 @@ class TelegramWatchdog:
         gap = now - last_activity
 
         if gap < self._stall_threshold_sec:
+            # Phase 4.14e (H8): bounded reset of the escalation latch.
+            # We only clear ``_escalated`` when the bot has genuinely
+            # recovered, defined as:
+            #   - the rolling restart-timestamp deque is empty
+            #     (no recent restarts within restart_window_sec), AND
+            #   - at least one full stall_threshold_sec has elapsed
+            #     since we first observed a healthy gap after the
+            #     escalation.
+            # Pruning the deque here (before the empty-check) mirrors
+            # the prune below so the reset path observes the same
+            # rolling window.
+            cutoff = now - self._restart_window_sec
+            while self._restart_ts and self._restart_ts[0] < cutoff:
+                self._restart_ts.popleft()
+            if self._escalated and not self._restart_ts:
+                if self._healthy_since_ts is None:
+                    self._healthy_since_ts = now
+                elif now - self._healthy_since_ts >= self._stall_threshold_sec:
+                    log.info(
+                        "telegram.watchdog.escalated_cleared",
+                        healthy_window_sec=round(
+                            now - self._healthy_since_ts, 2
+                        ),
+                    )
+                    self._escalated = False
+                    self._healthy_since_ts = None
             return  # healthy
+
+        # Stall seen — reset the healthy-window tracker.
+        self._healthy_since_ts = None
 
         # Stall detected.
         await self._emit_stall(gap=gap)
@@ -280,9 +325,28 @@ class TelegramWatchdog:
 
     async def _escalate(self, *, gap: float) -> None:
         """Engage SOFT kill via KillManager; emit escalation event with
-        the effective result (the call may be a no-op if the operator
-        has already engaged HARD/PANIC, per KillManager's monotonic
-        severity guarantee)."""
+        the effective before/after kill state.
+
+        Phase 4.14e — truthful result classification. Prior to this
+        change the payload defaulted to ``result="soft_kill_engaged"``
+        and only switched to ``"skipped_existing_stricter_kill"``
+        when the final mode was not SOFT. That defaulting was wrong
+        for the SOFT → SOFT case: a watchdog SOFT engage on an
+        already-SOFT row is a no-op (KillManager's monotonic
+        severity logic drops equal-severity engages) but the
+        emitted event still claimed ``soft_kill_engaged``. The fix
+        snapshots the kill state before the engage call and
+        classifies the result from the actual prior-mode:
+
+            prev NONE  → SOFT     =>  "soft_kill_engaged"
+            prev SOFT  → SOFT     =>  "noop_already_soft"
+            prev HARD* → SOFT     =>  "skipped_existing_stricter_kill"
+
+        The payload also carries ``effective`` / ``skipped_weaker``
+        so audit consumers don't have to infer the no-op from the
+        mode strings, and ``prev_mode`` / ``prev_panic`` to show the
+        actual transition rather than just the post-engage state.
+        """
         log.error(
             "telegram.watchdog.escalating",
             gap_sec=round(gap, 2),
@@ -291,9 +355,17 @@ class TelegramWatchdog:
         )
 
         attempted_mode = KillMode.SOFT
-        result = "soft_kill_engaged"
-        current_mode_after = KillMode.NONE
-        panic_after = False
+        # Snapshot BEFORE engage so the classification reflects the
+        # actual transition we drove, not just the final state.
+        prev_snap = self._kill.snapshot()
+        prev_mode = prev_snap.mode
+        prev_panic = prev_snap.panic
+
+        result = "kill_engage_error"  # pessimistic default — overridden on success
+        effective = False
+        skipped_weaker = False
+        current_mode_after = prev_mode
+        panic_after = prev_panic
         try:
             snap = await self._kill.engage(
                 attempted_mode,
@@ -302,18 +374,28 @@ class TelegramWatchdog:
             )
             current_mode_after = snap.mode
             panic_after = snap.panic
-            if snap.mode != attempted_mode or snap.panic:
-                # Either a stricter mode was already engaged or panic
-                # was already set — our SOFT engage did not change
-                # state (monotonic severity preserved the stricter
-                # prior kill).
-                if snap.mode != KillMode.SOFT:
-                    result = "skipped_existing_stricter_kill"
+
+            if prev_mode == KillMode.NONE:
+                # NONE → SOFT: a real engage landed.
+                result = "soft_kill_engaged"
+                effective = True
+            elif prev_mode == KillMode.SOFT:
+                # SOFT → SOFT: equal-severity engage is a no-op in
+                # KillManager; the audit trail must not claim an
+                # engagement happened.
+                result = "noop_already_soft"
+                effective = False
+                skipped_weaker = True
+            else:
+                # HARD or HARD+PANIC → our SOFT request was dropped by
+                # monotonic severity; the stricter prior mode stands.
+                result = "skipped_existing_stricter_kill"
+                effective = False
+                skipped_weaker = True
         except Exception as exc:
             log.error(
                 "telegram.watchdog.escalation_kill_failed", error=str(exc)
             )
-            result = "kill_engage_error"
 
         try:
             await self._bus.publish(
@@ -325,8 +407,13 @@ class TelegramWatchdog:
                         "restart_count": len(self._restart_ts),
                         "action": "soft_engage_attempted",
                         "result": result,
+                        "effective": bool(effective),
+                        "skipped_weaker": bool(skipped_weaker),
+                        "prev_mode": prev_mode.value,
+                        "prev_panic": bool(prev_panic),
                         "current_mode": current_mode_after.value,
                         "panic": panic_after,
+                        "requested_mode": attempted_mode.value,
                     },
                 )
             )

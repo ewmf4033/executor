@@ -76,6 +76,95 @@ def _parse_tg_timeout(raw: str) -> int:
     raise ValueError(f"unsupported timeout unit {unit!r}")
 
 
+def _sanitize_operator_reason(s: str, *, max_len: int = 200) -> str:
+    """Scrub an operator-provided reason string for safe logging/audit.
+
+    Phase 4.14e (M9) — operator text flows into log lines, audit
+    events, and eventually into Slack/ops dashboards. Raw Telegram
+    message bodies can contain control characters, CR/LF (which
+    break log parsers and enable log-injection lookalikes), ANSI
+    escapes (which corrupt terminal output), and arbitrary-length
+    prose. This helper:
+
+      * strips ANSI CSI escapes (``\\x1b[...<letter>``)
+      * replaces C0 control chars (including CR/LF/TAB) and DEL with
+        a single space so word boundaries survive
+      * collapses surrounding whitespace and trims to ``max_len``
+
+    Intentionally minimal — we don't attempt to defend against
+    Unicode bidi tricks or normalize emoji; those would require a
+    broader log-sanitization framework.  The input is a human-
+    typed chat message of at most a few hundred bytes, not
+    adversarial machine traffic.
+    """
+    if not s:
+        return ""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        # ANSI CSI: ESC '[' <params> <final letter 0x40-0x7E>
+        if ch == "\x1b" and i + 1 < n and s[i + 1] == "[":
+            i += 2
+            while i < n and not ("@" <= s[i] <= "~"):
+                i += 1
+            if i < n:
+                i += 1  # consume final letter
+            continue
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F:
+            out.append(" ")
+        else:
+            out.append(ch)
+        i += 1
+    cleaned = "".join(out).strip()
+    # Collapse multiple spaces that arose from control-char stripping.
+    if "  " in cleaned:
+        cleaned = " ".join(cleaned.split())
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
+
+async def _shielded_engage(coro, *, kind: str):
+    """Run ``coro`` shielded from caller-coroutine cancellation, AND
+    observe any exception it raises so it is not silently discarded.
+
+    Phase 4.14e follow-up (M8 robustness): ``asyncio.shield(coro)``
+    wraps ``coro`` in a Task. If our outer coroutine is cancelled
+    while the inner task is still running, ``await shield(...)``
+    raises ``CancelledError`` — but the inner task keeps running in
+    the background. If that inner task later raises, the exception
+    is held on the Task; if nothing ever retrieves it, asyncio logs
+    "Task exception was never retrieved" at GC time. Worse, from
+    the operator's perspective a panic engage could fail silently.
+
+    This helper creates the Task explicitly and, only if the outer
+    awaiter was cancelled (i.e. we lost our chance to observe the
+    result), attaches a done-callback that retrieves the exception
+    via ``task.exception()`` and logs it. The happy path and the
+    inner-raises-without-outer-cancel path are unchanged —
+    exceptions still propagate naturally to the caller.
+    """
+    task = asyncio.create_task(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def _retrieve_exc(t: "asyncio.Task[Any]") -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                log.error(
+                    "telegram.bot.shielded_engage_failed_after_cancel",
+                    kind=kind,
+                    error=str(exc),
+                )
+        task.add_done_callback(_retrieve_exc)
+        raise
+
+
 def _fmt_sec(seconds: int) -> str:
     sign = "-" if seconds < 0 else ""
     s = abs(int(seconds))
@@ -202,11 +291,23 @@ class TelegramBot:
     # ------------------------------------------------------------------
 
     def last_activity_ts(self) -> float:
-        """monotonic-clock timestamp of the most recent poll-loop iteration.
+        """monotonic-clock timestamp of the most recent *successful*
+        ``getUpdates`` call.
 
-        Updated on every iteration of ``_run`` — including error/backoff
-        paths — so the watchdog interprets "stall" as "the loop is not
-        running", not "the Telegram API is erroring".
+        Phase 4.14e (M7) — this timestamp is a **health** signal, not a
+        **liveness** signal. Earlier revisions ticked it on every loop
+        iteration (pre-call, post-success, and in the exception/backoff
+        path) so that a DNS or Telegram-API outage would not look like
+        a stall. That caused the opposite problem: a steadily-failing
+        ``getUpdates`` loop (expired token, resolved-but-unreachable
+        host, HTTP 5xx storm) showed as healthy to the watchdog even
+        though the operator had lost their command surface. The
+        watchdog is the component responsible for distinguishing "loop
+        is trying but failing" from "loop is wedged" — so this
+        timestamp now advances only on a successful Telegram
+        ``getUpdates`` round-trip (or on ``start()``, which gives the
+        bot one ``stall_threshold_sec`` grace window to achieve its
+        first success).
         """
         return self._last_activity_ts
 
@@ -232,16 +333,36 @@ class TelegramBot:
         log.info("telegram.bot.start")
 
     async def stop(self) -> None:
+        """Cancel the poll task and clear ``self._task`` unconditionally.
+
+        Phase 4.14e (H9) — the watchdog calls ``bot.stop()`` inside
+        ``asyncio.wait_for(..., timeout=restart_timeout_sec)``. Before
+        this fix, a timeout (which cancels ``stop()`` itself) left
+        ``self._task`` non-None, so the next ``start()`` returned
+        immediately (the ``if self._task is not None`` guard treated
+        the orphaned task as "still running"). The restart path then
+        never created a new poll task and the bot stayed down.
+
+        The try/finally guarantees ``self._task = None`` regardless of
+        how control leaves this coroutine — successful await, inner
+        CancelledError from the task itself, or outer CancelledError
+        from ``wait_for``. The aiohttp ``ClientSession`` is owned by
+        the poll task via ``async with``, so cancelling the task
+        invokes ``__aexit__`` and closes the session even if we are
+        ourselves cancelled before the await returns.
+        """
         if self._task is None:
             return
         self._stop.set()
         self._task.cancel()
         try:
-            await self._task
-        except (asyncio.CancelledError, Exception):
-            pass
-        self._task = None
-        log.info("telegram.bot.stop")
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        finally:
+            self._task = None
+            log.info("telegram.bot.stop")
 
     # ------------------------------------------------------------------
     # Public command dispatch (also used directly by tests)
@@ -266,10 +387,24 @@ class TelegramBot:
 
         # Parse BEFORE rate-limit enforcement so we can identify the
         # small set of critical kill subcommands that must always run.
+        #
+        # Phase 4.14e (M17): the critical-kill detection must look at
+        # parsed.command / parsed.sub WITHOUT the ``parsed.valid`` gate.
+        # A malformed ``/kill hard`` (missing reason) still has
+        # ``command="kill"`` and ``sub="hard"`` set — the parser only
+        # returns ``valid=False`` because the reason is absent. Prior
+        # to this change, the malformed command fell through to the
+        # rate-limit branch, consumed the chat's rate budget, and
+        # caused the operator's immediately-corrected ``/kill hard
+        # <reason>`` to be rate-limited. The corrected emergency
+        # command must always bypass the rate limit.
+        #
+        # Strict dispatch still rejects the malformed command (``if
+        # not parsed.valid: return "err: ..."``) so this does not
+        # weaken parse validation.
         parsed = parse_command(text)
         critical_kill = (
-            parsed.valid
-            and parsed.command == "kill"
+            parsed.command == "kill"
             and parsed.sub in ("hard", "panic")
         )
 
@@ -300,7 +435,20 @@ class TelegramBot:
                 snap = await self._kill.engage(KillMode.SOFT, p.args, source="telegram")
                 return f"OK: SOFT engaged ({snap.reason})"
             if p.sub == "hard":
-                snap = await self._kill.engage(KillMode.HARD, p.args, source="telegram")
+                # Phase 4.14e (M8): shield the engage from caller-
+                # coroutine cancellation. If the poll loop / handler
+                # task is cancelled (e.g. bot.stop() during shutdown)
+                # while we are mid-await on KillManager.engage, the
+                # KillStateStore.save() must still complete — the kill
+                # must persist. asyncio.shield only protects against
+                # the *outer* cancellation propagating into the engage
+                # coroutine; it does NOT fix DB stalls or a deadlock
+                # inside KillManager's own lock, and we make no claim
+                # it does.
+                snap = await _shielded_engage(
+                    self._kill.engage(KillMode.HARD, p.args, source="telegram"),
+                    kind="hard",
+                )
                 return f"OK: HARD engaged ({snap.reason})"
             if p.sub == "panic":
                 # Phase 4.14c: panic is engaged LOCALLY via KillManager
@@ -309,8 +457,12 @@ class TelegramBot:
                 # persists via KillStateStore inside its async lock, so
                 # even if the reply send subsequently fails, the kill
                 # state survives. Explicit forensic log for the trail.
-                snap = await self._kill.engage(
-                    KillMode.HARD, p.args, source="telegram", panic=True
+                # Phase 4.14e (M8): also shielded from caller cancellation.
+                snap = await _shielded_engage(
+                    self._kill.engage(
+                        KillMode.HARD, p.args, source="telegram", panic=True
+                    ),
+                    kind="panic",
                 )
                 log.info(
                     "telegram.panic.engaged_locally",
@@ -458,7 +610,7 @@ class TelegramBot:
     async def _do_disarm(self, reason: str) -> str:
         if self._operator_liveness is None:
             return "disarm: dead-man not wired"
-        reason = (reason or "").strip()
+        reason = _sanitize_operator_reason(reason)
         if not reason:
             return "disarm: reason required"
         now_ns = time.time_ns()
@@ -487,14 +639,16 @@ class TelegramBot:
         backoff = DEFAULT_LOOP_BACKOFF_SEC
         async with aiohttp.ClientSession() as session:  # type: ignore
             while not self._stop.is_set():
-                # Phase 4.14c: tick liveness BEFORE the call so a hung
-                # getUpdates still counts as "loop alive at T-now", while
-                # a wholly crashed/deadlocked task stops ticking entirely.
-                self._last_activity_ts = time.monotonic()
                 try:
                     updates = await self._get_updates(session)
-                    # Tick AFTER success too — proof the API responded
-                    # and we parsed the result cleanly.
+                    # Phase 4.14e (M7): tick ONLY on a successful
+                    # getUpdates. Errors and pre-call ticks used to
+                    # refresh this timestamp, which hid a failing
+                    # poll loop from the watchdog — a steady stream
+                    # of DNS/API errors looked identical to a healthy
+                    # bot. The watchdog now sees last_activity_ts
+                    # age past stall_threshold_sec when getUpdates is
+                    # actually failing, and restarts/escalates.
                     self._last_activity_ts = time.monotonic()
                     for upd in updates:
                         await self._handle_update(session, upd)
@@ -502,10 +656,12 @@ class TelegramBot:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    # Tick in the error path too — an error means the
-                    # loop is still trying, not stalled. Only a fully
-                    # dead task should stop updating this timestamp.
-                    self._last_activity_ts = time.monotonic()
+                    # Deliberately do NOT refresh _last_activity_ts
+                    # here — see M7 note above. The backoff sleep keeps
+                    # us off the CPU; the task is still alive so the
+                    # watchdog can distinguish "getUpdates failing" from
+                    # "task wedged" by comparing ``last_activity_ts``
+                    # drift vs. the pattern of failures.
                     log.warning("telegram.bot.loop.error", error=str(exc))
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)

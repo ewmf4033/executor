@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -612,23 +613,55 @@ class OperatorLivenessStore:
     The backing table is created by SCHEMA_SQL; the singleton row (id=1)
     is seeded via INSERT OR IGNORE on every connection open so fresh
     DBs have a valid starting row (armed=0).
+
+    Phase 4.14e — atomicity + writer serialization.
+
+    The backing sqlite3 connection is shared with the rest of
+    RiskState and is opened with ``check_same_thread=False``, which
+    permits cross-thread use at the cost of interleaved
+    read/branch/write sequences. Before this change ``heartbeat()``
+    performed ``load()`` → branch-on-armed → ``UPDATE``, so a
+    ``disarm()`` landing between the load and the update could leave
+    the row disarmed while still accepting the heartbeat write. The
+    caller would also see ``True`` and treat the heartbeat as
+    applied.
+
+    Hardening:
+      * ``heartbeat`` is now a single conditional ``UPDATE ...
+        WHERE armed = 1``; ``cursor.rowcount`` determines whether
+        the write applied (and therefore whether the caller sees
+        ``True``).
+      * ``_write_lock`` (``threading.RLock``) serializes every
+        arm/disarm/heartbeat write + commit sequence, so two writers
+        never share the connection cursor mid-transaction.
+      * ``load``/``status`` take the same lock: SQLite
+        isolation-level is autocommit-per-execute here, but the
+        lock keeps reads consistent against concurrent writers
+        (no partial ``last_heartbeat_ts_ns`` observed across the
+        write boundary).
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        # RLock so nested calls on the same thread (e.g. load() from
+        # status() while another method holds the lock) don't self-
+        # deadlock. Shared singleton lock: only one writer at a time.
+        self._write_lock = threading.RLock()
         # Defensive: guarantee singleton row exists even if this store is
         # constructed against a connection opened before SCHEMA_SQL ran.
-        self._conn.execute(
-            "INSERT OR IGNORE INTO operator_liveness (id) VALUES (1)"
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO operator_liveness (id) VALUES (1)"
+            )
+            self._conn.commit()
 
     def load(self) -> OperatorLivenessSnapshot:
-        row = self._conn.execute(
-            "SELECT armed, armed_ts_ns, timeout_sec, last_heartbeat_ts_ns, "
-            "armed_by_source, kill_mode_at_arm, disarmed_reason "
-            "FROM operator_liveness WHERE id = 1"
-        ).fetchone()
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT armed, armed_ts_ns, timeout_sec, last_heartbeat_ts_ns, "
+                "armed_by_source, kill_mode_at_arm, disarmed_reason "
+                "FROM operator_liveness WHERE id = 1"
+            ).fetchone()
         if row is None:
             # Should be unreachable given INSERT OR IGNORE above, but be
             # explicit rather than returning silently wrong state.
@@ -665,15 +698,16 @@ class OperatorLivenessStore:
         starts from arm time; the operator does not need an immediate
         heartbeat after arm.
         """
-        self._conn.execute(
-            "UPDATE operator_liveness SET "
-            "armed = 1, armed_ts_ns = ?, timeout_sec = ?, "
-            "last_heartbeat_ts_ns = ?, armed_by_source = ?, "
-            "kill_mode_at_arm = ?, disarmed_reason = NULL "
-            "WHERE id = 1",
-            (int(now_ns), int(timeout_sec), int(now_ns), source, kill_mode),
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE operator_liveness SET "
+                "armed = 1, armed_ts_ns = ?, timeout_sec = ?, "
+                "last_heartbeat_ts_ns = ?, armed_by_source = ?, "
+                "kill_mode_at_arm = ?, disarmed_reason = NULL "
+                "WHERE id = 1",
+                (int(now_ns), int(timeout_sec), int(now_ns), source, kill_mode),
+            )
+            self._conn.commit()
 
     def disarm(self, *, reason: str, now_ns: int) -> None:
         """Clear armed state, recording reason for audit trail.
@@ -683,29 +717,38 @@ class OperatorLivenessStore:
         OPERATOR_DISARMED audit event carries the timestamp).
         """
         del now_ns  # reserved for future use
-        self._conn.execute(
-            "UPDATE operator_liveness SET armed = 0, disarmed_reason = ? "
-            "WHERE id = 1",
-            (reason,),
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE operator_liveness SET armed = 0, disarmed_reason = ? "
+                "WHERE id = 1",
+                (reason,),
+            )
+            self._conn.commit()
 
     def heartbeat(self, *, now_ns: int) -> bool:
         """Reset-to-full heartbeat. No-op on disarmed state (returns False).
 
-        Returns True if the store was armed at the time of call (heartbeat
-        applied), False if disarmed (no write — does not silently re-arm).
+        Phase 4.14e — atomic conditional write. The armed-state check
+        and the last_heartbeat_ts_ns update are now a single
+        ``UPDATE ... WHERE armed = 1`` statement. If the row is
+        disarmed the ``rowcount`` is zero, ``last_heartbeat_ts_ns``
+        is NOT advanced, and the caller sees ``False`` — so a
+        concurrent ``disarm()`` landing during a heartbeat cannot
+        leave the row with a fresh heartbeat timestamp on a
+        disarmed state.
+
+        Returns True if the heartbeat write applied (row was armed),
+        False otherwise (no write — does not silently re-arm or
+        refresh heartbeat on a disarmed row).
         """
-        snap = self.load()
-        if not snap.armed:
-            return False
-        self._conn.execute(
-            "UPDATE operator_liveness SET last_heartbeat_ts_ns = ? "
-            "WHERE id = 1",
-            (int(now_ns),),
-        )
-        self._conn.commit()
-        return True
+        with self._write_lock:
+            cur = self._conn.execute(
+                "UPDATE operator_liveness SET last_heartbeat_ts_ns = ? "
+                "WHERE id = 1 AND armed = 1",
+                (int(now_ns),),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def status(self, *, now_ns: int) -> dict[str, Any]:
         snap = self.load()

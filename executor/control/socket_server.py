@@ -48,6 +48,39 @@ log = get_logger("executor.control.socket")
 _READ_TIMEOUT_SEC = 2.0
 
 
+async def _shielded_engage(coro, *, kind: str):
+    """Run ``coro`` shielded from handler-coroutine cancellation, and
+    ensure any exception it raises is observed (not silently lost).
+
+    Phase 4.14e follow-up (M8 robustness): ``asyncio.shield`` lets the
+    inner engage task outlive a cancelled outer handler (client
+    disconnect, ``server.close()`` sweeping in-flight handlers,
+    shutdown cancelling the handler task). When the outer await is
+    cancelled, asyncio raises ``CancelledError`` on our coroutine and
+    leaves the inner task running; if that task later raises we lose
+    the exception unless someone retrieves it. This helper attaches a
+    done-callback on the cancelled path that calls
+    ``task.exception()`` so the error lands in the log instead of the
+    ``Task exception was never retrieved`` GC warning.
+    """
+    task = asyncio.create_task(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def _retrieve_exc(t: "asyncio.Task[Any]") -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                log.error(
+                    "control.socket.shielded_engage_failed_after_cancel",
+                    kind=kind,
+                    error=str(exc),
+                )
+        task.add_done_callback(_retrieve_exc)
+        raise
+
+
 try:
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
 except ImportError:  # pragma: no cover — 3.12+ always has it
@@ -112,22 +145,40 @@ class ControlSocketServer:
 
     async def start(self) -> None:
         path = Path(self._socket_path)
-        # Parent directory is /run/executor (created by systemd
-        # RuntimeDirectory) in production; create it for test/dev.
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-        # Remove stale socket from a previous process.
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError as exc:
-                log.warning(
-                    "control.socket.stale_unlink_failed",
-                    path=str(path),
-                    error=str(exc),
-                )
-        self._server = await asyncio.start_unix_server(
-            self._handle_client, path=str(path)
-        )
+        # Phase 4.14e (H2): parent directory mode 0700 for the fallback
+        # mkdir path (test/dev). Production uses systemd RuntimeDirectory
+        # which is now also pinned at 0700 in the unit file.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Phase 4.14e (H3 partial): remove stale socket from a previous
+        # process using try/except-FileNotFoundError instead of exists()+
+        # unlink (dodges a pointless stat race; also tolerates dangling
+        # symlinks which exists() returns False for).
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning(
+                "control.socket.stale_unlink_failed",
+                path=str(path),
+                error=str(exc),
+            )
+        # Phase 4.14e (H3): close the bind→chmod TOCTOU. ``start_unix_server``
+        # creates the socket inode with mode ``0666 & ~umask``. Setting
+        # umask 0o177 forces the just-bound socket to have mode 0o600 *at
+        # creation*; no other local user can open(2) it during the brief
+        # interval before our explicit os.chmod(0o600) runs. The umask is
+        # always restored in the finally block so unrelated callers
+        # later in the process are unaffected. The redundant os.chmod
+        # remains as defense-in-depth in case platform-specific umask
+        # handling differs.
+        old_umask = os.umask(0o177)
+        try:
+            self._server = await asyncio.start_unix_server(
+                self._handle_client, path=str(path)
+            )
+        finally:
+            os.umask(old_umask)
         try:
             os.chmod(str(path), 0o600)
         except OSError as exc:  # pragma: no cover
@@ -144,10 +195,12 @@ class ControlSocketServer:
             except Exception:
                 pass
             self._server = None
+        # Phase 4.14e: direct unlink + tolerate-missing pattern; avoids
+        # the exists()→unlink TOCTOU.
         try:
-            p = Path(self._socket_path)
-            if p.exists():
-                p.unlink()
+            Path(self._socket_path).unlink()
+        except FileNotFoundError:
+            pass
         except OSError:
             pass
         log.info("control.socket.stop", path=self._socket_path)
@@ -394,19 +447,32 @@ class ControlSocketServer:
                 KillMode.SOFT, reason, source="executorctl"
             )
         elif sub == "hard":
-            await self._kill_mgr.engage(
-                KillMode.HARD,
-                reason,
-                source="executorctl",
-                cancel_open_orders=True,
+            # Phase 4.14e (M8): shield the engage from handler
+            # cancellation (client disconnect, daemon shutdown
+            # cancelling in-flight handlers via server.close()). The
+            # kill must persist even if the reply path never returns.
+            # shield() only covers caller-coroutine cancellation; it
+            # does not rescue a DB stall or a KillManager-lock
+            # deadlock — those remain PRE-T1 concerns.
+            await _shielded_engage(
+                self._kill_mgr.engage(
+                    KillMode.HARD,
+                    reason,
+                    source="executorctl",
+                    cancel_open_orders=True,
+                ),
+                kind="hard",
             )
         elif sub == "panic":
-            await self._kill_mgr.engage(
-                KillMode.HARD,
-                reason,
-                source="executorctl",
-                panic=True,
-                cancel_open_orders=True,
+            await _shielded_engage(
+                self._kill_mgr.engage(
+                    KillMode.HARD,
+                    reason,
+                    source="executorctl",
+                    panic=True,
+                    cancel_open_orders=True,
+                ),
+                kind="panic",
             )
         else:  # resume
             ok, err = await self._kill_mgr.resume(source="executorctl")

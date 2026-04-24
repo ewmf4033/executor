@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -259,3 +260,105 @@ async def test_operator_liveness_survives_restart(tmp_path: Path):
     assert snap.last_heartbeat_ts_ns == t0
     assert snap.kill_mode_at_arm == "SOFT"
     s2.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14e — heartbeat/disarm atomicity + writer serialization.
+#
+# Before 4.14e, ``heartbeat`` performed a ``load()`` → branch-on-armed
+# → ``UPDATE`` against a shared ``check_same_thread=False`` sqlite
+# connection. A ``disarm()`` landing between the load and the update
+# could leave the row disarmed while still accepting the heartbeat
+# write (and the caller would still see ``True``). The ultrareview
+# Run 2 flagged this as B1/B2; the fix replaces heartbeat with a
+# single conditional ``UPDATE ... WHERE armed = 1`` and adds a
+# writer-serializing ``threading.RLock`` around every mutation.
+# ---------------------------------------------------------------------------
+
+
+async def test_heartbeat_after_disarm_does_not_rearm(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    t0 = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=t0)
+    store.disarm(reason="ops", now_ns=t0 + 1)
+    # Late heartbeat arriving after disarm must not flip armed back on.
+    ok = store.heartbeat(now_ns=t0 + 10_000_000_000)
+    assert ok is False
+    snap = store.load()
+    assert snap.armed is False
+    s.close()
+
+
+async def test_heartbeat_after_disarm_does_not_advance_last_heartbeat(
+    tmp_path: Path,
+):
+    s, store = await _fresh_live_store(tmp_path)
+    t0 = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=t0)
+    pre = store.load().last_heartbeat_ts_ns
+    assert pre == t0
+    store.disarm(reason="ops", now_ns=t0 + 1)
+    # Heartbeat on disarmed row must be a no-op — last_heartbeat_ts_ns
+    # frozen at its pre-disarm value.
+    store.heartbeat(now_ns=t0 + 5_000_000_000)
+    assert store.load().last_heartbeat_ts_ns == pre
+    s.close()
+
+
+async def test_heartbeat_returns_not_accepted_when_disarmed(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    # Default row is disarmed — caller must see False, not True-on-stale-read.
+    assert store.heartbeat(now_ns=time.time_ns()) is False
+    s.close()
+
+
+async def test_disarm_after_heartbeat_wins_when_ordered_last(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    t0 = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=t0)
+    assert store.heartbeat(now_ns=t0 + 1_000_000_000) is True
+    store.disarm(reason="late", now_ns=t0 + 2_000_000_000)
+    snap = store.load()
+    assert snap.armed is False
+    assert snap.disarmed_reason == "late"
+    # Another heartbeat now cannot resurrect armed state.
+    assert store.heartbeat(now_ns=t0 + 3_000_000_000) is False
+    assert store.load().armed is False
+    s.close()
+
+
+async def test_liveness_store_serializes_writes(tmp_path: Path):
+    """Sanity check: the writer lock lets many concurrent heartbeats
+    from different threads run without corrupting state or tripping
+    ``sqlite3`` recursive-cursor errors. End state must be ``armed=True``
+    with ``last_heartbeat_ts_ns`` equal to one of the submitted values."""
+    s, store = await _fresh_live_store(tmp_path)
+    t0 = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=t0)
+
+    submitted: list[int] = []
+    errors: list[BaseException] = []
+
+    def _hammer(offset: int) -> None:
+        try:
+            ts = t0 + offset
+            submitted.append(ts)
+            store.heartbeat(now_ns=ts)
+        except BaseException as exc:  # pragma: no cover — would fail test
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_hammer, args=(i * 1_000_000,))
+        for i in range(1, 21)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    assert errors == []
+    snap = store.load()
+    assert snap.armed is True
+    # The final persisted heartbeat must be one of the submitted
+    # timestamps — never a partial/garbage value.
+    assert snap.last_heartbeat_ts_ns in submitted
+    s.close()

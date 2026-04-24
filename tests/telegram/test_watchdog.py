@@ -469,6 +469,199 @@ def test_watchdog_escalation_does_not_downgrade_existing_hard_or_panic(
     assert esc.payload.get("panic") is True
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.14e — escalation result classification (B3).
+#
+# The pre-4.14e watchdog defaulted to ``result="soft_kill_engaged"`` and
+# only overrode it when the final mode was not SOFT. This misreported
+# SOFT → SOFT (no-op) as an engagement. The fix snapshots kill state
+# before engage and classifies from the actual prior mode, and also
+# reports explicit ``effective`` / ``skipped_weaker`` flags in the
+# payload.
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_escalation_reports_noop_when_soft_already_active(
+    tmp_path: Path,
+) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    # Pre-engage SOFT (e.g. strategy gate earlier tripped). Watchdog's
+    # subsequent SOFT engage is a no-op in KillManager.
+    asyncio.run(km.engage(KillMode.SOFT, "prior soft"))
+    assert km.mode is KillMode.SOFT
+
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(bot=bot, kill_mgr=km, bus=bus, max_restarts=1)
+    wd._restart_ts.append(time.monotonic() - 10.0)  # budget full
+
+    asyncio.run(wd._check_once())
+
+    esc = [
+        e for e in bus.events
+        if e.event_type == EventType.TELEGRAM_WATCHDOG_ESCALATED
+    ]
+    assert esc, "escalation event must still emit for audit"
+    p = esc[0].payload
+    # The watchdog must NOT claim it engaged SOFT when SOFT was already on.
+    assert p["result"] == "noop_already_soft"
+    assert p["effective"] is False
+    assert p["skipped_weaker"] is True
+    assert p["prev_mode"] == "SOFT"
+    assert p["current_mode"] == "SOFT"
+    assert p["panic"] is False
+    # Final kill state: still SOFT (unchanged).
+    assert km.mode is KillMode.SOFT
+
+
+def test_watchdog_escalation_reports_skipped_when_existing_panic(
+    tmp_path: Path,
+) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    asyncio.run(km.engage(KillMode.HARD, "operator panic", panic=True))
+    assert km.snapshot().panic is True
+
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(bot=bot, kill_mgr=km, bus=bus, max_restarts=1)
+    wd._restart_ts.append(time.monotonic() - 10.0)
+
+    asyncio.run(wd._check_once())
+
+    esc = [
+        e for e in bus.events
+        if e.event_type == EventType.TELEGRAM_WATCHDOG_ESCALATED
+    ][0]
+    assert esc.payload["result"] == "skipped_existing_stricter_kill"
+    assert esc.payload["effective"] is False
+    assert esc.payload["skipped_weaker"] is True
+    assert esc.payload["prev_mode"] == "HARD"
+    assert esc.payload["prev_panic"] is True
+    assert esc.payload["current_mode"] == "HARD"
+    assert esc.payload["panic"] is True
+
+
+def test_watchdog_escalation_payload_matches_actual_transition(
+    tmp_path: Path,
+) -> None:
+    """Happy path: NONE → SOFT via watchdog escalation. Payload must say
+    the SOFT engage was actually effective (not inferred from the mode)."""
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(bot=bot, kill_mgr=km, bus=bus, max_restarts=1)
+    wd._restart_ts.append(time.monotonic() - 10.0)
+
+    asyncio.run(wd._check_once())
+
+    esc = [
+        e for e in bus.events
+        if e.event_type == EventType.TELEGRAM_WATCHDOG_ESCALATED
+    ][0]
+    assert esc.payload["result"] == "soft_kill_engaged"
+    assert esc.payload["effective"] is True
+    assert esc.payload["skipped_weaker"] is False
+    assert esc.payload["prev_mode"] == "NONE"
+    assert esc.payload["current_mode"] == "SOFT"
+    assert km.mode is KillMode.SOFT
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14e (H8) — bounded escalation latch reset.
+#
+# After escalating, the watchdog clears ``_escalated`` only after a full
+# healthy window during which:
+#   - the restart-timestamp deque is empty (no stalls inside
+#     restart_window_sec), and
+#   - the observed gap has been below ``stall_threshold_sec`` for at
+#     least ``stall_threshold_sec`` contiguous seconds.
+# Any intervening stall resets the healthy-window timer to None.
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_escalated_resets_only_after_healthy_window(
+    tmp_path: Path,
+) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    # stall_threshold_sec is 2s so the "healthy window" is 2s.
+    wd = _watchdog(
+        bot=bot,
+        kill_mgr=km,
+        bus=bus,
+        stall_threshold_sec=2,
+        restart_window_sec=10,
+        max_restarts=1,
+    )
+    # Pre-fill budget so the first stall check escalates.
+    wd._restart_ts.append(time.monotonic() - 1.0)
+
+    asyncio.run(wd._check_once())
+    assert wd._escalated is True
+    # Bot now healthy; restart-deque still holds the recent timestamp.
+    bot.set_last_activity(time.monotonic())
+    asyncio.run(wd._check_once())
+    # Healthy gap observed but restart_ts not yet empty → no reset yet.
+    assert wd._escalated is True
+
+    # Prune all restart timestamps by advancing past the restart
+    # window and running another healthy check (which will prune).
+    wd._restart_ts.clear()  # simulate window drain
+    bot.set_last_activity(time.monotonic())
+    asyncio.run(wd._check_once())
+    # First healthy check after empty deque records the start of the
+    # healthy window — latch NOT yet cleared.
+    assert wd._escalated is True
+    assert wd._healthy_since_ts is not None
+
+    # Force the healthy window to appear fully elapsed by rewinding
+    # the tracked start (equivalent to waiting stall_threshold_sec).
+    wd._healthy_since_ts = time.monotonic() - 5.0  # > 2s
+    bot.set_last_activity(time.monotonic())
+    asyncio.run(wd._check_once())
+    assert wd._escalated is False, "healthy window elapsed — latch must clear"
+    assert wd._healthy_since_ts is None
+
+
+def test_watchdog_healthy_window_resets_on_stall(tmp_path: Path) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(
+        bot=bot,
+        kill_mgr=km,
+        bus=bus,
+        stall_threshold_sec=2,
+        restart_window_sec=10,
+        max_restarts=1,
+    )
+    wd._restart_ts.append(time.monotonic() - 1.0)
+    asyncio.run(wd._check_once())  # escalate
+    assert wd._escalated is True
+
+    # Start healthy window.
+    wd._restart_ts.clear()
+    bot.set_last_activity(time.monotonic())
+    asyncio.run(wd._check_once())
+    assert wd._healthy_since_ts is not None
+    # A subsequent stall resets the healthy-window tracker.
+    bot.set_last_activity(time.monotonic() - 200.0)
+    asyncio.run(wd._check_once())
+    assert wd._healthy_since_ts is None
+    assert wd._escalated is True  # still latched
+
+
 def test_watchdog_events_use_telegram_watchdog_source(tmp_path: Path) -> None:
     """All watchdog-originated events use Source.TELEGRAM_WATCHDOG."""
     captured: list[Event] = []

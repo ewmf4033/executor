@@ -240,15 +240,19 @@ def test_kill_manager_hard_can_upgrade_to_panic(tmp_path: Path) -> None:
     assert snap2.panic is True
     assert snap2.manual_only is True
     assert snap2.panic_until_ns > 0
-    # Reason on upgrade: raises_severity=False so final_reason falls
-    # back to the prior mode's reason. The panic flag is what
-    # distinguishes this engage in the audit trail.
+    # Phase 4.14e: reason is now updated on HARD → HARD+PANIC so
+    # the operator-supplied panic reason survives into
+    # ``kill_status`` and the audit trail. ``engaged_ts_ns`` is
+    # still NOT refreshed (no severity raise), preserving the
+    # original HARD engagement time for forensics.
+    assert snap2.reason == "now-panic"
     state_changes = [
         e for e in events if e.event_type == EventType.KILL_STATE_CHANGED
     ]
     assert state_changes[-1].payload["panic"] is True
     assert state_changes[-1].payload["to_mode"] == "HARD"
     assert state_changes[-1].payload["from_mode"] == "HARD"
+    assert state_changes[-1].payload["reason"] == "now-panic"
 
 
 def test_kill_manager_engage_soft_does_not_clear_panic(tmp_path: Path) -> None:
@@ -272,6 +276,62 @@ def test_kill_manager_engage_soft_does_not_clear_panic(tmp_path: Path) -> None:
         m.engage(KillMode.HARD, "second-hard", panic=False)
     )
     assert snap3.panic is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14e — HARD → PANIC upgrade: reason preservation, panic bookkeeping,
+# and engaged_ts_ns stability.
+#
+# The ultrareview Run 2 flagged H11: the operator-supplied panic reason was
+# dropped on HARD → PANIC because ``final_reason`` only updated on a
+# severity raise. HARD → HARD+PANIC raises no severity (same mode) but is
+# still an effective engage (``sets_new_panic=True``). We now update
+# ``reason`` on any effective engage while keeping ``engaged_ts_ns`` frozen
+# on non-severity-raising transitions so forensic ordering survives.
+# ---------------------------------------------------------------------------
+
+
+def test_hard_to_panic_updates_reason(tmp_path: Path) -> None:
+    m, _ = _mgr(tmp_path)
+    asyncio.run(m.engage(KillMode.HARD, "initial-hard"))
+    snap = asyncio.run(
+        m.engage(KillMode.HARD, "operator panic after incident", panic=True)
+    )
+    assert snap.mode is KillMode.HARD
+    assert snap.panic is True
+    # The operator's panic reason must survive into the persisted snapshot.
+    assert snap.reason == "operator panic after incident"
+
+
+def test_hard_to_panic_preserves_original_engaged_ts_ns(tmp_path: Path) -> None:
+    m, _ = _mgr(tmp_path)
+    snap_first = asyncio.run(m.engage(KillMode.HARD, "initial-hard"))
+    original_ts = snap_first.engaged_ts_ns
+    assert original_ts > 0
+    # Let the wall clock advance a hair so a refreshed timestamp would differ.
+    time.sleep(0.002)
+    snap_panic = asyncio.run(
+        m.engage(KillMode.HARD, "panic", panic=True)
+    )
+    # engaged_ts_ns refreshes only on severity raises (NONE→SOFT, SOFT→HARD,
+    # NONE→HARD), NOT on a panic-only upgrade at the same mode.
+    assert snap_panic.engaged_ts_ns == original_ts
+
+
+def test_hard_to_panic_refreshes_panic_until_and_manual_only(tmp_path: Path) -> None:
+    m, _ = _mgr(tmp_path)
+    asyncio.run(m.engage(KillMode.HARD, "initial-hard"))
+    snap_pre = m.snapshot()
+    assert snap_pre.panic is False
+    assert snap_pre.panic_until_ns == 0
+    assert snap_pre.manual_only is False
+
+    snap = asyncio.run(m.engage(KillMode.HARD, "panic", panic=True))
+    assert snap.panic is True
+    # panic_until_ns is refreshed to now + cooldown (cooldown=1s in _mgr).
+    assert snap.panic_until_ns > 0
+    # manual_only is set on any panic engage.
+    assert snap.manual_only is True
 
 
 def test_state_persists_across_restart(tmp_path: Path) -> None:

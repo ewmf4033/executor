@@ -627,14 +627,22 @@ class DaemonService:
         """Phase 4.7 Q6 shutdown order (drain before unsubscribe):
 
             1. Signal + cancel strategy/background tasks (no new intents).
+            1a. Stop control socket FIRST (Phase 4.14e H1) — no new
+                executorctl commands can enter while subsystems tear
+                down. Draining the bus or stopping the orchestrator
+                while the control socket still accepts arm/kill/resume
+                commands would race new state changes against teardown.
             2. Short sleep to let in-flight emits reach the bus.
             3. Publish STOPPING + STATE_SAVED lifecycle events.
             4. Drain the bus inbox so pending events reach orchestrator.
-            5. orchestrator.stop() — unsubscribe AFTER drain.
-            6. telemetry.stop().
-            7. bus.stop() — final close / sentinel delivery.
-            8. audit.stop() — flush last (so STATE_SAVED lands).
-            9. Close attribution / risk_state / kill_store.
+            5. telegram watchdog.stop() (before bot so the watchdog
+               does not see bot.stop() as a stall).
+            6. telegram bot.stop().
+            7. orchestrator.stop() — unsubscribe AFTER drain.
+            8. telemetry.stop().
+            9. bus.stop() — final close / sentinel delivery.
+            10. audit.stop() — flush last (so STATE_SAVED lands).
+            11. Close attribution / risk_state / kill_store.
         """
         self._stop_event.set()
         # (1) Cancel background tasks so no new intents are produced.
@@ -646,6 +654,19 @@ class DaemonService:
             except (asyncio.CancelledError, Exception):
                 pass
         self._bg_tasks.clear()
+
+        # (1a) Phase 4.14e — stop the control socket listener immediately
+        # after background tasks, BEFORE we drain the bus and tear down
+        # subsystems. Any new executorctl connection after this point
+        # gets ECONNREFUSED; any in-flight handler is cancelled via
+        # server.close() + wait_closed(). Ultrareview Run 2 (H1) flagged
+        # the prior ordering — control_server stopped near the end — as
+        # allowing kill/resume/arm to land on partially-shutdown state.
+        if self.control_server is not None:
+            try:
+                await self.control_server.stop()
+            except Exception:
+                pass
 
         # (2) Brief settle window for any in-flight publishes.
         try:
@@ -688,19 +709,7 @@ class DaemonService:
         except Exception as exc:
             log.warning("daemon.stop.drain_failed", error=str(exc))
 
-        # (5) Now safe to unsubscribe orchestrator.
-        if self.orchestrator is not None:
-            try:
-                await self.orchestrator.stop()
-            except Exception:
-                pass
-        # (6) Telemetry.
-        if self.telemetry is not None:
-            try:
-                await self.telemetry.stop()
-            except Exception:
-                pass
-        # Phase 4.14c: stop the Telegram watchdog before the bot so it
+        # (5) Phase 4.14c: stop the Telegram watchdog before the bot so it
         # cannot observe a bot.stop() as a "stall" and attempt a restart
         # during shutdown.
         if self.telegram_watchdog is not None:
@@ -708,32 +717,36 @@ class DaemonService:
                 await self.telegram_watchdog.stop()
             except Exception:
                 pass
-        # Phase 4.11.1: stop the Telegram bot before closing the bus so its
-        # poll loop is torn down cleanly and can't race the sentinel.
+        # (6) Phase 4.11.1: stop the Telegram bot before closing the bus so
+        # its poll loop is torn down cleanly and can't race the sentinel.
         if self.telegram_bot is not None:
             try:
                 await self.telegram_bot.stop()
             except Exception:
                 pass
-        # Phase 4.14a: stop the control socket listener. Cleans up the
-        # socket file; any in-flight handler tasks get cancelled by the
-        # server.close() + wait_closed().
-        if self.control_server is not None:
+        # (7) Now safe to unsubscribe orchestrator.
+        if self.orchestrator is not None:
             try:
-                await self.control_server.stop()
+                await self.orchestrator.stop()
             except Exception:
                 pass
-        # (7) Bus final close.
+        # (8) Telemetry.
+        if self.telemetry is not None:
+            try:
+                await self.telemetry.stop()
+            except Exception:
+                pass
+        # (9) Bus final close.
         try:
             await self.bus.stop()
         except Exception:
             pass
-        # (8) Audit flush/close.
+        # (10) Audit flush/close.
         try:
             await self.audit.stop()
         except Exception:
             pass
-        # (9) Close backing stores.
+        # (11) Close backing stores.
         if self.attribution is not None:
             try:
                 self.attribution.close()

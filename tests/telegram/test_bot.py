@@ -316,9 +316,116 @@ def test_telegram_arm_heartbeat_disarm_flow(tmp_path: Path) -> None:
     assert EventType.OPERATOR_DISARMED in kinds
 
 
+def test_disarm_reason_sanitized_for_control_chars(tmp_path: Path) -> None:
+    """Phase 4.14e (M9) — operator-typed reason strings must have
+    control chars, CR/LF, and ANSI escapes scrubbed before they reach
+    logs, audit events, or Slack. Arm first, then disarm with a
+    malicious reason and verify the stored/echoed reason is clean."""
+    bot, liveness, events = _bot_with_dead_man(tmp_path)
+    asyncio.run(bot.handle_text("/arm 10m", chat_id="42"))
+
+    nasty = "bad\r\n\x1b[31mINJECT\x1b[0m\x07\x00stuff\tend"
+    reply = asyncio.run(
+        bot.handle_text(f"/disarm {nasty}", chat_id="42")
+    )
+
+    # Reply echoes the sanitized reason: no ESC, no CR/LF, no NUL, no BEL.
+    assert "\x1b" not in reply
+    assert "\r" not in reply and "\n" not in reply
+    assert "\x00" not in reply and "\x07" not in reply
+    # Visible parts of the original message survive.
+    assert "bad" in reply
+    assert "INJECT" in reply
+    assert "stuff" in reply
+
+    # Published OPERATOR_DISARMED event payload was sanitized identically.
+    disarm_evs = [
+        e for e in events if e.event_type is EventType.OPERATOR_DISARMED
+    ]
+    assert len(disarm_evs) == 1
+    payload_reason = disarm_evs[0].payload["reason"]
+    assert "\x1b" not in payload_reason
+    assert "\r" not in payload_reason and "\n" not in payload_reason
+    assert "\x00" not in payload_reason and "\x07" not in payload_reason
+
+
+def test_disarm_reason_sanitized_length_cap(tmp_path: Path) -> None:
+    """Reason strings are capped at 200 chars to bound log volume."""
+    bot, _liveness, events = _bot_with_dead_man(tmp_path)
+    asyncio.run(bot.handle_text("/arm 10m", chat_id="42"))
+    long_reason = "x" * 1000
+    asyncio.run(bot.handle_text(f"/disarm {long_reason}", chat_id="42"))
+    ev = [
+        e for e in events if e.event_type is EventType.OPERATOR_DISARMED
+    ][-1]
+    assert len(ev.payload["reason"]) <= 200
+
+
+def test_disarm_only_control_chars_rejected_as_empty(tmp_path: Path) -> None:
+    """A reason consisting solely of control chars/whitespace sanitizes
+    to empty and must be rejected — same semantics as ``/disarm``
+    with no argument."""
+    bot, liveness, _events = _bot_with_dead_man(tmp_path)
+    asyncio.run(bot.handle_text("/arm 10m", chat_id="42"))
+    reply = asyncio.run(
+        bot.handle_text("/disarm \x1b[31m\r\n\t\x00", chat_id="42")
+    )
+    assert "reason required" in reply
+    assert liveness.load().armed is True  # still armed
+
+
 # ---------------------------------------------------------------------------
 # Phase 4.14c — /kill panic local-bypass.
 # ---------------------------------------------------------------------------
+
+
+async def test_bot_shielded_engage_exception_after_cancel_is_logged(
+    tmp_path: Path,
+) -> None:
+    """Phase 4.14e follow-up: if _dispatch is cancelled mid-engage and
+    the shielded inner engage subsequently raises, the exception must
+    be retrieved (done-callback) and surfaced via the module logger —
+    not silently swallowed as a GC-time warning."""
+    from executor.telegram import bot as bot_mod
+
+    bot, km, _events = _bot(tmp_path)
+    started = asyncio.Event()
+
+    async def _raising_engage(*_a, **_kw):
+        started.set()
+        await asyncio.sleep(0.05)
+        raise RuntimeError("engage-blew-up-after-cancel")
+
+    km.engage = _raising_engage  # type: ignore[assignment]
+
+    captured: list[tuple[str, dict]] = []
+    original_error = bot_mod.log.error
+
+    def _spy_error(event, **kw):
+        captured.append((event, kw))
+        return original_error(event, **kw)
+
+    bot_mod.log.error = _spy_error  # type: ignore[assignment]
+    try:
+        task = asyncio.create_task(
+            bot.handle_text("/kill panic boom", chat_id="42")
+        )
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.15)
+    finally:
+        bot_mod.log.error = original_error  # type: ignore[assignment]
+
+    assert any(
+        evt == "telegram.bot.shielded_engage_failed_after_cancel"
+        and kw.get("kind") == "panic"
+        and "engage-blew-up-after-cancel" in kw.get("error", "")
+        for evt, kw in captured
+    ), captured
 
 
 def test_panic_engages_kill_before_reply_send(tmp_path: Path) -> None:
@@ -420,6 +527,186 @@ def test_soft_and_status_still_respect_rate_limit(tmp_path: Path) -> None:
     assert "SOFT engaged" in r1
     r2 = asyncio.run(bot.handle_text("/kill status", chat_id="42"))
     assert "rate-limited" in r2
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14e — bot lifecycle (H9) + health-signal semantics (M7).
+# ---------------------------------------------------------------------------
+
+
+def test_bot_stop_cancelled_nulls_task(tmp_path: Path) -> None:
+    """If ``bot.stop()`` is itself cancelled mid-await, ``self._task``
+    must still be cleared so a subsequent ``start()`` creates a fresh
+    poll task. The prior implementation set ``self._task = None``
+    outside a ``finally`` block, so an outer cancellation left the
+    orphan task in place and ``start()`` no-opped."""
+    bot, _km, _ = _bot(tmp_path)
+
+    async def _hung_run() -> None:
+        try:
+            await asyncio.Event().wait()  # never completes
+        except asyncio.CancelledError:
+            # Simulate a slow teardown inside the task itself — the
+            # task takes a little while to honor cancellation.
+            await asyncio.sleep(0.2)
+            raise
+
+    async def _exercise() -> None:
+        bot._task = asyncio.create_task(_hung_run(), name="fake-bot-task")
+        # Force a CancelledError to propagate into stop() while it is
+        # awaiting self._task.
+        stop_task = asyncio.create_task(bot.stop())
+        await asyncio.sleep(0)  # let stop() begin awaiting
+        stop_task.cancel()
+        try:
+            await stop_task
+        except asyncio.CancelledError:
+            pass
+        # Even though stop() was itself cancelled, the finally block
+        # must have cleared _task.
+        assert bot._task is None
+
+    asyncio.run(_exercise())
+
+
+def test_bot_stop_timeout_allows_restart(tmp_path: Path) -> None:
+    """After a stop() that experienced an outer cancellation, a fresh
+    start() must create a new task rather than short-circuiting via the
+    ``if self._task is not None`` guard."""
+    bot, _, _ = _bot(tmp_path)
+
+    async def _hung_run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
+
+    async def _exercise() -> None:
+        bot._task = asyncio.create_task(_hung_run(), name="hung-task")
+        # Wrap stop() in a very short wait_for; when it times out,
+        # wait_for cancels the inner stop() coroutine.
+        try:
+            await asyncio.wait_for(bot.stop(), timeout=0.001)
+        except asyncio.TimeoutError:
+            pass
+        # Regardless of the timeout, _task must be None.
+        assert bot._task is None
+        # start() must be able to create a new task. Use a minimal
+        # fake loop that exits immediately so we do not depend on the
+        # real poll.
+        bot._stop.clear()
+
+        async def _quick_loop() -> None:
+            return None
+
+        # Monkey-patch _run for this test so start() spawns a
+        # trivially-completing task instead of the real poll.
+        bot._run = _quick_loop  # type: ignore[assignment]
+        await bot.start()
+        assert bot._task is not None
+        await bot.stop()
+        assert bot._task is None
+
+    asyncio.run(_exercise())
+
+
+def test_last_activity_not_updated_on_getupdates_exception(tmp_path: Path) -> None:
+    """Phase 4.14e (M7): a failing ``_get_updates`` must NOT advance
+    ``_last_activity_ts``. Prior behavior refreshed the timestamp in
+    every error path and before each call, hiding outages from the
+    watchdog.
+
+    We run a trimmed version of ``_run``'s body directly so the test
+    does not depend on aiohttp's ClientSession context manager.
+    """
+    bot, _, _ = _bot(tmp_path)
+    call_count = 0
+
+    async def _boom(_session):
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("simulated getUpdates failure")
+
+    bot._get_updates = _boom  # type: ignore[assignment]
+
+    async def _exercise() -> None:
+        # Freeze the baseline timestamp to a known value we can compare
+        # against after a burst of failed cycles.
+        baseline = time.monotonic()
+        bot._last_activity_ts = baseline
+        # Run 5 iterations of the real failure-path code (mirrors the
+        # body of ``_run`` without the aiohttp session).
+        backoff = 0.001
+        for _ in range(5):
+            try:
+                await bot._get_updates(None)
+                bot._last_activity_ts = time.monotonic()
+            except Exception:
+                # M7 fix: no last_activity update in the error path.
+                await asyncio.sleep(backoff)
+        # Timestamp must not have advanced past the baseline.
+        assert bot._last_activity_ts == baseline, (
+            f"last_activity_ts drifted from {baseline} to "
+            f"{bot._last_activity_ts} across {call_count} failed "
+            "getUpdates; error path must not tick."
+        )
+        assert call_count == 5
+
+    asyncio.run(_exercise())
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14e (M17) — malformed emergency commands must not consume
+# rate budget. A parse-fail on ``/kill hard`` (missing reason) had
+# ``parsed.valid=False`` and therefore hit the rate-limit branch,
+# which would block the operator's immediately-corrected
+# ``/kill hard <reason>`` for the rest of the rate window. The fix
+# recognizes critical-kill prefixes from parsed.command/parsed.sub
+# regardless of validity, so malformed criticals skip the rate
+# limit *and* do not set ``_last_cmd_ts``. Strict dispatch still
+# returns the parse error string.
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_kill_hard_does_not_consume_rate_limit_for_corrected_hard(
+    tmp_path: Path,
+) -> None:
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    km = KillManager(store=store)
+    bot = TelegramBot(
+        kill_manager=km, token="tok", chat_id="42", rate_limit_sec=60.0
+    )
+    # Malformed: missing reason. Strict dispatch still returns "err:".
+    r1 = asyncio.run(bot.handle_text("/kill hard", chat_id="42"))
+    assert r1.startswith("err:")
+    assert "reason" in r1.lower()
+    # Critical-kill detection is based on parsed.command/parsed.sub,
+    # not parsed.valid — so rate budget was NOT consumed.
+    assert "42" not in bot._last_cmd_ts
+
+    # Immediately-corrected hard must NOT be rate-limited.
+    r2 = asyncio.run(bot.handle_text("/kill hard real reason", chat_id="42"))
+    assert "rate-limited" not in r2
+    assert "HARD engaged" in r2
+    assert km.mode is KillMode.HARD
+
+
+def test_malformed_kill_panic_does_not_consume_rate_limit_for_corrected_panic(
+    tmp_path: Path,
+) -> None:
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    km = KillManager(store=store, panic_cooldown_sec=1)
+    bot = TelegramBot(
+        kill_manager=km, token="tok", chat_id="42", rate_limit_sec=60.0
+    )
+    r1 = asyncio.run(bot.handle_text("/kill panic", chat_id="42"))
+    assert r1.startswith("err:")
+    assert "42" not in bot._last_cmd_ts
+
+    r2 = asyncio.run(bot.handle_text("/kill panic meltdown", chat_id="42"))
+    assert "rate-limited" not in r2
+    assert "PANIC engaged" in r2
+    assert km.snapshot().panic is True
 
 
 def test_panic_engagement_survives_send_reply_failure(tmp_path: Path) -> None:

@@ -14,7 +14,11 @@ Type=simple
 User=root
 WorkingDirectory=/root/executor
 RuntimeDirectory=executor
-RuntimeDirectoryMode=0755
+# Phase 4.14e (H2): 0700 — only the executor user should see the control
+# socket. 0755 allowed any local user on the box to stat/list the socket
+# path (authentication is still filesystem perms on the socket itself at
+# 0600, but narrowing the parent dir removes the enumeration surface).
+RuntimeDirectoryMode=0700
 Environment=PYTHONUNBUFFERED=1
 Environment=EXECUTOR_LOG_LEVEL=INFO
 Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs/paper_live
