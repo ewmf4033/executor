@@ -100,6 +100,15 @@ class EventType(str, Enum):
     # Phase 4.13 — operator bypass of fail-closed kill-DB-corruption rebuild.
     KILL_STATE_FORCE_RESET = "KILL_STATE_FORCE_RESET"
 
+    # Phase 4.14b — dead-man gate (Gate 8.5). Operator-availability
+    # lifecycle: explicit arm/disarm + periodic heartbeat; trip when
+    # heartbeat goes stale. Distinct event types so downstream alerting
+    # can separate operator-liveness signals from kill-switch signals.
+    OPERATOR_ARMED = "OPERATOR_ARMED"
+    OPERATOR_DISARMED = "OPERATOR_DISARMED"
+    OPERATOR_HEARTBEAT = "OPERATOR_HEARTBEAT"
+    DEAD_MAN_TRIPPED = "DEAD_MAN_TRIPPED"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
@@ -111,8 +120,10 @@ class EventType(str, Enum):
 # between risk admission and venue emit). Phase 4.12 added
 # POISONING_INPUT_REJECTED + POISONING_DETECTOR_ERROR (0g hardening:
 # input validation + detector exception fail-closed).
+# Phase 4.14b added OPERATOR_ARMED + OPERATOR_DISARMED +
+# OPERATOR_HEARTBEAT + DEAD_MAN_TRIPPED (dead-man gate lifecycle).
 # Guard against silent drift:
-assert len(EventType) == 43, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 47, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------

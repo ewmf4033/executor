@@ -70,3 +70,10 @@ kill_switch:
 # Phase 4 — execution attribution
 attribution:
   exit_horizon_sec: 300
+
+# Phase 4.14b — dead-man gate (operator availability, Gate 8.5).
+dead_man:
+  enabled: false
+  default_timeout_sec: 21600  # 6h
+  min_timeout_sec: 300        # 5m
+  max_timeout_sec: 43200      # 12h

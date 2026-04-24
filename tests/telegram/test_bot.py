@@ -190,3 +190,103 @@ def test_venue_health_no_provider(tmp_path: Path) -> None:
     bot, _, _ = _bot(tmp_path)
     reply = asyncio.run(bot.handle_text("/venue health", chat_id="42"))
     assert "no provider" in reply
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — dead-man Telegram commands.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_ping_distinct_from_heartbeat() -> None:
+    # /ping is status-only; /heartbeat updates last_heartbeat. The parser
+    # must keep them as distinct commands even though neither takes args.
+    p_ping = parse_command("/ping")
+    p_hb = parse_command("/heartbeat")
+    assert p_ping.valid is True and p_ping.command == "ping"
+    assert p_hb.valid is True and p_hb.command == "heartbeat"
+    assert p_ping.command != p_hb.command
+
+
+def test_parse_arm_and_disarm() -> None:
+    p_arm = parse_command("/arm 6h")
+    assert p_arm.valid is True
+    assert p_arm.command == "arm"
+    assert p_arm.sub == "6h"
+
+    p_arm_missing = parse_command("/arm")
+    assert p_arm_missing.valid is False
+
+    p_dis = parse_command("/disarm session end")
+    assert p_dis.valid is True
+    assert p_dis.command == "disarm"
+    assert p_dis.args == "session end"
+
+    p_dis_missing = parse_command("/disarm")
+    assert p_dis_missing.valid is False
+
+
+def _bot_with_dead_man(tmp_path: Path):
+    from dataclasses import replace as _replace
+
+    from executor.risk.config import DeadManCfg, RiskConfig
+    from executor.risk.state import OperatorLivenessStore, RiskState
+
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    captured: list[Event] = []
+
+    async def pub(ev: Event) -> None:
+        captured.append(ev)
+
+    km = KillManager(store=store, publish=pub, panic_cooldown_sec=1)
+    rs = RiskState(db_path=tmp_path / "risk_state.sqlite")
+    asyncio.run(rs.load())
+    liveness = OperatorLivenessStore(rs.connection)
+    cfg = _replace(
+        RiskConfig(),
+        dead_man=DeadManCfg(
+            enabled=True,
+            default_timeout_sec=600,
+            min_timeout_sec=60,
+            max_timeout_sec=3600,
+        ),
+    )
+    bot = TelegramBot(
+        kill_manager=km,
+        token="tok",
+        chat_id="42",
+        rate_limit_sec=0.0,
+        operator_liveness=liveness,
+        dead_man_cfg_getter=lambda: cfg.dead_man,
+        publish=pub,
+    )
+    return bot, liveness, captured
+
+
+def test_telegram_arm_heartbeat_disarm_flow(tmp_path: Path) -> None:
+    bot, liveness, events = _bot_with_dead_man(tmp_path)
+    # /arm 10m  -> armed
+    reply = asyncio.run(bot.handle_text("/arm 10m", chat_id="42"))
+    assert "armed for 10m" in reply
+    assert liveness.load().armed is True
+
+    # /ping must NOT update last_heartbeat.
+    before_hb = liveness.load().last_heartbeat_ts_ns
+    reply_ping = asyncio.run(bot.handle_text("/ping", chat_id="42"))
+    assert "pong" in reply_ping and "armed=True" in reply_ping
+    assert liveness.load().last_heartbeat_ts_ns == before_hb
+
+    # /heartbeat updates last_heartbeat.
+    reply_hb = asyncio.run(bot.handle_text("/heartbeat", chat_id="42"))
+    assert "heartbeat ok" in reply_hb
+    assert liveness.load().last_heartbeat_ts_ns >= before_hb
+
+    # /disarm
+    reply_dis = asyncio.run(bot.handle_text("/disarm done", chat_id="42"))
+    assert "disarmed" in reply_dis
+    assert liveness.load().armed is False
+
+    # OPERATOR_* events were published.
+    kinds = {e.event_type for e in events}
+    assert EventType.OPERATOR_ARMED in kinds
+    assert EventType.OPERATOR_HEARTBEAT in kinds
+    assert EventType.OPERATOR_DISARMED in kinds

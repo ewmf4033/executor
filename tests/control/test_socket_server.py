@@ -247,6 +247,117 @@ async def test_socket_permissions_0600_after_start(tmp_path: Path) -> None:
         await srv.stop()
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.14b — dead-man (arm/disarm/heartbeat/arm_status) handlers.
+# ---------------------------------------------------------------------------
+
+
+async def _start_with_dead_man(
+    tmp_path: Path, *, enabled: bool = True
+) -> tuple[ControlSocketServer, Path]:
+    from dataclasses import replace as _replace
+
+    from executor.risk.config import DeadManCfg, RiskConfig
+    from executor.risk.state import OperatorLivenessStore, RiskState
+
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    mgr = KillManager(store=store, panic_cooldown_sec=1)
+    rs = RiskState(db_path=tmp_path / "risk_state.sqlite")
+    await rs.load()
+    liveness = OperatorLivenessStore(rs.connection)
+    cfg = _replace(
+        RiskConfig(),
+        dead_man=DeadManCfg(
+            enabled=enabled,
+            default_timeout_sec=600,
+            min_timeout_sec=60,
+            max_timeout_sec=3600,
+        ),
+    )
+    sock = tmp_path / "control.sock"
+    srv = ControlSocketServer(
+        socket_path=str(sock),
+        kill_mgr=mgr,
+        daemon_started_ts_ns=time.time_ns(),
+        operator_liveness=liveness,
+        risk_config_getter=lambda: cfg,
+    )
+    await srv.start()
+    return srv, sock
+
+
+async def test_arm_engages_when_enabled(tmp_path: Path) -> None:
+    srv, sock = await _start_with_dead_man(tmp_path, enabled=True)
+    try:
+        resp = await _roundtrip(
+            sock,
+            {"cmd": "arm", "args": {"timeout_sec": 600}, "source": "test"},
+        )
+    finally:
+        await srv.stop()
+    assert resp["ok"] is True
+    assert resp["result"]["armed"] is True
+    assert resp["result"]["timeout_sec"] == 600
+    assert resp["result"]["kill_mode_at_arm"] == "NONE"
+
+
+async def test_arm_rejects_when_disabled(tmp_path: Path) -> None:
+    srv, sock = await _start_with_dead_man(tmp_path, enabled=False)
+    try:
+        resp = await _roundtrip(
+            sock,
+            {"cmd": "arm", "args": {"timeout_sec": 600}, "source": "test"},
+        )
+    finally:
+        await srv.stop()
+    assert resp["ok"] is False
+    assert "dead_man_disabled" in resp["error"]
+
+
+async def test_heartbeat_updates_last_hb(tmp_path: Path) -> None:
+    srv, sock = await _start_with_dead_man(tmp_path, enabled=True)
+    try:
+        await _roundtrip(
+            sock,
+            {"cmd": "arm", "args": {"timeout_sec": 600}, "source": "test"},
+        )
+        resp = await _roundtrip(
+            sock, {"cmd": "heartbeat", "args": {}, "source": "test"}
+        )
+        status = await _roundtrip(
+            sock, {"cmd": "arm_status", "args": {}, "source": "test"}
+        )
+    finally:
+        await srv.stop()
+    assert resp["ok"] is True
+    assert resp["result"]["armed"] is True
+    assert resp["result"]["seconds_until_stale"] > 0
+    assert status["ok"] is True
+    assert status["result"]["armed"] is True
+
+
+async def test_disarm_clears_armed(tmp_path: Path) -> None:
+    srv, sock = await _start_with_dead_man(tmp_path, enabled=True)
+    try:
+        await _roundtrip(
+            sock,
+            {"cmd": "arm", "args": {"timeout_sec": 600}, "source": "test"},
+        )
+        resp = await _roundtrip(
+            sock,
+            {"cmd": "disarm", "args": {"reason": "eod"}, "source": "test"},
+        )
+        status = await _roundtrip(
+            sock, {"cmd": "arm_status", "args": {}, "source": "test"}
+        )
+    finally:
+        await srv.stop()
+    assert resp["ok"] is True
+    assert resp["result"]["armed"] is False
+    assert resp["result"]["disarmed_reason"] == "eod"
+    assert status["result"]["armed"] is False
+
+
 async def test_stale_socket_file_removed_on_start(tmp_path: Path) -> None:
     sock = tmp_path / "control.sock"
     sock.write_text("stale leftover")

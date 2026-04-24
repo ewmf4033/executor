@@ -17,7 +17,18 @@ from executor.control.protocol import (
 
 
 def test_commands_registry_and_version() -> None:
-    assert COMMANDS == {"ping", "version", "kill_status", "kill"}
+    # Phase 4.14b added arm/disarm/heartbeat/arm_status for the dead-man
+    # gate control surface.
+    assert COMMANDS == {
+        "ping",
+        "version",
+        "kill_status",
+        "kill",
+        "arm",
+        "disarm",
+        "heartbeat",
+        "arm_status",
+    }
     assert PROTOCOL_VERSION == 1
 
 

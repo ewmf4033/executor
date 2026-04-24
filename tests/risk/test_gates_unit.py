@@ -353,3 +353,112 @@ async def test_clip_floor_approves_within_floor(policy):
     )
     r = await ClipFloorGate().check(ctx)
     assert r.decision == GateDecision.APPROVE
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — DeadManGate (Gate 8.5).
+# ---------------------------------------------------------------------------
+
+
+async def _enable_dead_man(policy):
+    """Flip dead_man.enabled=True on the policy's live config + wire a
+    real OperatorLivenessStore backed by the policy's RiskState. Returns
+    the store so the test can arm/disarm/heartbeat it directly."""
+    from dataclasses import replace as _replace
+
+    from executor.risk.config import DeadManCfg
+    from executor.risk.state import OperatorLivenessStore
+
+    cfg_mgr = policy._cfg_mgr
+    new_cfg = _replace(
+        cfg_mgr._config,
+        dead_man=DeadManCfg(
+            enabled=True,
+            default_timeout_sec=600,
+            min_timeout_sec=60,
+            max_timeout_sec=3600,
+        ),
+    )
+    cfg_mgr._config = new_cfg
+    store = OperatorLivenessStore(policy.state.connection)
+    policy.operator_liveness = store
+    return store
+
+
+async def test_dead_man_disabled_bypasses(policy):
+    from executor.risk.gates import DeadManGate
+
+    # Default cfg has dead_man.enabled=False — gate should approve
+    # regardless of store state.
+    intent = make_intent()
+    r = await DeadManGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_dead_man_enabled_disarmed_rejects(policy):
+    from executor.risk.gates import DeadManGate
+
+    await _enable_dead_man(policy)
+    intent = make_intent()
+    r = await DeadManGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert "dead_man_disarmed" in r.reason
+
+
+async def test_dead_man_enabled_armed_fresh_approves(policy):
+    from executor.risk.gates import DeadManGate
+
+    store = await _enable_dead_man(policy)
+    now = time.time_ns()
+    store.arm(timeout_sec=600, source="test", kill_mode="NONE", now_ns=now)
+    intent = make_intent()
+    ctx = GateCtx(
+        original_intent=intent, current_intent=intent, policy=policy,
+        now_ns=now + 1_000_000_000,  # +1s
+    )
+    r = await DeadManGate().check(ctx)
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_dead_man_enabled_armed_stale_rejects(policy):
+    from executor.risk.gates import DeadManGate
+
+    store = await _enable_dead_man(policy)
+    now = time.time_ns()
+    store.arm(timeout_sec=60, source="test", kill_mode="NONE", now_ns=now)
+    intent = make_intent()
+    # 120s after arm with 60s timeout => stale by ~60s
+    ctx = GateCtx(
+        original_intent=intent, current_intent=intent, policy=policy,
+        now_ns=now + 120 * 1_000_000_000,
+    )
+    r = await DeadManGate().check(ctx)
+    assert r.decision == GateDecision.REJECT
+    assert "dead_man_stale" in r.reason
+
+
+async def test_dead_man_enabled_armed_boundary_exact_timeout_rejects(policy):
+    from executor.risk.gates import DeadManGate
+
+    store = await _enable_dead_man(policy)
+    now = time.time_ns()
+    timeout_sec = 60
+    store.arm(timeout_sec=timeout_sec, source="test", kill_mode="NONE", now_ns=now)
+    intent = make_intent()
+    # Exactly last_hb + timeout_sec*1e9 + 1ns => reject (spec: hard cutoff).
+    exact_deadline_plus_one_ns = now + timeout_sec * 1_000_000_000 + 1
+    ctx = GateCtx(
+        original_intent=intent, current_intent=intent, policy=policy,
+        now_ns=exact_deadline_plus_one_ns,
+    )
+    r = await DeadManGate().check(ctx)
+    assert r.decision == GateDecision.REJECT
+    assert "dead_man_stale" in r.reason
+
+    # And at exactly the deadline (no extra ns), still approve — ">" not ">=".
+    at_deadline_ctx = GateCtx(
+        original_intent=intent, current_intent=intent, policy=policy,
+        now_ns=now + timeout_sec * 1_000_000_000,
+    )
+    r2 = await DeadManGate().check(at_deadline_ctx)
+    assert r2.decision == GateDecision.APPROVE

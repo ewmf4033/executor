@@ -44,7 +44,7 @@ from ..kill.state import KillStateStore
 from ..risk.config import ConfigManager, RiskConfig
 from ..risk.kill import KillSwitch
 from ..risk.policy import RiskPolicy
-from ..risk.state import RiskState
+from ..risk.state import OperatorLivenessStore, RiskState
 from ..strategies.yes_no_cross.strategy import CrossPair, YESNOCrossDetect
 from ..telegram.bot import TelegramBot
 from .event_bus import EventBus
@@ -241,11 +241,20 @@ class DaemonService:
         socket_path = os.environ.get(
             "EXECUTOR_CONTROL_SOCKET", "/run/executor/control.sock"
         )
+        # Phase 4.14b: operator liveness store shares the risk_state
+        # SQLite connection; table is created by RiskState's SCHEMA_SQL
+        # and the singleton row is seeded by the store on construction.
+        self._operator_liveness = OperatorLivenessStore(
+            self.risk_state.connection
+        )
         self.control_server = ControlSocketServer(
             socket_path=socket_path,
             kill_mgr=self.kill_mgr,
             daemon_started_ts_ns=time.time_ns(),
             git_sha=os.environ.get("EXECUTOR_GIT_SHA"),
+            operator_liveness=self._operator_liveness,
+            risk_config_getter=lambda: self.config_mgr.config,
+            publish=self.bus.publish,
         )
         await self.control_server.start()
 
@@ -254,7 +263,15 @@ class DaemonService:
         # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from os.environ at __init__;
         # if either is missing, start() silently no-ops (logs
         # telegram.bot.disabled.no_token / .no_chat_id) and _task stays None.
-        self.telegram_bot = TelegramBot(kill_manager=self.kill_mgr)
+        self.telegram_bot = TelegramBot(
+            kill_manager=self.kill_mgr,
+            # Phase 4.14b: same operator_liveness store the control
+            # server and risk policy share — Telegram /arm, /heartbeat,
+            # etc. must update the same row the DeadManGate reads.
+            operator_liveness=self._operator_liveness,
+            dead_man_cfg_getter=lambda: self.config_mgr.config.dead_man,
+            publish=self.bus.publish,
+        )
         await self.telegram_bot.start()
         await self.bus.publish(
             Event.make(
@@ -295,6 +312,9 @@ class DaemonService:
             # /kill hard engages the exact instance the gate chain and the
             # kill_switch_recheck both consult.
             kill_switch=self._shared_kill_switch,
+            # Phase 4.14b: dead-man gate reads the same operator_liveness
+            # store the control server writes to.
+            operator_liveness=self._operator_liveness,
         )
         # Phase 4.11 Item 1: invariant assertion — catches regressions
         # where a future refactor forgets to share the instance and silently

@@ -38,7 +38,10 @@ async def test_three_strategies_mixed_outcomes(policy_with_bus):
     vc = await policy.evaluate(c)
 
     assert va.admitted is True and va.reject_gate is None
-    assert len(va.gates_passed) == 14
+    # Phase 4.14b added DeadManGate (order 8.5); it bypasses when
+    # cfg.dead_man.enabled is False (the default) so it is counted as a
+    # passed gate. 14 -> 15.
+    assert len(va.gates_passed) == 15
     assert "structural" in va.gate_timings_ms
     assert "clip_floor" in va.gate_timings_ms
 

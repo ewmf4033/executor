@@ -103,6 +103,24 @@ class AttributionCfg:
 
 
 @dataclass(frozen=True, slots=True)
+class DeadManCfg:
+    """Phase 4.14b — operator availability gate (Gate 8.5).
+
+    When ``enabled`` is False the DeadManGate bypasses entirely (paper
+    default). When True, the operator must explicitly arm the dead-man
+    and provide heartbeats within ``timeout_sec``; stale or disarmed
+    state blocks new intents.
+
+    Bounds: 300s (5 min) <= min_timeout_sec <= default_timeout_sec
+    <= max_timeout_sec <= 43200s (12h).
+    """
+    enabled: bool = False
+    default_timeout_sec: int = 21600  # 6h
+    min_timeout_sec: int = 300        # 5 min
+    max_timeout_sec: int = 43200      # 12h
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     # Phase 4.13: when True, safety gates fail-closed rather than no-op when
     # their backing detector/tracker is unavailable. Default False preserves
@@ -131,6 +149,7 @@ class RiskConfig:
     adverse_selection: AdverseSelectionCfg = field(default_factory=AdverseSelectionCfg)
     kill_switch: KillSwitchCfg = field(default_factory=KillSwitchCfg)
     attribution: AttributionCfg = field(default_factory=AttributionCfg)
+    dead_man: DeadManCfg = field(default_factory=DeadManCfg)
 
     def fingerprint(self) -> str:
         """Stable SHA256 of the config; used for CONFIG_RELOADED payload."""
@@ -236,6 +255,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
             adverse_selection=_parse_adverse_selection(raw.get("adverse_selection", {})),
             kill_switch=_parse_kill_switch(raw.get("kill_switch", {})),
             attribution=_parse_attribution(raw.get("attribution", {})),
+            dead_man=_parse_dead_man(raw.get("dead_man", {})),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
@@ -332,6 +352,39 @@ def _parse_kill_switch(d: dict[str, Any]) -> KillSwitchCfg:
 
 def _parse_attribution(d: dict[str, Any]) -> AttributionCfg:
     return AttributionCfg(exit_horizon_sec=int(d.get("exit_horizon_sec", 300)))
+
+
+def _parse_dead_man(d: dict[str, Any]) -> DeadManCfg:
+    """Phase 4.14b: parse + bounds-check dead-man config.
+
+    Hard limits: 1 <= min_timeout_sec <= default_timeout_sec <=
+    max_timeout_sec <= 86400s (1d). The 86400 cap is a defensive
+    upper bound; the spec recommends 43200s (12h) and below.
+    """
+    enabled = bool(d.get("enabled", False))
+    min_t = _require_positive_int(
+        d.get("min_timeout_sec", 300), "dead_man.min_timeout_sec", max_val=86400
+    )
+    default_t = _require_positive_int(
+        d.get("default_timeout_sec", 21600),
+        "dead_man.default_timeout_sec",
+        max_val=86400,
+    )
+    max_t = _require_positive_int(
+        d.get("max_timeout_sec", 43200), "dead_man.max_timeout_sec", max_val=86400
+    )
+    if not (min_t <= default_t <= max_t):
+        raise ConfigError(
+            f"dead_man bounds violated: require min_timeout_sec <= "
+            f"default_timeout_sec <= max_timeout_sec, got "
+            f"min={min_t} default={default_t} max={max_t}"
+        )
+    return DeadManCfg(
+        enabled=enabled,
+        default_timeout_sec=default_t,
+        min_timeout_sec=min_t,
+        max_timeout_sec=max_t,
+    )
 
 
 # ---------------------------------------------------------------------------

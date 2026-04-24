@@ -40,9 +40,12 @@ try:
 except ImportError:  # pragma: no cover — aiohttp is a hard dep declared in pyproject
     aiohttp = None  # type: ignore
 
+from ..core.events import Event, EventType, Source
 from ..core.logging import get_logger
 from ..kill.manager import KillManager
 from ..kill.state import KillMode
+from ..risk.config import DeadManCfg
+from ..risk.state import OperatorLivenessStore
 
 
 log = get_logger("executor.telegram.bot")
@@ -54,18 +57,58 @@ DEFAULT_POLL_TIMEOUT_SEC = 25
 DEFAULT_LOOP_BACKOFF_SEC = 1.0
 
 
+def _parse_tg_timeout(raw: str) -> int:
+    """Parse a Telegram-style duration token ("300", "5m", "6h") -> seconds.
+
+    Rejects day suffix for T1 safety (mirrors executorctl's parser).
+    """
+    if not raw:
+        raise ValueError("empty timeout")
+    unit = raw[-1].lower()
+    if unit.isdigit():
+        return int(raw)
+    if unit == "s":
+        return int(raw[:-1])
+    if unit == "m":
+        return int(raw[:-1]) * 60
+    if unit == "h":
+        return int(raw[:-1]) * 3600
+    raise ValueError(f"unsupported timeout unit {unit!r}")
+
+
+def _fmt_sec(seconds: int) -> str:
+    sign = "-" if seconds < 0 else ""
+    s = abs(int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{sec}s")
+    return sign + "".join(parts)
+
+
 @dataclass(frozen=True)
 class ParsedCommand:
     valid: bool
-    command: str            # "kill" | "venue" | ""
+    command: str            # "kill" | "venue" | "ping" | "heartbeat" | "arm" | "disarm" | "arm_status" | ""
     sub: str                # "soft" | "hard" | "panic" | "resume" | "status" | "health" | ""
     args: str
     error: str = ""
 
 
+# Phase 4.14b: /ping, /heartbeat, /arm_status take no arguments. /arm takes
+# a single timeout token (sub). /disarm takes the rest of the line as its
+# reason (args). /ping is explicitly distinct from /heartbeat — the former
+# is status-only and does NOT update last_heartbeat_ts_ns.
+_DEAD_MAN_NO_ARG = frozenset({"ping", "heartbeat", "arm_status"})
+
+
 def parse_command(text: str) -> ParsedCommand:
     """
-    Strict parser for the Phase 4 surface. Returns valid=False on garbage.
+    Strict parser for the Phase 4 / 4.14b surface. Returns valid=False on garbage.
     Strips an optional bot-mention suffix (e.g. "/kill@masta_op2_bot soft x").
     """
     raw = (text or "").strip()
@@ -75,7 +118,8 @@ def parse_command(text: str) -> ParsedCommand:
     if not parts:
         return ParsedCommand(False, "", "", "", "empty command")
     head = parts[0].split("@", 1)[0].lower()  # strip @bot mention
-    if head not in ("kill", "venue"):
+    known = {"kill", "venue", "ping", "heartbeat", "arm", "disarm", "arm_status"}
+    if head not in known:
         return ParsedCommand(False, head, "", "", f"unknown command: {head}")
     sub = parts[1].lower() if len(parts) > 1 else ""
     args = parts[2] if len(parts) > 2 else ""
@@ -90,6 +134,22 @@ def parse_command(text: str) -> ParsedCommand:
         if sub != "health":
             return ParsedCommand(False, head, sub, args, f"unknown /venue sub: {sub}")
         return ParsedCommand(True, head, sub, args, "")
+    # Phase 4.14b — dead-man commands.
+    if head in _DEAD_MAN_NO_ARG:
+        # No arguments expected; tolerate extras by ignoring.
+        return ParsedCommand(True, head, "", "", "")
+    if head == "arm":
+        if not sub:
+            return ParsedCommand(False, head, sub, args, "/arm requires <timeout>")
+        # Preserve original case of the timeout token.
+        orig_sub = parts[1] if len(parts) > 1 else ""
+        return ParsedCommand(True, head, orig_sub, "", "")
+    if head == "disarm":
+        # Join sub + args back into a single free-form reason string.
+        reason = (parts[1] + (" " + args if args else "")) if len(parts) > 1 else ""
+        if not reason:
+            return ParsedCommand(False, head, "", "", "/disarm requires <reason>")
+        return ParsedCommand(True, head, "", reason, "")
     return ParsedCommand(False, head, sub, args, "unhandled")
 
 
@@ -106,8 +166,18 @@ class TelegramBot:
         venue_health_provider: Callable[[], Awaitable[dict[str, Any]] | dict[str, Any]] | None = None,
         send_callback: Callable[[str], Awaitable[None]] | None = None,
         poll_timeout_sec: int = DEFAULT_POLL_TIMEOUT_SEC,
+        # Phase 4.14b — optional dead-man wiring. None preserves the
+        # Phase 4 / 4.11.1 behavior for existing tests: /arm /disarm /...
+        # commands then reply with an "unavailable" error rather than
+        # silently no-opping.
+        operator_liveness: OperatorLivenessStore | None = None,
+        dead_man_cfg_getter: Callable[[], DeadManCfg] | None = None,
+        publish: Callable[[Event], Awaitable[None]] | None = None,
     ) -> None:
         self._kill = kill_manager
+        self._operator_liveness = operator_liveness
+        self._dead_man_cfg_getter = dead_man_cfg_getter
+        self._publish = publish
         self._token = token if token is not None else os.environ.get("TELEGRAM_BOT_TOKEN", "")
         env_chat = chat_id if chat_id is not None else os.environ.get("TELEGRAM_CHAT_ID", "")
         self._chat_id: str = str(env_chat) if env_chat not in (None, "") else ""
@@ -209,6 +279,17 @@ class TelegramBot:
                     f"manual_only={snap.manual_only} strikes={snap.resume_strikes} "
                     f"reason={snap.reason!r}"
                 )
+        # Phase 4.14b — dead-man commands.
+        if p.command == "ping":
+            return self._fmt_ping()
+        if p.command == "arm_status":
+            return self._fmt_arm_status()
+        if p.command == "heartbeat":
+            return await self._do_heartbeat()
+        if p.command == "arm":
+            return await self._do_arm(p.sub)
+        if p.command == "disarm":
+            return await self._do_disarm(p.args)
         if p.command == "venue" and p.sub == "health":
             if self._venue_health is None:
                 return "venue health: no provider attached"
@@ -222,6 +303,128 @@ class TelegramBot:
                 f"{k}={v}" for k, v in sorted((raw or {}).items())
             )
         return "err: unhandled command"
+
+    # ------------------------------------------------------------------
+    # Phase 4.14b — dead-man helpers.
+    # ------------------------------------------------------------------
+
+    def _fmt_ping(self) -> str:
+        """Status-only pong; NEVER updates last_heartbeat_ts_ns."""
+        snap = self._kill.snapshot()
+        if self._operator_liveness is None:
+            return f"pong | kill={snap.mode.value}"
+        live = self._operator_liveness.load()
+        if not live.armed:
+            return f"pong | armed=False kill={snap.mode.value}"
+        deadline = live.last_heartbeat_ts_ns + live.timeout_sec * 1_000_000_000
+        until_stale = int((deadline - time.time_ns()) / 1e9)
+        return (
+            f"pong | armed=True until_stale={_fmt_sec(until_stale)} "
+            f"kill={snap.mode.value}"
+        )
+
+    def _fmt_arm_status(self) -> str:
+        if self._operator_liveness is None:
+            return "arm_status: operator_liveness not wired"
+        live = self._operator_liveness.load()
+        if not live.armed:
+            reason = f" last_disarm_reason={live.disarmed_reason!r}" if live.disarmed_reason else ""
+            return f"armed=False{reason}"
+        deadline = live.last_heartbeat_ts_ns + live.timeout_sec * 1_000_000_000
+        until_stale = int((deadline - time.time_ns()) / 1e9)
+        return (
+            f"armed=True timeout={_fmt_sec(live.timeout_sec)} "
+            f"until_stale={_fmt_sec(until_stale)} "
+            f"kill_mode_at_arm={live.kill_mode_at_arm}"
+        )
+
+    async def _do_heartbeat(self) -> str:
+        if self._operator_liveness is None:
+            return "heartbeat: operator_liveness not wired"
+        now_ns = time.time_ns()
+        was_armed = self._operator_liveness.heartbeat(now_ns=now_ns)
+        if not was_armed:
+            return "not armed — heartbeat ignored"
+        live = self._operator_liveness.load()
+        deadline = live.last_heartbeat_ts_ns + live.timeout_sec * 1_000_000_000
+        until_stale = int((deadline - now_ns) / 1e9)
+        if self._publish is not None:
+            try:
+                await self._publish(
+                    Event.make(
+                        EventType.OPERATOR_HEARTBEAT,
+                        source=Source.TELEGRAM,
+                        payload={
+                            "last_heartbeat_ts_ns": int(now_ns),
+                            "seconds_until_stale": until_stale,
+                        },
+                    )
+                )
+            except Exception as exc:  # pragma: no cover
+                log.warning("telegram.bot.heartbeat_publish_failed", error=str(exc))
+        return f"heartbeat ok — {_fmt_sec(until_stale)} until stale"
+
+    async def _do_arm(self, timeout_token: str) -> str:
+        if self._operator_liveness is None or self._dead_man_cfg_getter is None:
+            return "arm: dead-man not wired"
+        cfg = self._dead_man_cfg_getter()
+        if not cfg.enabled:
+            return "arm: dead_man.enabled is False in risk.yaml"
+        try:
+            timeout_sec = _parse_tg_timeout(timeout_token)
+        except ValueError as exc:
+            return f"arm: invalid timeout ({exc})"
+        if not (cfg.min_timeout_sec <= timeout_sec <= cfg.max_timeout_sec):
+            return (
+                f"arm: timeout_sec {timeout_sec} out of bounds "
+                f"[{cfg.min_timeout_sec},{cfg.max_timeout_sec}]"
+            )
+        kill_mode = self._kill.snapshot().mode.value
+        now_ns = time.time_ns()
+        self._operator_liveness.arm(
+            timeout_sec=timeout_sec,
+            source="telegram",
+            kill_mode=kill_mode,
+            now_ns=now_ns,
+        )
+        if self._publish is not None:
+            try:
+                await self._publish(
+                    Event.make(
+                        EventType.OPERATOR_ARMED,
+                        source=Source.TELEGRAM,
+                        payload={
+                            "timeout_sec": int(timeout_sec),
+                            "armed_by_source": "telegram",
+                            "kill_mode_at_arm": kill_mode,
+                            "armed_ts_ns": int(now_ns),
+                        },
+                    )
+                )
+            except Exception as exc:  # pragma: no cover
+                log.warning("telegram.bot.arm_publish_failed", error=str(exc))
+        return f"armed for {_fmt_sec(timeout_sec)} | kill={kill_mode} at arm time"
+
+    async def _do_disarm(self, reason: str) -> str:
+        if self._operator_liveness is None:
+            return "disarm: dead-man not wired"
+        reason = (reason or "").strip()
+        if not reason:
+            return "disarm: reason required"
+        now_ns = time.time_ns()
+        self._operator_liveness.disarm(reason=reason, now_ns=now_ns)
+        if self._publish is not None:
+            try:
+                await self._publish(
+                    Event.make(
+                        EventType.OPERATOR_DISARMED,
+                        source=Source.TELEGRAM,
+                        payload={"reason": reason, "disarmed_ts_ns": int(now_ns)},
+                    )
+                )
+            except Exception as exc:  # pragma: no cover
+                log.warning("telegram.bot.disarm_publish_failed", error=str(exc))
+        return f"disarmed — reason: {reason}"
 
     # ------------------------------------------------------------------
     # Long-running poll loop (real Telegram)

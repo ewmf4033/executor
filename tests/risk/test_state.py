@@ -12,6 +12,7 @@ import pytest
 
 from executor.core.types import Position
 from executor.risk.state import (
+    OperatorLivenessStore,
     RiskState,
     RiskStateCorruptInCapitalMode,
     utc_date_str,
@@ -175,3 +176,86 @@ async def test_riskstate_corrupt_paper_mode_rebuilds(tmp_path: Path):
         venues={"kalshi": FakeAdapter(positions)}, capital_mode=False
     )
     assert outcome2 == "rebuilt_venues"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — OperatorLivenessStore tests.
+# ---------------------------------------------------------------------------
+
+
+async def _fresh_live_store(tmp_path: Path) -> tuple[RiskState, OperatorLivenessStore]:
+    s = RiskState(db_path=tmp_path / "rs.sqlite")
+    await s.load()
+    return s, OperatorLivenessStore(s.connection)
+
+
+async def test_operator_liveness_arm_persists(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    now = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=now)
+    snap = store.load()
+    assert snap.armed is True
+    assert snap.timeout_sec == 600
+    assert snap.armed_ts_ns == now
+    assert snap.last_heartbeat_ts_ns == now
+    assert snap.armed_by_source == "executorctl"
+    assert snap.kill_mode_at_arm == "NONE"
+    assert snap.disarmed_reason is None
+    s.close()
+
+
+async def test_operator_liveness_disarm_clears_state(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    now = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=now)
+    store.disarm(reason="session end", now_ns=now + 1)
+    snap = store.load()
+    assert snap.armed is False
+    assert snap.disarmed_reason == "session end"
+    s.close()
+
+
+async def test_operator_liveness_heartbeat_updates_ts(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    t0 = time.time_ns()
+    store.arm(timeout_sec=600, source="executorctl", kill_mode="NONE", now_ns=t0)
+    t1 = t0 + 5_000_000_000  # +5s
+    ok = store.heartbeat(now_ns=t1)
+    assert ok is True
+    snap = store.load()
+    assert snap.last_heartbeat_ts_ns == t1
+    s.close()
+
+
+async def test_operator_liveness_heartbeat_noop_when_disarmed(tmp_path: Path):
+    s, store = await _fresh_live_store(tmp_path)
+    # No arm at all — default row is disarmed.
+    ok = store.heartbeat(now_ns=time.time_ns())
+    assert ok is False
+    snap = store.load()
+    assert snap.armed is False
+    assert snap.last_heartbeat_ts_ns == 0
+    s.close()
+
+
+async def test_operator_liveness_survives_restart(tmp_path: Path):
+    # Open, arm, close — then reopen the same DB and verify the row
+    # reflects armed state with its original armed_ts_ns preserved.
+    path = tmp_path / "rs.sqlite"
+    s1 = RiskState(db_path=path)
+    await s1.load()
+    store1 = OperatorLivenessStore(s1.connection)
+    t0 = time.time_ns()
+    store1.arm(timeout_sec=1200, source="executorctl", kill_mode="SOFT", now_ns=t0)
+    s1.close()
+
+    s2 = RiskState(db_path=path)
+    await s2.load()
+    store2 = OperatorLivenessStore(s2.connection)
+    snap = store2.load()
+    assert snap.armed is True
+    assert snap.armed_ts_ns == t0
+    assert snap.timeout_sec == 1200
+    assert snap.last_heartbeat_ts_ns == t0
+    assert snap.kill_mode_at_arm == "SOFT"
+    s2.close()

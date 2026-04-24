@@ -25,9 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..core.events import Event, EventType, Source
 from ..core.logging import get_logger
 from ..kill.manager import KillManager
 from ..kill.state import KillMode, KillStateSnapshot
+from ..risk.config import RiskConfig
+from ..risk.state import OperatorLivenessStore
 from .protocol import (
     COMMANDS,
     PROTOCOL_VERSION,
@@ -86,11 +89,25 @@ class ControlSocketServer:
         kill_mgr: KillManager,
         daemon_started_ts_ns: int,
         git_sha: str | None = None,
+        # Phase 4.14b — optional operator-liveness wiring for the
+        # dead-man gate. All three are optional so existing tests that
+        # construct the server with only the kill surface still work;
+        # dead-man commands that require any of them will return
+        # "dead_man_disabled" / "internal_error" when absent.
+        operator_liveness: OperatorLivenessStore | None = None,
+        risk_config_getter: "Any | None" = None,
+        publish: "Any | None" = None,
     ) -> None:
         self._socket_path = str(socket_path)
         self._kill_mgr = kill_mgr
         self._daemon_started_ts_ns = int(daemon_started_ts_ns)
         self._git_sha = git_sha
+        self._operator_liveness = operator_liveness
+        # Callable returning current RiskConfig (reads through to the
+        # ConfigManager so SIGHUP reloads of dead_man bounds are picked
+        # up without server restart). None => dead-man config not wired.
+        self._risk_config_getter = risk_config_getter
+        self._publish = publish
         self._server: asyncio.base_events.Server | None = None
 
     async def start(self) -> None:
@@ -222,8 +239,144 @@ class ControlSocketServer:
             return _public_snapshot(self._kill_mgr.snapshot())
         if cmd == "kill":
             return await self._do_kill(args)
+        # Phase 4.14b — operator liveness / dead-man.
+        if cmd == "arm":
+            return await self._do_arm(args)
+        if cmd == "disarm":
+            return await self._do_disarm(args)
+        if cmd == "heartbeat":
+            return await self._do_heartbeat(args)
+        if cmd == "arm_status":
+            return await self._do_arm_status(args)
         # Unreachable given COMMANDS guard above.
         raise ProtocolError(f"unknown cmd: {cmd}")
+
+    # ------------------------------------------------------------------
+    # Phase 4.14b — operator liveness / dead-man.
+    # ------------------------------------------------------------------
+
+    def _require_liveness(self) -> OperatorLivenessStore:
+        if self._operator_liveness is None:
+            raise ProtocolError(
+                "dead_man_unavailable: operator_liveness store not wired"
+            )
+        return self._operator_liveness
+
+    def _current_dead_man_cfg(self):
+        """Return the current dead_man config section, or None if not wired.
+
+        Read through the getter each call so SIGHUP reloads are picked up.
+        """
+        if self._risk_config_getter is None:
+            return None
+        cfg = self._risk_config_getter()
+        return cfg.dead_man
+
+    async def _publish_if_available(self, event: Event) -> None:
+        if self._publish is None:
+            return
+        try:
+            await self._publish(event)
+        except Exception as exc:  # pragma: no cover — publish errors logged
+            log.error("control.socket.publish_failed", error=str(exc))
+
+    async def _do_arm(self, args: dict[str, Any]) -> dict[str, Any]:
+        dm_cfg = self._current_dead_man_cfg()
+        if dm_cfg is None:
+            raise ProtocolError(
+                "dead_man_unavailable: risk config not wired into control server"
+            )
+        if not dm_cfg.enabled:
+            raise ProtocolError(
+                "dead_man_disabled: cfg.dead_man.enabled is False; "
+                "enable in risk.yaml before arming"
+            )
+        raw_timeout = args.get("timeout_sec")
+        if not isinstance(raw_timeout, int) or isinstance(raw_timeout, bool):
+            raise ProtocolError("'timeout_sec' must be an integer")
+        if raw_timeout < dm_cfg.min_timeout_sec or raw_timeout > dm_cfg.max_timeout_sec:
+            raise ProtocolError(
+                f"'timeout_sec' out of bounds [{dm_cfg.min_timeout_sec},"
+                f"{dm_cfg.max_timeout_sec}], got {raw_timeout}"
+            )
+        source = args.get("source", "executorctl")
+        if not isinstance(source, str) or not source:
+            source = "executorctl"
+        store = self._require_liveness()
+        kill_mode = self._kill_mgr.snapshot().mode.value
+        now_ns = time.time_ns()
+        store.arm(
+            timeout_sec=raw_timeout,
+            source=source,
+            kill_mode=kill_mode,
+            now_ns=now_ns,
+        )
+        await self._publish_if_available(
+            Event.make(
+                EventType.OPERATOR_ARMED,
+                source=Source.EXECUTOR,
+                payload={
+                    "timeout_sec": int(raw_timeout),
+                    "armed_by_source": source,
+                    "kill_mode_at_arm": kill_mode,
+                    "armed_ts_ns": int(now_ns),
+                },
+            )
+        )
+        return {
+            "armed": True,
+            "timeout_sec": int(raw_timeout),
+            "kill_mode_at_arm": kill_mode,
+            "last_heartbeat_ts_ns": int(now_ns),
+        }
+
+    async def _do_disarm(self, args: dict[str, Any]) -> dict[str, Any]:
+        reason = args.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise ProtocolError("'reason' is required (non-empty string) for disarm")
+        store = self._require_liveness()
+        now_ns = time.time_ns()
+        store.disarm(reason=reason, now_ns=now_ns)
+        await self._publish_if_available(
+            Event.make(
+                EventType.OPERATOR_DISARMED,
+                source=Source.EXECUTOR,
+                payload={"reason": reason, "disarmed_ts_ns": int(now_ns)},
+            )
+        )
+        return {"armed": False, "disarmed_reason": reason}
+
+    async def _do_heartbeat(self, args: dict[str, Any]) -> dict[str, Any]:
+        store = self._require_liveness()
+        now_ns = time.time_ns()
+        was_armed = store.heartbeat(now_ns=now_ns)
+        if not was_armed:
+            return {
+                "armed": False,
+                "note": "heartbeat on disarmed state is a no-op",
+            }
+        snap = store.load()
+        deadline_ns = snap.last_heartbeat_ts_ns + snap.timeout_sec * 1_000_000_000
+        seconds_until_stale = int((deadline_ns - now_ns) / 1e9)
+        await self._publish_if_available(
+            Event.make(
+                EventType.OPERATOR_HEARTBEAT,
+                source=Source.EXECUTOR,
+                payload={
+                    "last_heartbeat_ts_ns": int(now_ns),
+                    "seconds_until_stale": seconds_until_stale,
+                },
+            )
+        )
+        return {
+            "armed": True,
+            "last_heartbeat_ts_ns": int(now_ns),
+            "seconds_until_stale": seconds_until_stale,
+        }
+
+    async def _do_arm_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        store = self._require_liveness()
+        return store.status(now_ns=time.time_ns())
 
     async def _do_kill(self, args: dict[str, Any]) -> dict[str, Any]:
         sub = args.get("sub")

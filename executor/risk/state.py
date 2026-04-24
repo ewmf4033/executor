@@ -103,6 +103,20 @@ CREATE TABLE IF NOT EXISTS adverse_selection_pauses (
     reason TEXT,
     source_market_id TEXT
 );
+-- Phase 4.14b: singleton row tracking operator liveness for Gate 8.5.
+-- armed state + timeout + last heartbeat persist across daemon restart,
+-- so a crash mid-session does not secretly disarm the dead-man.
+CREATE TABLE IF NOT EXISTS operator_liveness (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    armed INTEGER NOT NULL DEFAULT 0,
+    armed_ts_ns INTEGER NOT NULL DEFAULT 0,
+    timeout_sec INTEGER NOT NULL DEFAULT 0,
+    last_heartbeat_ts_ns INTEGER NOT NULL DEFAULT 0,
+    armed_by_source TEXT,
+    kill_mode_at_arm TEXT,
+    disarmed_reason TEXT
+);
+INSERT OR IGNORE INTO operator_liveness (id) VALUES (1);
 """
 
 
@@ -229,6 +243,14 @@ class RiskState:
                 self._conn.close()
             self._conn = None
         self._started = False
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Expose the SQLite handle for co-located stores (Phase 4.14b:
+        OperatorLivenessStore). Raises if called before load()."""
+        if self._conn is None:
+            raise RuntimeError("RiskState.connection accessed before load()")
+        return self._conn
 
     # ------------------------------------------------------------------
     # Open / schema
@@ -561,3 +583,147 @@ class RiskState:
             "DELETE FROM adverse_selection_pauses WHERE venue = ?", (venue,)
         )
         self._conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — operator liveness store backing Gate 8.5 (dead-man).
+#
+# Shares the risk_state.sqlite connection; lives as a small class to keep
+# the arm/disarm/heartbeat/status surface co-located. Armed state,
+# armed_ts_ns, and last_heartbeat_ts_ns all persist across daemon restart
+# — a crash at T=3h with timeout=6h leaves 3h remaining, not a reset.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OperatorLivenessSnapshot:
+    armed: bool
+    armed_ts_ns: int
+    timeout_sec: int
+    last_heartbeat_ts_ns: int
+    armed_by_source: str | None
+    kill_mode_at_arm: str | None
+    disarmed_reason: str | None
+
+
+class OperatorLivenessStore:
+    """Singleton-row store for operator arm/disarm/heartbeat state.
+
+    The backing table is created by SCHEMA_SQL; the singleton row (id=1)
+    is seeded via INSERT OR IGNORE on every connection open so fresh
+    DBs have a valid starting row (armed=0).
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        # Defensive: guarantee singleton row exists even if this store is
+        # constructed against a connection opened before SCHEMA_SQL ran.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO operator_liveness (id) VALUES (1)"
+        )
+        self._conn.commit()
+
+    def load(self) -> OperatorLivenessSnapshot:
+        row = self._conn.execute(
+            "SELECT armed, armed_ts_ns, timeout_sec, last_heartbeat_ts_ns, "
+            "armed_by_source, kill_mode_at_arm, disarmed_reason "
+            "FROM operator_liveness WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            # Should be unreachable given INSERT OR IGNORE above, but be
+            # explicit rather than returning silently wrong state.
+            return OperatorLivenessSnapshot(
+                armed=False,
+                armed_ts_ns=0,
+                timeout_sec=0,
+                last_heartbeat_ts_ns=0,
+                armed_by_source=None,
+                kill_mode_at_arm=None,
+                disarmed_reason=None,
+            )
+        return OperatorLivenessSnapshot(
+            armed=bool(row[0]),
+            armed_ts_ns=int(row[1]),
+            timeout_sec=int(row[2]),
+            last_heartbeat_ts_ns=int(row[3]),
+            armed_by_source=row[4],
+            kill_mode_at_arm=row[5],
+            disarmed_reason=row[6],
+        )
+
+    def arm(
+        self,
+        *,
+        timeout_sec: int,
+        source: str,
+        kill_mode: str,
+        now_ns: int,
+    ) -> None:
+        """Engage the dead-man. Records kill_mode at arm time for audit.
+
+        last_heartbeat is set to now_ns so the first 'timeout_sec' window
+        starts from arm time; the operator does not need an immediate
+        heartbeat after arm.
+        """
+        self._conn.execute(
+            "UPDATE operator_liveness SET "
+            "armed = 1, armed_ts_ns = ?, timeout_sec = ?, "
+            "last_heartbeat_ts_ns = ?, armed_by_source = ?, "
+            "kill_mode_at_arm = ?, disarmed_reason = NULL "
+            "WHERE id = 1",
+            (int(now_ns), int(timeout_sec), int(now_ns), source, kill_mode),
+        )
+        self._conn.commit()
+
+    def disarm(self, *, reason: str, now_ns: int) -> None:
+        """Clear armed state, recording reason for audit trail.
+
+        now_ns is accepted for API symmetry and potential future auditing
+        of disarm times; it is not currently persisted on the row (the
+        OPERATOR_DISARMED audit event carries the timestamp).
+        """
+        del now_ns  # reserved for future use
+        self._conn.execute(
+            "UPDATE operator_liveness SET armed = 0, disarmed_reason = ? "
+            "WHERE id = 1",
+            (reason,),
+        )
+        self._conn.commit()
+
+    def heartbeat(self, *, now_ns: int) -> bool:
+        """Reset-to-full heartbeat. No-op on disarmed state (returns False).
+
+        Returns True if the store was armed at the time of call (heartbeat
+        applied), False if disarmed (no write — does not silently re-arm).
+        """
+        snap = self.load()
+        if not snap.armed:
+            return False
+        self._conn.execute(
+            "UPDATE operator_liveness SET last_heartbeat_ts_ns = ? "
+            "WHERE id = 1",
+            (int(now_ns),),
+        )
+        self._conn.commit()
+        return True
+
+    def status(self, *, now_ns: int) -> dict[str, Any]:
+        snap = self.load()
+        if snap.armed:
+            deadline_ns = snap.last_heartbeat_ts_ns + snap.timeout_sec * 1_000_000_000
+            seconds_until_stale = (deadline_ns - int(now_ns)) / 1e9
+            seconds_since_armed = (int(now_ns) - snap.armed_ts_ns) / 1e9
+        else:
+            seconds_until_stale = 0.0
+            seconds_since_armed = 0.0
+        return {
+            "armed": snap.armed,
+            "armed_ts_ns": snap.armed_ts_ns,
+            "timeout_sec": snap.timeout_sec,
+            "last_heartbeat_ts_ns": snap.last_heartbeat_ts_ns,
+            "armed_by_source": snap.armed_by_source,
+            "kill_mode_at_arm": snap.kill_mode_at_arm,
+            "disarmed_reason": snap.disarmed_reason,
+            "seconds_until_stale": seconds_until_stale,
+            "seconds_since_armed": seconds_since_armed,
+        }

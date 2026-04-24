@@ -163,3 +163,74 @@ def test_config_accepts_valid_ranges_unchanged(tmp_path: Path):
     assert cfg.poisoning.min_samples == 50
     assert cfg.kill_switch.panic_cooldown_sec == 0
     assert cfg.venue_health.window_sec == 30
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — DeadManCfg parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_dead_man_disabled_by_default():
+    cfg = load_config(None)
+    assert cfg.dead_man.enabled is False
+    assert cfg.dead_man.default_timeout_sec == 21600
+    assert cfg.dead_man.min_timeout_sec == 300
+    assert cfg.dead_man.max_timeout_sec == 43200
+
+
+def test_dead_man_cfg_defaults_parse(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 1800,
+            "min_timeout_sec": 60,
+            "max_timeout_sec": 7200,
+        }
+    }))
+    cfg = load_config(p)
+    assert cfg.dead_man.enabled is True
+    assert cfg.dead_man.default_timeout_sec == 1800
+    assert cfg.dead_man.min_timeout_sec == 60
+    assert cfg.dead_man.max_timeout_sec == 7200
+
+
+def test_dead_man_cfg_invalid_bounds_rejected(tmp_path: Path):
+    # min > default
+    p1 = tmp_path / "bad1.yaml"
+    p1.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 60,
+            "min_timeout_sec": 120,
+            "max_timeout_sec": 600,
+        }
+    }))
+    with pytest.raises(ConfigError):
+        load_config(p1)
+
+    # max < default
+    p2 = tmp_path / "bad2.yaml"
+    p2.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 1800,
+            "min_timeout_sec": 60,
+            "max_timeout_sec": 600,
+        }
+    }))
+    with pytest.raises(ConfigError):
+        load_config(p2)
+
+    # Negative / zero rejected by _require_positive_int
+    p3 = tmp_path / "bad3.yaml"
+    p3.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 600,
+            "min_timeout_sec": 0,
+            "max_timeout_sec": 3600,
+        }
+    }))
+    with pytest.raises(ConfigError):
+        load_config(p3)

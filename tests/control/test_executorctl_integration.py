@@ -77,3 +77,70 @@ def test_executorctl_connect_failure_exit_2(tmp_path: Path) -> None:
     result = _run(missing, "ping")
     assert result.returncode == 2
     assert "socket not found" in result.stderr or "daemon" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — arm + heartbeat integration via the CLI against a live server
+# wired with the dead-man surface.
+# ---------------------------------------------------------------------------
+
+
+async def _start_with_dead_man(tmp_path: Path):
+    from dataclasses import replace as _replace
+
+    from executor.risk.config import DeadManCfg, RiskConfig
+    from executor.risk.state import OperatorLivenessStore, RiskState
+
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    mgr = KillManager(store=store, panic_cooldown_sec=1)
+    rs = RiskState(db_path=tmp_path / "risk_state.sqlite")
+    await rs.load()
+    liveness = OperatorLivenessStore(rs.connection)
+    cfg = _replace(
+        RiskConfig(),
+        dead_man=DeadManCfg(
+            enabled=True,
+            default_timeout_sec=600,
+            min_timeout_sec=60,
+            max_timeout_sec=3600,
+        ),
+    )
+    sock = tmp_path / "ctl.sock"
+    srv = ControlSocketServer(
+        socket_path=str(sock),
+        kill_mgr=mgr,
+        daemon_started_ts_ns=time.time_ns(),
+        operator_liveness=liveness,
+        risk_config_getter=lambda: cfg,
+    )
+    await srv.start()
+    return srv, sock
+
+
+async def test_executorctl_arm_and_heartbeat_end_to_end(tmp_path: Path) -> None:
+    srv, sock = await _start_with_dead_man(tmp_path)
+    try:
+        loop = asyncio.get_running_loop()
+        arm_res = await loop.run_in_executor(
+            None, lambda: _run(sock, "arm", "--timeout", "10m")
+        )
+        assert arm_res.returncode == 0, (
+            f"stdout={arm_res.stdout!r} stderr={arm_res.stderr!r}"
+        )
+        assert "armed for 10m" in arm_res.stdout
+
+        hb_res = await loop.run_in_executor(
+            None, lambda: _run(sock, "heartbeat")
+        )
+        assert hb_res.returncode == 0, (
+            f"stdout={hb_res.stdout!r} stderr={hb_res.stderr!r}"
+        )
+        assert "heartbeat ok" in hb_res.stdout
+
+        status_res = await loop.run_in_executor(
+            None, lambda: _run(sock, "arm_status")
+        )
+        assert status_res.returncode == 0
+        assert "armed=True" in status_res.stdout
+    finally:
+        await srv.stop()

@@ -70,3 +70,14 @@ kill_switch:
 # Phase 4 — execution attribution
 attribution:
   exit_horizon_sec: 300
+
+# Phase 4.14b — dead-man gate (operator availability, Gate 8.5).
+# Disabled by default so paper mode + tests are unaffected. Flip to
+# enabled: true before T1 live trading. The operator must then run
+# `executorctl arm --timeout <X>` (or /arm via Telegram) before new
+# intents are admitted, and heartbeat within `timeout_sec` thereafter.
+dead_man:
+  enabled: false
+  default_timeout_sec: 21600  # 6h
+  min_timeout_sec: 300        # 5m
+  max_timeout_sec: 43200      # 12h

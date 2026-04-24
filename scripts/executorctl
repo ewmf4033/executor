@@ -14,6 +14,10 @@ Usage:
     executorctl kill hard  <reason>
     executorctl kill panic <reason>
     executorctl kill resume
+    executorctl arm --timeout 6h
+    executorctl disarm --reason "session end"
+    executorctl heartbeat
+    executorctl arm_status
 
 Socket path: $EXECUTOR_CONTROL_SOCKET, default /run/executor/control.sock.
 
@@ -145,6 +149,107 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_timeout(raw: str) -> int:
+    """Parse a duration string with optional s/m/h suffix into seconds.
+
+    Accepts "300", "5m", "6h". Rejects "1d" (day suffix) per T1 safety —
+    the dead-man ceiling caps at 12h; operators who want longer should
+    explicitly write "43200" in seconds.
+    """
+    if not raw:
+        raise ValueError("empty timeout")
+    unit = raw[-1].lower()
+    if unit.isdigit():
+        value = int(raw)
+        return value
+    if unit == "s":
+        return int(raw[:-1])
+    if unit == "m":
+        return int(raw[:-1]) * 60
+    if unit == "h":
+        return int(raw[:-1]) * 3600
+    raise ValueError(f"unsupported timeout unit {unit!r} — use s/m/h or bare seconds")
+
+
+def _fmt_duration(seconds: int) -> str:
+    """Format seconds as compact HhMmSs. Negative -> "-XsY"."""
+    sign = "-" if seconds < 0 else ""
+    s = abs(int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{sec}s")
+    return sign + "".join(parts)
+
+
+def cmd_arm(args: argparse.Namespace) -> int:
+    try:
+        timeout_sec = _parse_timeout(args.timeout)
+    except ValueError as exc:
+        print(f"executorctl: invalid --timeout: {exc}", file=sys.stderr)
+        return 3
+    resp = _send(args.socket, "arm", {"timeout_sec": timeout_sec})
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    r = resp["result"]
+    print(
+        f"armed for {_fmt_duration(timeout_sec)} | "
+        f"kill_mode_at_arm={r.get('kill_mode_at_arm', '?')}"
+    )
+    return 0
+
+
+def cmd_disarm(args: argparse.Namespace) -> int:
+    if not args.reason:
+        print("executorctl: --reason is required for disarm", file=sys.stderr)
+        return 3
+    resp = _send(args.socket, "disarm", {"reason": args.reason})
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    r = resp["result"]
+    print(f"disarmed — reason: {r.get('disarmed_reason', args.reason)}")
+    return 0
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> int:
+    resp = _send(args.socket, "heartbeat")
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    r = resp["result"]
+    if not r.get("armed"):
+        print("heartbeat ignored — dead-man is disarmed")
+        return 0
+    seconds_until_stale = int(r.get("seconds_until_stale", 0))
+    print(f"heartbeat ok — {_fmt_duration(seconds_until_stale)} until stale")
+    return 0
+
+
+def cmd_arm_status(args: argparse.Namespace) -> int:
+    resp = _send(args.socket, "arm_status")
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    r = resp["result"]
+    if not r.get("armed"):
+        print("armed=False")
+        return 0
+    last_hb = int(r.get("last_heartbeat_ts_ns", 0))
+    import time as _time
+    hb_age_sec = int((_time.time_ns() - last_hb) / 1e9) if last_hb else -1
+    until_stale = int(r.get("seconds_until_stale", 0))
+    timeout = int(r.get("timeout_sec", 0))
+    print(
+        f"armed=True timeout={_fmt_duration(timeout)} "
+        f"hb_age={_fmt_duration(hb_age_sec)} "
+        f"until_stale={_fmt_duration(until_stale)} "
+        f"kill_mode_at_arm={r.get('kill_mode_at_arm', '?')}"
+    )
+    return 0
+
+
 def cmd_kill(args: argparse.Namespace) -> int:
     sub = args.kill_sub
     if sub == "status":
@@ -185,6 +290,18 @@ def _build_parser() -> argparse.ArgumentParser:
         p = kill_sub.add_parser(engage, help=f"engage {engage} kill")
         p.add_argument("reason", help="operator-supplied reason (required)")
     kill_sub.add_parser("resume", help="clear kill state")
+
+    # Phase 4.14b — dead-man operator liveness commands.
+    arm = sub.add_parser("arm", help="arm the dead-man switch")
+    arm.add_argument(
+        "--timeout",
+        required=True,
+        help="heartbeat timeout; accepts seconds or s/m/h suffix (e.g. 6h)",
+    )
+    disarm = sub.add_parser("disarm", help="disarm the dead-man switch")
+    disarm.add_argument("--reason", required=True, help="operator reason")
+    sub.add_parser("heartbeat", help="send an explicit dead-man heartbeat")
+    sub.add_parser("arm_status", help="show dead-man arm + heartbeat state")
     return parser
 
 
@@ -205,6 +322,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_version(args)
     if args.cmd == "kill":
         return cmd_kill(args)
+    if args.cmd == "arm":
+        return cmd_arm(args)
+    if args.cmd == "disarm":
+        return cmd_disarm(args)
+    if args.cmd == "heartbeat":
+        return cmd_heartbeat(args)
+    if args.cmd == "arm_status":
+        return cmd_arm_status(args)
     print(f"executorctl: unknown command: {args.cmd}", file=sys.stderr)
     return 3
 

@@ -539,6 +539,54 @@ class DailyLossGate(Gate):
 # ---------------------------------------------------------------------------
 
 
+class DeadManGate(Gate):
+    """Gate 8.5 — operator availability (dead-man).
+
+    Phase 4.14b. GPT-5.5 architectural review #2 (2026-04-23) flagged that
+    solo-operator trading had no availability precondition: if the operator
+    is asleep, traveling, or unreachable, intents kept being admitted. This
+    gate adds an explicit arm/disarm + periodic-heartbeat contract.
+
+    Behavior matrix:
+      - config.enabled is False  -> approve (paper default)
+      - enabled, disarmed        -> reject (operator must arm to trade)
+      - enabled, armed, fresh hb -> approve
+      - enabled, armed, stale hb -> reject (hard cutoff, no grace)
+    """
+
+    name = "dead_man"
+    order = "8.5"
+
+    async def check(self, ctx: GateCtx) -> GateResult:
+        cfg = ctx.policy.config.dead_man
+        if not cfg.enabled:
+            return GateResult.approve()
+        store = ctx.policy.operator_liveness
+        if store is None:
+            # Enabled but no store wired: fail closed — configuration bug
+            # should not silently admit intents.
+            return GateResult.reject(
+                "dead_man: enabled but operator_liveness store not wired"
+            )
+        snap = store.load()
+        if not snap.armed:
+            return GateResult.reject(
+                "dead_man_disarmed: operator has not armed the dead-man; "
+                "run executorctl arm or /arm before trading"
+            )
+        deadline_ns = (
+            snap.last_heartbeat_ts_ns + snap.timeout_sec * 1_000_000_000
+        )
+        if ctx.now_ns > deadline_ns:
+            stale_sec = (ctx.now_ns - deadline_ns) / 1e9
+            return GateResult.reject(
+                f"dead_man_stale: heartbeat stale by {stale_sec:.1f}s "
+                f"(timeout={snap.timeout_sec}s, "
+                f"last_hb_ns={snap.last_heartbeat_ts_ns})"
+            )
+        return GateResult.approve()
+
+
 class ClipFloorGate(Gate):
     name = "clip_floor"
     order = "9"
@@ -592,5 +640,6 @@ def default_gate_chain() -> list[Gate]:
         GlobalPortfolioGate(),
         StrategyAllocationGate(),
         DailyLossGate(),
+        DeadManGate(),
         ClipFloorGate(),
     ]

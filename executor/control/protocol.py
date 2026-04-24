@@ -25,9 +25,21 @@ from typing import Any
 
 PROTOCOL_VERSION = 1
 
-# Registered commands for Phase 4.14a. Phase 4.14b/c will extend this set
-# (heartbeat/dead-man-gate + telegram watchdog diagnostics).
-COMMANDS: frozenset[str] = frozenset({"ping", "version", "kill_status", "kill"})
+# Registered commands. Phase 4.14a: ping/version/kill_status/kill.
+# Phase 4.14b adds arm/disarm/heartbeat/arm_status for the dead-man gate.
+COMMANDS: frozenset[str] = frozenset(
+    {
+        "ping",
+        "version",
+        "kill_status",
+        "kill",
+        # Phase 4.14b — dead-man (operator liveness) control plane.
+        "arm",
+        "disarm",
+        "heartbeat",
+        "arm_status",
+    }
+)
 
 
 class ProtocolError(Exception):

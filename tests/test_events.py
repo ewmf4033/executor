@@ -28,6 +28,9 @@ def test_event_type_count_and_uniqueness():
         "POISONING_INPUT_REJECTED", "POISONING_DETECTOR_ERROR",
         # Phase 4.13 — operator bypass of fail-closed kill-DB-corruption rebuild
         "KILL_STATE_FORCE_RESET",
+        # Phase 4.14b — dead-man gate (Gate 8.5) lifecycle
+        "OPERATOR_ARMED", "OPERATOR_DISARMED", "OPERATOR_HEARTBEAT",
+        "DEAD_MAN_TRIPPED",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"
