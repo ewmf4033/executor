@@ -342,6 +342,14 @@ class AttributionTracker:
             #   BUY:  pnl = (exit_price - fill_price) * size  (price up = profit)
             #   SELL: pnl = (fill_price - exit_price) * size  (price down = profit)
             # We use a sign multiplier for compactness.
+            #
+            # Phase 4.13.2 (GPT-5.5 architectural review #2, 2026-04-23):
+            # subtract fees so gate_13 (daily_loss) sees NET-of-fees PnL.
+            # Kalshi fees are always a cost paid by the trader (stored as a
+            # positive Decimal on AttributionRecord), so net = gross - fee
+            # regardless of side. At small T1 trade sizes, fee rounding can
+            # flip a gross-profitable strategy to net-negative, so gate_13
+            # must be fed the net number.
             if (
                 self._risk_state is not None
                 and p.record.exit_price is not None
@@ -349,7 +357,11 @@ class AttributionTracker:
             ):
                 try:
                     side_sign = Decimal("1") if p.record.side == Side.BUY else Decimal("-1")
-                    pnl_delta = side_sign * (p.record.exit_price - p.record.fill_price) * p.record.size
+                    gross_pnl = side_sign * (p.record.exit_price - p.record.fill_price) * p.record.size
+                    # Fee is a cost (always subtracted); None → 0 for paper
+                    # fills and any path that hasn't populated fee yet.
+                    fee = p.record.fee if p.record.fee is not None else Decimal("0")
+                    pnl_delta = gross_pnl - fee
                     self._risk_state.record_pnl(
                         p.record.strategy_id,
                         pnl_delta,

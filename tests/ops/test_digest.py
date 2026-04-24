@@ -372,6 +372,79 @@ def test_digest_exits_one_on_collection_failure(tmp_path: Path) -> None:
     assert result.returncode == 1, f"expected 1 on collection failure: rc={result.returncode}"
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.13.2: fee-aware paper_pnl in daily digest.
+# ---------------------------------------------------------------------------
+
+
+def test_digest_pnl_subtracts_fee(tmp_path: Path) -> None:
+    """collect_attribution_data.paper_pnl reflects gross − fee per row.
+
+    Row 1: BUY, fill=0.30, exit=0.40, size=100, fee=0.25 → gross 10.00, net 9.75.
+    Row 2: SELL, fill=0.60, exit=0.50, size=50,  fee=0.15 → gross  5.00, net 4.85.
+    Expected paper_pnl: 14.60.  Expected total_fees: 0.40 (unchanged).
+    """
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location("_digest_mod", DIGEST_SCRIPT)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+    target_date = dt.date.today() - dt.timedelta(days=1)
+    attr_db = tmp_path / "attribution.sqlite"
+
+    conn = sqlite3.connect(str(attr_db))
+    conn.execute("""
+        CREATE TABLE attribution (
+            fill_id TEXT PRIMARY KEY,
+            intent_id TEXT NOT NULL,
+            leg_id TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            venue TEXT NOT NULL,
+            market_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            size TEXT NOT NULL,
+            intent_price TEXT,
+            decision_price TEXT,
+            arrival_price TEXT,
+            fill_price TEXT NOT NULL,
+            exit_price TEXT,
+            strategy_edge TEXT,
+            execution_cost TEXT,
+            short_term_alpha TEXT,
+            fee TEXT,
+            fill_ts_ns INTEGER NOT NULL,
+            settled_ts_ns INTEGER NOT NULL,
+            extra_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    base_ts = int(dt.datetime(
+        target_date.year, target_date.month, target_date.day,
+        12, 0, 0, tzinfo=dt.timezone.utc,
+    ).timestamp() * 1e9)
+    rows = [
+        (str(uuid.uuid4()), "i1", "l1", "s", "kalshi", "m1",
+         "BUY", "100", None, None, None, "0.30", "0.40",
+         None, None, None, "0.25", base_ts, base_ts + 1),
+        (str(uuid.uuid4()), "i2", "l2", "s", "kalshi", "m2",
+         "SELL", "50", None, None, None, "0.60", "0.50",
+         None, None, None, "0.15", base_ts + 100, base_ts + 101),
+    ]
+    for r in rows:
+        conn.execute(
+            "INSERT INTO attribution VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')",
+            r,
+        )
+    conn.commit()
+    conn.close()
+
+    data = mod.collect_attribution_data(str(attr_db), target_date)
+    assert data["fill_count"] == 2
+    assert data["paper_pnl"] == 14.60, f"expected 14.60, got {data['paper_pnl']}"
+    assert data["total_fees"] == 0.40, f"expected 0.40, got {data['total_fees']}"
+
+
 @pytest.mark.slow
 def test_digest_writes_telegram_flag_on_failure(tmp_path: Path) -> None:
     target_date = dt.date.today() - dt.timedelta(days=1)
