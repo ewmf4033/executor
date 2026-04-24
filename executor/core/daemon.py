@@ -34,6 +34,7 @@ from typing import Any
 
 from ..attribution.tracker import AttributionTracker
 from ..audit.writer import AuditWriter
+from ..control.socket_server import ControlSocketServer
 from ..detectors.adverse_selection import (
     NullAdverseSelectionDetector,
     WindowAdverseSelectionDetector,
@@ -106,6 +107,7 @@ class DaemonService:
         self.orchestrator: Orchestrator | None = None
         self.strategy: YESNOCrossDetect | None = None
         self.telegram_bot: TelegramBot | None = None
+        self.control_server: ControlSocketServer | None = None
 
         self._stop_event = asyncio.Event()
         self._bg_tasks: list[asyncio.Task[Any]] = []
@@ -227,6 +229,25 @@ class DaemonService:
         # Phase 4.9 Item 1: plumb kill_mgr into AuditWriter so persistent
         # audit write failures can engage the kill switch (fail-closed).
         self.audit.set_kill_manager(self.kill_mgr)
+
+        # Phase 4.14a: out-of-process operator control channel. AF_UNIX
+        # socket authenticated by filesystem permissions (mode 0600 +
+        # User=root). Route kill commands through the already-wired
+        # KillManager — same audit trail, same state machine, same
+        # fail-closed semantics. No changes to KillManager or the
+        # Telegram surface. Socket location defaults to /run/executor
+        # (systemd RuntimeDirectory) and is overridable via env var for
+        # tests and dev.
+        socket_path = os.environ.get(
+            "EXECUTOR_CONTROL_SOCKET", "/run/executor/control.sock"
+        )
+        self.control_server = ControlSocketServer(
+            socket_path=socket_path,
+            kill_mgr=self.kill_mgr,
+            daemon_started_ts_ns=time.time_ns(),
+            git_sha=os.environ.get("EXECUTOR_GIT_SHA"),
+        )
+        await self.control_server.start()
 
         # Phase 4.11.1: wire TelegramBot into the daemon lifecycle so /kill
         # commands land on the shared KillManager. The bot reads
@@ -638,6 +659,14 @@ class DaemonService:
         if self.telegram_bot is not None:
             try:
                 await self.telegram_bot.stop()
+            except Exception:
+                pass
+        # Phase 4.14a: stop the control socket listener. Cleans up the
+        # socket file; any in-flight handler tasks get cancelled by the
+        # server.close() + wait_closed().
+        if self.control_server is not None:
+            try:
+                await self.control_server.stop()
             except Exception:
                 pass
         # (7) Bus final close.

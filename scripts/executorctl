@@ -1,0 +1,216 @@
+#!/usr/bin/python3
+"""
+executorctl — operator CLI for the Executor daemon control socket.
+
+Standalone script: pure Python stdlib. Does NOT import the executor
+package and does NOT require /root/executor/.venv to be healthy. The
+operator must be able to engage kill even if the venv is broken.
+
+Usage:
+    executorctl ping
+    executorctl version
+    executorctl kill status
+    executorctl kill soft  <reason>
+    executorctl kill hard  <reason>
+    executorctl kill panic <reason>
+    executorctl kill resume
+
+Socket path: $EXECUTOR_CONTROL_SOCKET, default /run/executor/control.sock.
+
+Exit codes:
+    0 — ok
+    1 — daemon responded with ok=false
+    2 — connection / IO failure (daemon not running, permission denied, ...)
+    3 — invalid CLI arguments
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import socket
+import sys
+
+
+DEFAULT_SOCKET = "/run/executor/control.sock"
+CONNECT_TIMEOUT_SEC = 2.0
+READ_TIMEOUT_SEC = 5.0
+SOURCE_TAG = "executorctl"
+MAX_RESPONSE_BYTES = 1_000_000
+
+
+def _io_fail(msg: str) -> "Exception":
+    print(f"executorctl: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _connect(path: str) -> socket.socket:
+    if not os.path.exists(path):
+        _io_fail(f"socket not found at {path} — is the daemon running?")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(CONNECT_TIMEOUT_SEC)
+    try:
+        s.connect(path)
+    except PermissionError:
+        _io_fail(
+            f"permission denied on {path} — run as root or check socket ownership"
+        )
+    except ConnectionRefusedError:
+        _io_fail(f"connection refused at {path} — daemon not accepting connections")
+    except OSError as exc:
+        if exc.errno == errno.EACCES:
+            _io_fail(
+                f"permission denied on {path} — run as root or check socket ownership"
+            )
+        _io_fail(f"connect failed: {exc}")
+    s.settimeout(READ_TIMEOUT_SEC)
+    return s
+
+
+def _send(path: str, cmd: str, args: dict | None = None) -> dict:
+    payload = {"cmd": cmd, "args": args or {}, "source": SOURCE_TAG}
+    s = _connect(path)
+    try:
+        s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                _io_fail("timeout waiting for response")
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > MAX_RESPONSE_BYTES:
+                _io_fail("response exceeded max size")
+        if not buf:
+            _io_fail("empty response — daemon closed connection")
+        line = buf.split(b"\n", 1)[0]
+        try:
+            return json.loads(line.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            _io_fail(f"protocol error: {exc}")
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _print_snapshot(result: dict) -> None:
+    parts = [
+        f"mode={result.get('mode', '?')}",
+        f"panic={result.get('panic', '?')}",
+        f"manual_only={result.get('manual_only', '?')}",
+        f"strikes={result.get('strikes', '?')}",
+    ]
+    reason = result.get("reason") or ""
+    if reason:
+        parts.append(f"reason={reason!r}")
+    if result.get("resume_blocked"):
+        parts.append(f"resume_blocked={result['resume_blocked']!r}")
+    print(" ".join(parts))
+
+
+def _handle_err(resp: dict) -> int:
+    err = resp.get("error", "unknown error")
+    code = resp.get("code", "?")
+    print(f"executorctl: error ({code}): {err}", file=sys.stderr)
+    return 1
+
+
+def cmd_ping(args: argparse.Namespace) -> int:
+    resp = _send(args.socket, "ping")
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    r = resp["result"]
+    print(
+        f"pong uptime={r.get('daemon_uptime_sec', '?')}s "
+        f"protocol_version={r.get('protocol_version', '?')}"
+    )
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    resp = _send(args.socket, "version")
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    r = resp["result"]
+    print(
+        f"executor_version={r.get('executor_version', 'unknown')} "
+        f"protocol_version={r.get('protocol_version', '?')} "
+        f"git_sha={r.get('git_sha') or 'unknown'}"
+    )
+    return 0
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    sub = args.kill_sub
+    if sub == "status":
+        resp = _send(args.socket, "kill_status")
+    elif sub in ("soft", "hard", "panic"):
+        resp = _send(args.socket, "kill", {"sub": sub, "reason": args.reason})
+    elif sub == "resume":
+        resp = _send(args.socket, "kill", {"sub": "resume"})
+    else:
+        print(f"executorctl: unknown kill sub: {sub}", file=sys.stderr)
+        return 3
+    if not resp.get("ok"):
+        return _handle_err(resp)
+    _print_snapshot(resp["result"])
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="executorctl",
+        description="Operator CLI for the Executor daemon control socket.",
+    )
+    parser.add_argument(
+        "--socket",
+        default=os.environ.get("EXECUTOR_CONTROL_SOCKET", DEFAULT_SOCKET),
+        help=(
+            "Path to control socket "
+            f"(default: $EXECUTOR_CONTROL_SOCKET or {DEFAULT_SOCKET})"
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("ping", help="diagnostic liveness check")
+    sub.add_parser("version", help="report executor + protocol version")
+    kill = sub.add_parser("kill", help="engage/resume the kill switch")
+    kill_sub = kill.add_subparsers(dest="kill_sub", required=True)
+    kill_sub.add_parser("status", help="show current kill state")
+    for engage in ("soft", "hard", "panic"):
+        p = kill_sub.add_parser(engage, help=f"engage {engage} kill")
+        p.add_argument("reason", help="operator-supplied reason (required)")
+    kill_sub.add_parser("resume", help="clear kill state")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # argparse exits with 2 on usage errors. Map to 3 per the CLI
+        # contract; keep 0 (help) and any other code as-is.
+        code = exc.code if isinstance(exc.code, int) else 1
+        if code == 2:
+            return 3
+        return code
+    if args.cmd == "ping":
+        return cmd_ping(args)
+    if args.cmd == "version":
+        return cmd_version(args)
+    if args.cmd == "kill":
+        return cmd_kill(args)
+    print(f"executorctl: unknown command: {args.cmd}", file=sys.stderr)
+    return 3
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
