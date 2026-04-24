@@ -77,3 +77,13 @@ dead_man:
   default_timeout_sec: 21600  # 6h
   min_timeout_sec: 300        # 5m
   max_timeout_sec: 43200      # 12h
+
+# Phase 4.14c — Telegram polling watchdog.
+telegram:
+  watchdog:
+    enabled: true
+    stall_threshold_sec: 120
+    poll_interval_sec: 10
+    max_restarts: 3
+    restart_window_sec: 300
+    escalate_on_max: true

@@ -290,3 +290,57 @@ def test_telegram_arm_heartbeat_disarm_flow(tmp_path: Path) -> None:
     assert EventType.OPERATOR_ARMED in kinds
     assert EventType.OPERATOR_HEARTBEAT in kinds
     assert EventType.OPERATOR_DISARMED in kinds
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14c — /kill panic local-bypass.
+# ---------------------------------------------------------------------------
+
+
+def test_panic_engages_kill_before_reply_send(tmp_path: Path) -> None:
+    """Panic must engage kill_mgr via _dispatch BEFORE any Telegram
+    reply is sent (handle_update only calls _send_reply after
+    _dispatch/handle_text returns)."""
+    bot, km, _events = _bot(tmp_path)
+    assert km.mode is KillMode.NONE
+    # handle_text returns the reply string; by the time it returns, kill
+    # must already be engaged.
+    reply = asyncio.run(bot.handle_text("/kill panic big trouble", chat_id="42"))
+    assert km.mode is KillMode.HARD
+    snap = km.snapshot()
+    assert snap.panic is True
+    assert snap.manual_only is True
+    assert "PANIC engaged" in reply
+
+
+def test_panic_engagement_survives_send_reply_failure(tmp_path: Path) -> None:
+    """If the outbound Telegram send fails, the kill-switch remains
+    engaged — engagement happened in _dispatch, persisted via
+    KillStateStore, before any outbound call."""
+    bot, km, _events = _bot(tmp_path)
+
+    # Install a failing send override so that any post-dispatch reply
+    # delivery would fail. handle_text itself does not call _send_reply;
+    # that happens inside _handle_update.  We exercise the equivalent by
+    # calling handle_text (engagement) then simulating reply failure.
+    async def _boom(_text: str) -> None:
+        raise RuntimeError("telegram send down")
+
+    bot._send_override = _boom  # type: ignore[attr-defined]
+
+    reply = asyncio.run(bot.handle_text("/kill panic network", chat_id="42"))
+    # Engagement persisted before the reply path could ever run.
+    assert km.mode is KillMode.HARD
+    assert km.snapshot().panic is True
+    assert "PANIC engaged" in reply
+
+    # Simulate the outer send path failing; kill must still be engaged.
+    async def _simulate_send() -> None:
+        try:
+            await bot._send_reply(session=None, chat_id="42", text=reply)
+        except Exception:
+            pass
+
+    asyncio.run(_simulate_send())
+    assert km.mode is KillMode.HARD
+    assert km.snapshot().panic is True

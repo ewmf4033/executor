@@ -81,3 +81,17 @@ dead_man:
   default_timeout_sec: 21600  # 6h
   min_timeout_sec: 300        # 5m
   max_timeout_sec: 43200      # 12h
+
+# Phase 4.14c — Telegram polling watchdog. Detects stalls in the
+# getUpdates loop and restarts the bot task; if restarts exceed
+# max_restarts within restart_window_sec, escalates via SOFT kill.
+# Never auto-HARDs on Telegram health alone (operator-awareness
+# degradation should reject new intents, not cancel open orders).
+telegram:
+  watchdog:
+    enabled: true
+    stall_threshold_sec: 120
+    poll_interval_sec: 10
+    max_restarts: 3
+    restart_window_sec: 300
+    escalate_on_max: true

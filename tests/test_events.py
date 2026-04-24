@@ -31,6 +31,8 @@ def test_event_type_count_and_uniqueness():
         # Phase 4.14b — dead-man gate (Gate 8.5) lifecycle
         "OPERATOR_ARMED", "OPERATOR_DISARMED", "OPERATOR_HEARTBEAT",
         "DEAD_MAN_TRIPPED",
+        # Phase 4.14c — Telegram polling watchdog
+        "TELEGRAM_STALL_DETECTED", "TELEGRAM_WATCHDOG_ESCALATED",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"

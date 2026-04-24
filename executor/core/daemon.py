@@ -47,6 +47,7 @@ from ..risk.policy import RiskPolicy
 from ..risk.state import OperatorLivenessStore, RiskState
 from ..strategies.yes_no_cross.strategy import CrossPair, YESNOCrossDetect
 from ..telegram.bot import TelegramBot
+from ..telegram.watchdog import TelegramWatchdog
 from .event_bus import EventBus
 from .events import Event, EventType, Source
 from .logging import configure, get_logger
@@ -107,6 +108,7 @@ class DaemonService:
         self.orchestrator: Orchestrator | None = None
         self.strategy: YESNOCrossDetect | None = None
         self.telegram_bot: TelegramBot | None = None
+        self.telegram_watchdog: TelegramWatchdog | None = None
         self.control_server: ControlSocketServer | None = None
 
         self._stop_event = asyncio.Event()
@@ -283,6 +285,30 @@ class DaemonService:
                 },
             )
         )
+
+        # Phase 4.14c: Telegram polling watchdog. Detects when the
+        # getUpdates loop stalls (hung request, dead task) and either
+        # restarts the bot or — after repeated failures — engages
+        # kill_mgr in SOFT mode. Routed directly through KillManager so
+        # the escalation path does not depend on Telegram itself.
+        wd_cfg = self.config_mgr.config.telegram.watchdog
+        if wd_cfg.enabled:
+            self.telegram_watchdog = TelegramWatchdog(
+                bot=self.telegram_bot,
+                kill_mgr=self.kill_mgr,
+                bus=self.bus,
+                stall_threshold_sec=wd_cfg.stall_threshold_sec,
+                poll_interval_sec=wd_cfg.poll_interval_sec,
+                max_restarts=wd_cfg.max_restarts,
+                restart_window_sec=wd_cfg.restart_window_sec,
+                escalate_on_max=wd_cfg.escalate_on_max,
+            )
+            self._bg_tasks.append(
+                asyncio.create_task(
+                    self.telegram_watchdog.run(),
+                    name="telegram-watchdog",
+                )
+            )
 
         self.attribution = AttributionTracker(
             db_path=self.attribution_db,
@@ -672,6 +698,14 @@ class DaemonService:
         if self.telemetry is not None:
             try:
                 await self.telemetry.stop()
+            except Exception:
+                pass
+        # Phase 4.14c: stop the Telegram watchdog before the bot so it
+        # cannot observe a bot.stop() as a "stall" and attempt a restart
+        # during shutdown.
+        if self.telegram_watchdog is not None:
+            try:
+                await self.telegram_watchdog.stop()
             except Exception:
                 pass
         # Phase 4.11.1: stop the Telegram bot before closing the bus so its

@@ -234,3 +234,77 @@ def test_dead_man_cfg_invalid_bounds_rejected(tmp_path: Path):
     }))
     with pytest.raises(ConfigError):
         load_config(p3)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14c — TelegramWatchdogCfg parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_telegram_watchdog_enabled_by_default():
+    cfg = load_config(None)
+    assert cfg.telegram.watchdog.enabled is True
+    assert cfg.telegram.watchdog.stall_threshold_sec == 120
+    assert cfg.telegram.watchdog.poll_interval_sec == 10
+    assert cfg.telegram.watchdog.max_restarts == 3
+    assert cfg.telegram.watchdog.restart_window_sec == 300
+    assert cfg.telegram.watchdog.escalate_on_max is True
+
+
+def test_telegram_watchdog_defaults_parse(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "telegram": {
+            "watchdog": {
+                "enabled": True,
+                "stall_threshold_sec": 60,
+                "poll_interval_sec": 5,
+                "max_restarts": 2,
+                "restart_window_sec": 120,
+                "escalate_on_max": False,
+            }
+        }
+    }))
+    cfg = load_config(p)
+    assert cfg.telegram.watchdog.enabled is True
+    assert cfg.telegram.watchdog.stall_threshold_sec == 60
+    assert cfg.telegram.watchdog.poll_interval_sec == 5
+    assert cfg.telegram.watchdog.max_restarts == 2
+    assert cfg.telegram.watchdog.restart_window_sec == 120
+    assert cfg.telegram.watchdog.escalate_on_max is False
+
+
+def test_telegram_watchdog_invalid_bounds_rejected(tmp_path: Path):
+    # poll_interval_sec >= stall_threshold_sec is rejected.
+    p1 = tmp_path / "bad1.yaml"
+    p1.write_text(yaml.safe_dump({
+        "telegram": {
+            "watchdog": {"stall_threshold_sec": 10, "poll_interval_sec": 10}
+        }
+    }))
+    with pytest.raises(ConfigError, match="poll_interval_sec"):
+        load_config(p1)
+
+    # stall_threshold_sec below 10s minimum is rejected.
+    p2 = tmp_path / "bad2.yaml"
+    p2.write_text(yaml.safe_dump({
+        "telegram": {"watchdog": {"stall_threshold_sec": 5}}
+    }))
+    with pytest.raises(ConfigError, match="stall_threshold_sec"):
+        load_config(p2)
+
+    # Negative max_restarts rejected (non-negative int enforced).
+    p3 = tmp_path / "bad3.yaml"
+    p3.write_text(yaml.safe_dump({
+        "telegram": {"watchdog": {"max_restarts": -1}}
+    }))
+    with pytest.raises(ConfigError, match="max_restarts"):
+        load_config(p3)
+
+    # restart_window_sec below 60s minimum rejected.
+    p4 = tmp_path / "bad4.yaml"
+    p4.write_text(yaml.safe_dump({
+        "telegram": {"watchdog": {"restart_window_sec": 30}}
+    }))
+    with pytest.raises(ConfigError, match="restart_window_sec"):
+        load_config(p4)

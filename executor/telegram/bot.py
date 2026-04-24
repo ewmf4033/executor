@@ -190,6 +190,25 @@ class TelegramBot:
         self._stop = asyncio.Event()
         self._last_cmd_ts: dict[str, float] = {}
         self._update_offset: int = 0
+        # Phase 4.14c: polling-loop liveness timestamp consumed by
+        # TelegramWatchdog. Updated on every iteration of _run (before
+        # getUpdates, after success, and in error paths) so "stall" means
+        # the loop is not running at all — not just that the API is
+        # failing. CPython: single-float reads/writes are atomic; no lock.
+        self._last_activity_ts: float = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Phase 4.14c — polling liveness for TelegramWatchdog.
+    # ------------------------------------------------------------------
+
+    def last_activity_ts(self) -> float:
+        """monotonic-clock timestamp of the most recent poll-loop iteration.
+
+        Updated on every iteration of ``_run`` — including error/backoff
+        paths — so the watchdog interprets "stall" as "the loop is not
+        running", not "the Telegram API is erroring".
+        """
+        return self._last_activity_ts
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -205,6 +224,10 @@ class TelegramBot:
             log.warning("telegram.bot.disabled.no_chat_id")
             return
         self._stop.clear()
+        # Phase 4.14c: reset liveness timestamp on every start so the
+        # watchdog doesn't observe a stale value from a prior lifecycle
+        # (e.g. after a watchdog-driven stop()/start() cycle).
+        self._last_activity_ts = time.monotonic()
         self._task = asyncio.create_task(self._run(), name="telegram-bot")
         log.info("telegram.bot.start")
 
@@ -265,8 +288,20 @@ class TelegramBot:
                 snap = await self._kill.engage(KillMode.HARD, p.args, source="telegram")
                 return f"OK: HARD engaged ({snap.reason})"
             if p.sub == "panic":
+                # Phase 4.14c: panic is engaged LOCALLY via KillManager
+                # before any outbound Telegram API call (_send_reply runs
+                # only after _dispatch returns). KillManager.engage()
+                # persists via KillStateStore inside its async lock, so
+                # even if the reply send subsequently fails, the kill
+                # state survives. Explicit forensic log for the trail.
                 snap = await self._kill.engage(
                     KillMode.HARD, p.args, source="telegram", panic=True
+                )
+                log.info(
+                    "telegram.panic.engaged_locally",
+                    mode=snap.mode.value,
+                    reason=snap.reason,
+                    note="kill engaged before telegram reply; reply failure does not revert",
                 )
                 return f"OK: PANIC engaged ({snap.reason}); cooldown until ts_ns={snap.panic_until_ns}"
             if p.sub == "resume":
@@ -437,14 +472,25 @@ class TelegramBot:
         backoff = DEFAULT_LOOP_BACKOFF_SEC
         async with aiohttp.ClientSession() as session:  # type: ignore
             while not self._stop.is_set():
+                # Phase 4.14c: tick liveness BEFORE the call so a hung
+                # getUpdates still counts as "loop alive at T-now", while
+                # a wholly crashed/deadlocked task stops ticking entirely.
+                self._last_activity_ts = time.monotonic()
                 try:
                     updates = await self._get_updates(session)
+                    # Tick AFTER success too — proof the API responded
+                    # and we parsed the result cleanly.
+                    self._last_activity_ts = time.monotonic()
                     for upd in updates:
                         await self._handle_update(session, upd)
                     backoff = DEFAULT_LOOP_BACKOFF_SEC
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    # Tick in the error path too — an error means the
+                    # loop is still trying, not stalled. Only a fully
+                    # dead task should stop updating this timestamp.
+                    self._last_activity_ts = time.monotonic()
                     log.warning("telegram.bot.loop.error", error=str(exc))
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)

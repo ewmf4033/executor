@@ -109,6 +109,13 @@ class EventType(str, Enum):
     OPERATOR_HEARTBEAT = "OPERATOR_HEARTBEAT"
     DEAD_MAN_TRIPPED = "DEAD_MAN_TRIPPED"
 
+    # Phase 4.14c — Telegram polling watchdog. Detects stalls in the
+    # getUpdates loop and escalates via SOFT kill when restart retries
+    # exhaust. Distinct from kill events so alerting can separate
+    # operator-awareness degradation from kill-switch lifecycle.
+    TELEGRAM_STALL_DETECTED = "TELEGRAM_STALL_DETECTED"
+    TELEGRAM_WATCHDOG_ESCALATED = "TELEGRAM_WATCHDOG_ESCALATED"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
@@ -122,8 +129,10 @@ class EventType(str, Enum):
 # input validation + detector exception fail-closed).
 # Phase 4.14b added OPERATOR_ARMED + OPERATOR_DISARMED +
 # OPERATOR_HEARTBEAT + DEAD_MAN_TRIPPED (dead-man gate lifecycle).
+# Phase 4.14c added TELEGRAM_STALL_DETECTED + TELEGRAM_WATCHDOG_ESCALATED
+# (Telegram polling watchdog).
 # Guard against silent drift:
-assert len(EventType) == 47, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 49, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------

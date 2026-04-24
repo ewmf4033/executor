@@ -121,6 +121,29 @@ class DeadManCfg:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramWatchdogCfg:
+    """Phase 4.14c — Telegram polling watchdog.
+
+    Detects stalls in the TelegramBot.getUpdates loop. Monitors
+    TelegramBot.last_activity_ts() every ``poll_interval_sec``. When the
+    gap exceeds ``stall_threshold_sec``, restarts the bot task; if
+    restarts within ``restart_window_sec`` exceed ``max_restarts`` and
+    ``escalate_on_max`` is True, engages the kill-switch in SOFT mode.
+    """
+    enabled: bool = True
+    stall_threshold_sec: int = 120
+    poll_interval_sec: int = 10
+    max_restarts: int = 3
+    restart_window_sec: int = 300
+    escalate_on_max: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramCfg:
+    watchdog: TelegramWatchdogCfg = field(default_factory=TelegramWatchdogCfg)
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     # Phase 4.13: when True, safety gates fail-closed rather than no-op when
     # their backing detector/tracker is unavailable. Default False preserves
@@ -150,6 +173,7 @@ class RiskConfig:
     kill_switch: KillSwitchCfg = field(default_factory=KillSwitchCfg)
     attribution: AttributionCfg = field(default_factory=AttributionCfg)
     dead_man: DeadManCfg = field(default_factory=DeadManCfg)
+    telegram: TelegramCfg = field(default_factory=TelegramCfg)
 
     def fingerprint(self) -> str:
         """Stable SHA256 of the config; used for CONFIG_RELOADED payload."""
@@ -256,6 +280,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
             kill_switch=_parse_kill_switch(raw.get("kill_switch", {})),
             attribution=_parse_attribution(raw.get("attribution", {})),
             dead_man=_parse_dead_man(raw.get("dead_man", {})),
+            telegram=_parse_telegram(raw.get("telegram", {})),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
@@ -385,6 +410,62 @@ def _parse_dead_man(d: dict[str, Any]) -> DeadManCfg:
         min_timeout_sec=min_t,
         max_timeout_sec=max_t,
     )
+
+
+def _parse_telegram_watchdog(d: dict[str, Any]) -> TelegramWatchdogCfg:
+    """Phase 4.14c: parse + bounds-check Telegram watchdog config.
+
+    Bounds: stall_threshold_sec in [10, 3600]; poll_interval_sec in
+    [1, 60] and < stall_threshold_sec; max_restarts in [0, 10];
+    restart_window_sec in [60, 3600].
+    """
+    enabled = bool(d.get("enabled", True))
+    stall_threshold_sec = _require_positive_int(
+        d.get("stall_threshold_sec", 120),
+        "telegram.watchdog.stall_threshold_sec",
+        max_val=3600,
+    )
+    if stall_threshold_sec < 10:
+        raise ConfigError(
+            f"telegram.watchdog.stall_threshold_sec must be >= 10, got {stall_threshold_sec}"
+        )
+    poll_interval_sec = _require_positive_int(
+        d.get("poll_interval_sec", 10),
+        "telegram.watchdog.poll_interval_sec",
+        max_val=60,
+    )
+    if poll_interval_sec >= stall_threshold_sec:
+        raise ConfigError(
+            f"telegram.watchdog.poll_interval_sec ({poll_interval_sec}) must be < "
+            f"stall_threshold_sec ({stall_threshold_sec})"
+        )
+    max_restarts = _require_non_negative_int(
+        d.get("max_restarts", 3),
+        "telegram.watchdog.max_restarts",
+        max_val=10,
+    )
+    restart_window_sec = _require_positive_int(
+        d.get("restart_window_sec", 300),
+        "telegram.watchdog.restart_window_sec",
+        max_val=3600,
+    )
+    if restart_window_sec < 60:
+        raise ConfigError(
+            f"telegram.watchdog.restart_window_sec must be >= 60, got {restart_window_sec}"
+        )
+    escalate_on_max = bool(d.get("escalate_on_max", True))
+    return TelegramWatchdogCfg(
+        enabled=enabled,
+        stall_threshold_sec=stall_threshold_sec,
+        poll_interval_sec=poll_interval_sec,
+        max_restarts=max_restarts,
+        restart_window_sec=restart_window_sec,
+        escalate_on_max=escalate_on_max,
+    )
+
+
+def _parse_telegram(d: dict[str, Any]) -> TelegramCfg:
+    return TelegramCfg(watchdog=_parse_telegram_watchdog(d.get("watchdog", {})))
 
 
 # ---------------------------------------------------------------------------
