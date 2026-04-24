@@ -13,6 +13,8 @@ StartLimitBurst=3
 Type=simple
 User=root
 WorkingDirectory=/root/executor
+RuntimeDirectory=executor
+RuntimeDirectoryMode=0755
 Environment=PYTHONUNBUFFERED=1
 Environment=EXECUTOR_LOG_LEVEL=INFO
 Environment=EXECUTOR_AUDIT_DIR=/root/executor/audit-logs/paper_live
