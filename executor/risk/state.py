@@ -115,6 +115,18 @@ class ExposureRecord:
     event_id: str | None = None
 
 
+class RiskStateCorruptInCapitalMode(RuntimeError):
+    """Raised by ``RiskState.load(capital_mode=True)`` when the cache is
+    corrupt. Phase 4.13.1 Fix #C (GPT-5.5 review #2): under real capital
+    we refuse to start trading on reconstructed state; the operator must
+    investigate why ``risk_state.sqlite`` became corrupt before resuming.
+
+    Paper mode retains the prior best-effort rebuild-from-venues +
+    audit-replay behavior (``capital_mode=False``, the default) so
+    observation windows and tests are unaffected.
+    """
+
+
 def utc_midnight_ns(now_ns: int | None = None) -> int:
     now_ns = now_ns or time.time_ns()
     dt = datetime.fromtimestamp(now_ns / 1e9, tz=timezone.utc)
@@ -151,10 +163,17 @@ class RiskState:
         *,
         venues: dict[str, Any] | None = None,
         audit_db_path: str | os.PathLike[str] | None = None,
+        capital_mode: bool = False,
     ) -> str:
         """
         Open the SQLite cache. On corruption, delete + rebuild from venues.
         Returns one of: "loaded", "rebuilt_venues", "rebuilt_audit_fallback".
+
+        Phase 4.13.1 Fix #C: when ``capital_mode=True``, corrupt cache is
+        NOT auto-rebuilt. Instead ``RiskStateCorruptInCapitalMode`` is
+        raised so the daemon refuses to start on reconstructed state.
+        Paper mode (``capital_mode=False``, default) preserves the prior
+        best-effort rebuild + audit-replay behavior.
         """
         outcome = await asyncio.to_thread(self._try_open)
         if outcome == "ok":
@@ -163,7 +182,22 @@ class RiskState:
             log.info("risk.state.loaded", db=str(self._db_path))
             return "loaded"
 
-        # Corrupt / missing — rebuild.
+        # Corrupt / missing path.
+        if capital_mode:
+            # Fail-closed: do not rebuild from venues, do not replay audit.
+            # The operator must investigate the corruption before resuming.
+            log.error(
+                "risk.state.corrupt_capital_mode_halt",
+                reason=outcome,
+                db=str(self._db_path),
+            )
+            raise RiskStateCorruptInCapitalMode(
+                f"risk_state.sqlite unreadable under capital_mode "
+                f"(reason={outcome}, path={self._db_path}); "
+                "refusing to start on reconstructed state — operator must "
+                "investigate the corruption before resuming trading"
+            )
+
         log.warning("risk.state.cache_corrupt_rebuilding", reason=outcome, db=str(self._db_path))
         try:
             if self._db_path.exists():

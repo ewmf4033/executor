@@ -81,6 +81,7 @@ class AuditWriter:
         *,
         kill_manager: "KillManager | None" = None,
         fail_threshold: int | None = None,
+        capital_mode: bool = False,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
@@ -100,11 +101,36 @@ class AuditWriter:
         self._fail_threshold = max(1, int(fail_threshold))
         self._consecutive_write_failures = 0
         self._audit_kill_engaged = False
+        # Phase 4.13.1 Fix #B (GPT-5.5 review #2): in capital_mode, audit
+        # write-failure escalation goes HARD + cancel_open_orders instead of
+        # SOFT. Paper mode retains SOFT-only behavior so observation tests
+        # are unaffected.
+        self._capital_mode = bool(capital_mode)
 
     def set_kill_manager(self, kill_manager: "KillManager") -> None:
         """Late-binding for DaemonService: audit.start() runs before KillManager
         exists, so we plumb the reference in afterwards."""
         self._kill_manager = kill_manager
+
+    def set_capital_mode(self, capital_mode: bool) -> None:
+        """Late-binding for DaemonService: AuditWriter is constructed before
+        ConfigManager has loaded YAML, so DaemonService plumbs the capital_mode
+        flag in after config resolution."""
+        self._capital_mode = bool(capital_mode)
+
+    def _audit_kill_mode(self):
+        """Return the KillMode to engage when fail-closed escalation trips.
+
+        In capital_mode=True: HARD (stops new intents AND cancels open orders
+        — combined with cancel_open_orders=True in the engage() call this is
+        the "stop everything and clean up" path for real-capital audit
+        breakage). In paper mode: SOFT (stop new intents only, no venue
+        actions). The import is deferred so audit/writer.py does not create
+        an import cycle with kill/state.py at module load.
+        """
+        from ..kill.state import KillMode
+
+        return KillMode.HARD if self._capital_mode else KillMode.SOFT
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -247,14 +273,21 @@ class AuditWriter:
             pass
         log.error("audit.kill.triggered", reason=reason, msg=msg)
         # Engage the kill switch (panic=True -> manual_only pinned).
+        # Phase 4.13.1 Fix #B: in capital_mode, escalate to HARD and cancel
+        # open orders. Paper mode retains SOFT-only (no cancels) because
+        # observation windows must not disturb venue state on synthetic
+        # failures. The mode decision goes through self._audit_kill_mode()
+        # so KillMode import stays deferred.
+        mode = self._audit_kill_mode()
+        cancel_open = bool(self._capital_mode)
         if self._kill_manager is not None:
             try:
                 await self._kill_manager.engage(
-                    _audit_kill_mode(),
+                    mode,
                     reason,
                     source="audit",
                     panic=True,
-                    cancel_open_orders=False,
+                    cancel_open_orders=cancel_open,
                 )
             except Exception as exc:
                 log.error("audit.kill.engage_failed", error=str(exc))
@@ -360,16 +393,6 @@ _INSERT_SQL = (
 
 def _insert_row(conn: sqlite3.Connection, row: tuple[Any, ...]) -> None:
     conn.execute(_INSERT_SQL, row)
-
-
-def _audit_kill_mode():
-    """Deferred import so audit/writer.py does not create an import cycle
-    with kill/manager.py at module load. Returns SOFT — the audit-kill
-    should stop new intents but not attempt venue cancels (which may
-    themselves be broken)."""
-    from ..kill.state import KillMode
-
-    return KillMode.SOFT
 
 
 def _send_telegram_alert_direct(text: str) -> None:

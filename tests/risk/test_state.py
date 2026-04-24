@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from executor.core.types import Position
-from executor.risk.state import RiskState, utc_date_str
+from executor.risk.state import (
+    RiskState,
+    RiskStateCorruptInCapitalMode,
+    utc_date_str,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -120,3 +124,54 @@ async def test_config_hash_roundtrip(tmp_path: Path):
     h, ts = s.current_config_hash()
     assert h == "abc123"
     assert ts is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.13.1 Fix #C — corrupt cache halts startup under capital_mode
+# ---------------------------------------------------------------------------
+
+
+async def test_riskstate_corrupt_capital_mode_halts(tmp_path: Path):
+    """With capital_mode=True, a corrupt cache file causes load() to raise
+    RiskStateCorruptInCapitalMode instead of silently rebuilding from
+    venues or replaying audit."""
+    path = tmp_path / "rs.sqlite"
+    path.write_bytes(b"this is not a sqlite database")
+    positions = [
+        Position(
+            market_id="MKT-1", venue="kalshi", outcome_id="YES",
+            size=Decimal("50"), avg_price_prob=Decimal("0.60"),
+            unrealized_pnl=Decimal("0"), as_of_ts=time.time_ns(),
+        ),
+    ]
+    s = RiskState(db_path=path)
+    # Even with venues available, load must refuse.
+    with pytest.raises(RiskStateCorruptInCapitalMode):
+        await s.load(
+            venues={"kalshi": FakeAdapter(positions)}, capital_mode=True
+        )
+
+
+async def test_riskstate_corrupt_paper_mode_rebuilds(tmp_path: Path):
+    """With capital_mode=False (default), the existing best-effort
+    rebuild-from-venues behavior is preserved for paper observation."""
+    path = tmp_path / "rs.sqlite"
+    path.write_bytes(b"this is not a sqlite database")
+    positions = [
+        Position(
+            market_id="MKT-1", venue="kalshi", outcome_id="YES",
+            size=Decimal("50"), avg_price_prob=Decimal("0.60"),
+            unrealized_pnl=Decimal("0"), as_of_ts=time.time_ns(),
+        ),
+    ]
+    s = RiskState(db_path=path)
+    outcome = await s.load(venues={"kalshi": FakeAdapter(positions)})
+    assert outcome == "rebuilt_venues"
+    # Explicit capital_mode=False works the same way.
+    path2 = tmp_path / "rs2.sqlite"
+    path2.write_bytes(b"corrupt again")
+    s2 = RiskState(db_path=path2)
+    outcome2 = await s2.load(
+        venues={"kalshi": FakeAdapter(positions)}, capital_mode=False
+    )
+    assert outcome2 == "rebuilt_venues"

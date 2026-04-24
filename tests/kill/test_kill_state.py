@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,123 @@ def test_corrupt_kill_db_force_reset_not_honored_when_env_value_wrong(
         assert snap.manual_only is True
     finally:
         store.close()
+
+
+# --------------------------------------------------------------------------
+# Phase 4.13.1 Fix #A — KILL_STATE_FORCE_RESET audit event wiring
+# --------------------------------------------------------------------------
+
+
+async def _run_daemon_self_check_with_corrupt_kill_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, force_reset: bool
+) -> Path:
+    """Pre-corrupt the kill DB, run daemon self-check, return audit DB path."""
+    from executor.core.daemon import run_daemon
+
+    monkeypatch.setenv("PAPER_MODE", "true")
+    monkeypatch.setenv("EXECUTOR_PAPER_MODE_NO_ORDERBOOK", "true")
+    if force_reset:
+        monkeypatch.setenv(FORCE_RESET_ENV_VAR, "1")
+    else:
+        monkeypatch.delenv(FORCE_RESET_ENV_VAR, raising=False)
+
+    kill_db = tmp_path / "kill.sqlite"
+    kill_db.write_bytes(b"not a sqlite database (pre-corrupted for test)")
+
+    rc = await run_daemon(
+        self_check_only=True,
+        audit_dir=tmp_path / "audit",
+        risk_yaml="/root/executor/config/risk.yaml",
+        risk_state_db=tmp_path / "rstate.sqlite",
+        kill_db=kill_db,
+        attribution_db=tmp_path / "attr.sqlite",
+        telemetry_port=0,
+        enable_quote_feeder=False,
+    )
+    # Self-check may fail because kill state seeded HARD+manual_only in the
+    # non-force-reset path, but the audit DB will still have our corruption
+    # events. The force-reset path seeds NONE so self-check should pass.
+    assert rc in (0, 1)
+    audit_files = list((tmp_path / "audit").glob("audit-*.sqlite"))
+    assert len(audit_files) == 1
+    return audit_files[0]
+
+
+@pytest.mark.asyncio
+async def test_force_reset_emits_audit_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With EXECUTOR_FORCE_RESET_KILL_STATE=1 + corrupt kill DB, both the
+    existing ERROR(KILL_DB_REBUILT_FROM_CORRUPTION) and the new
+    KILL_STATE_FORCE_RESET events must be in the audit log."""
+    audit_db = await _run_daemon_self_check_with_corrupt_kill_db(
+        tmp_path, monkeypatch, force_reset=True
+    )
+    conn = sqlite3.connect(str(audit_db))
+    try:
+        err_rows = conn.execute(
+            "SELECT payload_json FROM events WHERE event_type='ERROR'"
+        ).fetchall()
+        fr_rows = conn.execute(
+            "SELECT payload_json FROM events WHERE event_type='KILL_STATE_FORCE_RESET'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Exactly one KILL_STATE_FORCE_RESET event with correct payload.
+    assert len(fr_rows) == 1, f"expected 1 KILL_STATE_FORCE_RESET, got {len(fr_rows)}"
+    import json
+
+    fr_payload = json.loads(fr_rows[0][0])
+    assert "kill_db_path" in fr_payload
+    assert fr_payload["ns_ts"] > 0
+    assert "backup_path" in fr_payload
+    assert "EXECUTOR_FORCE_RESET_KILL_STATE=1" in fr_payload["note"]
+
+    # The rebuild ERROR event must also fire, and its note must reflect
+    # the force-reset branch.
+    corrupt_err = [
+        json.loads(r[0])
+        for r in err_rows
+        if json.loads(r[0]).get("kind") == "KILL_DB_REBUILT_FROM_CORRUPTION"
+    ]
+    assert len(corrupt_err) == 1
+    assert "force-reset" in corrupt_err[0]["note"]
+    assert "mode=NONE" in corrupt_err[0]["note"]
+
+
+@pytest.mark.asyncio
+async def test_default_corruption_no_force_reset_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the bypass env var, only the ERROR event fires — no
+    KILL_STATE_FORCE_RESET event in the audit log."""
+    audit_db = await _run_daemon_self_check_with_corrupt_kill_db(
+        tmp_path, monkeypatch, force_reset=False
+    )
+    conn = sqlite3.connect(str(audit_db))
+    try:
+        err_rows = conn.execute(
+            "SELECT payload_json FROM events WHERE event_type='ERROR'"
+        ).fetchall()
+        fr_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='KILL_STATE_FORCE_RESET'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert fr_count == 0, "KILL_STATE_FORCE_RESET must not fire without bypass"
+    import json
+
+    corrupt_err = [
+        json.loads(r[0])
+        for r in err_rows
+        if json.loads(r[0]).get("kind") == "KILL_DB_REBUILT_FROM_CORRUPTION"
+    ]
+    assert len(corrupt_err) == 1
+    # Note reflects fail-closed branch.
+    assert "mode=HARD" in corrupt_err[0]["note"]
+    assert "manual_only=True" in corrupt_err[0]["note"]
 
 
 def test_corrupt_backup_filename_unique(

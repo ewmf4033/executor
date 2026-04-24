@@ -134,8 +134,16 @@ class DaemonService:
 
         # Risk subsystem.
         self.config_mgr = ConfigManager(self.risk_yaml if self.risk_yaml.exists() else None)
+        # Phase 4.13.1 Fix #B: propagate capital_mode into AuditWriter so
+        # audit-write-failure escalation picks HARD + cancel_open_orders
+        # under real capital (SOFT-only under paper).
+        capital_mode = bool(self.config_mgr.config.capital_mode)
+        self.audit.set_capital_mode(capital_mode)
         self.risk_state = RiskState(db_path=self.risk_state_db)
-        await self.risk_state.load()
+        # Phase 4.13.1 Fix #C: under real capital, refuse to start on a
+        # reconstructed cache. Paper mode retains rebuild-from-venues +
+        # audit-replay behavior.
+        await self.risk_state.load(capital_mode=capital_mode)
 
         self.kill_store = KillStateStore(self.kill_db)
         # Phase 4.11 Item 1 (Review 8 0c-7, Review 9 #2): share a single
@@ -160,7 +168,29 @@ class DaemonService:
         # Phase 4.11 Item 5 (Review 8 0c-5): if the kill DB was corrupt and
         # rebuilt, surface an ERROR event so the operator knows to
         # investigate. The manager exists now so we have a bus reference.
+        # Phase 4.13.1 Fix #A: conditionally emit KILL_STATE_FORCE_RESET
+        # when the operator used EXECUTOR_FORCE_RESET_KILL_STATE=1 to
+        # bypass fail-closed rebuild. Note text varies accordingly so
+        # forensics can distinguish force-reset from fail-closed seed.
         if self.kill_store.rebuilt_from_corruption:
+            force_reset_used = getattr(self.kill_store, "force_reset_used", False)
+            if force_reset_used:
+                err_note = (
+                    "Corrupt kill_state.sqlite was renamed aside and a fresh "
+                    "DB was seeded in mode=NONE via force-reset operator "
+                    "override (EXECUTOR_FORCE_RESET_KILL_STATE=1). "
+                    "Investigate why the DB became corrupt."
+                )
+            else:
+                err_note = (
+                    "Corrupt kill_state.sqlite was renamed aside and "
+                    "a fresh DB was seeded in mode=HARD with "
+                    "manual_only=True (reason=KILL_DB_CORRUPT_REBUILT). "
+                    "Trading is stopped until an operator inspects the "
+                    ".corrupt-* backup and explicitly resolves via "
+                    "KillManager. Set EXECUTOR_FORCE_RESET_KILL_STATE=1 "
+                    "at daemon startup to bypass (seeds NONE instead)."
+                )
             await self.bus.publish(
                 Event.make(
                     EventType.ERROR,
@@ -168,18 +198,32 @@ class DaemonService:
                     payload={
                         "kind": "KILL_DB_REBUILT_FROM_CORRUPTION",
                         "kill_db_path": str(self.kill_db),
-                        "note": (
-                            "Corrupt kill_state.sqlite was renamed aside and "
-                            "a fresh DB was seeded in mode=HARD with "
-                            "manual_only=True (reason=KILL_DB_CORRUPT_REBUILT). "
-                            "Trading is stopped until an operator inspects the "
-                            ".corrupt-* backup and explicitly resolves via "
-                            "KillManager. Set EXECUTOR_FORCE_RESET_KILL_STATE=1 "
-                            "at daemon startup to bypass (seeds NONE instead)."
-                        ),
+                        "note": err_note,
                     },
                 )
             )
+            if force_reset_used:
+                backup_path = getattr(self.kill_store, "_corruption_backup_path", None)
+                await self.bus.publish(
+                    Event.make(
+                        EventType.KILL_STATE_FORCE_RESET,
+                        source=Source.KILL,
+                        payload={
+                            "kill_db_path": str(self.kill_db),
+                            "ns_ts": int(
+                                getattr(self.kill_store, "_corruption_ts_ns", 0)
+                            ),
+                            "backup_path": str(backup_path)
+                            if backup_path is not None
+                            else "",
+                            "note": (
+                                "Operator used EXECUTOR_FORCE_RESET_KILL_STATE=1 "
+                                "to bypass fail-closed after corruption. "
+                                "Investigate why corruption occurred."
+                            ),
+                        },
+                    )
+                )
         # Phase 4.9 Item 1: plumb kill_mgr into AuditWriter so persistent
         # audit write failures can engage the kill switch (fail-closed).
         self.audit.set_kill_manager(self.kill_mgr)

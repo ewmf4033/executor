@@ -51,6 +51,14 @@ Publish = Callable[[Event], Awaitable[None]]
 MAX_MARKETS = 10_000
 MAX_MARKET_ID_LEN = 128
 
+# Phase 4.13.1 Fix #D (GPT-5.5 review #2): active safety pauses must
+# never be silently LRU-evicted. We cap the number of concurrent active
+# pauses at MAX_ACTIVE_PAUSES (smaller than MAX_MARKETS). When exceeded,
+# new pause-adds are refused and a POISONING_DETECTOR_ERROR event is
+# emitted (detail="max_active_pauses_exceeded") so upstream sees an
+# explicit failure instead of silent safety-state eviction.
+MAX_ACTIVE_PAUSES = 1_000
+
 
 @dataclass
 class _PauseRecord:
@@ -100,6 +108,33 @@ class PoisoningTracker:
         except Exception:  # pragma: no cover - defensive
             log.exception("risk.poisoning.publish_failed", event_type=str(event.event_type))
 
+    async def _emit_max_active_pauses_exceeded(
+        self, market_id: str, now_ns: int
+    ) -> None:
+        """Signal upstream that the active-pause cap is saturated and this
+        pause-add was refused. Fail-closed: upstream should treat a refused
+        pause as a loss-of-signal for this market."""
+        self._detector_errors += 1
+        log.error(
+            "risk.poisoning.max_active_pauses_exceeded",
+            market_id=market_id,
+            active_pauses=self._count_active_pauses(now_ns),
+            cap=MAX_ACTIVE_PAUSES,
+        )
+        await self._emit(
+            Event.make(
+                EventType.POISONING_DETECTOR_ERROR,
+                source=Source.RISK,
+                market_id=market_id,
+                payload={
+                    "detector": self._detector.name,
+                    "detail": "max_active_pauses_exceeded",
+                    "active_pauses": self._count_active_pauses(now_ns),
+                    "cap": MAX_ACTIVE_PAUSES,
+                },
+            )
+        )
+
     async def _reject(self, market_id: str, reason: str, detail: dict[str, Any]) -> None:
         self._inputs_rejected += 1
         log.warning("risk.poisoning.input_rejected", market_id=market_id, reason=reason, **detail)
@@ -139,16 +174,45 @@ class PoisoningTracker:
             self._evictions_total += 1
         self._last_prob[market_id] = prob
 
-    def _touch_paused(self, market_id: str, rec: _PauseRecord) -> None:
-        """Insert pause record with LRU semantics."""
+    def _count_active_pauses(self, now_ns: int) -> int:
+        return sum(1 for r in self._paused.values() if r.until_ns > now_ns)
+
+    def _try_add_pause(
+        self, market_id: str, rec: _PauseRecord, now_ns: int
+    ) -> bool:
+        """Insert pause record with LRU semantics, protecting active pauses.
+
+        Returns True if the pause was recorded, False if refused because the
+        active-pause cap (MAX_ACTIVE_PAUSES) is saturated. When evicting to
+        stay under MAX_MARKETS, only expired entries (until_ns <= now_ns) are
+        evictable — an active pause will never be silently cleared by LRU
+        pressure from adversarial/high-churn market_id streams.
+
+        Updating an existing key always succeeds (refresh), since it does
+        not grow the set.
+        """
         if market_id in self._paused:
             self._paused.move_to_end(market_id)
             self._paused[market_id] = rec
-            return
+            return True
+        # New key. Refuse if the active-pause cap is saturated so upstream
+        # sees a first-class failure rather than silent LRU eviction.
+        if self._count_active_pauses(now_ns) >= MAX_ACTIVE_PAUSES:
+            return False
         if len(self._paused) >= MAX_MARKETS:
-            self._paused.popitem(last=False)
+            # Find the oldest expired entry to evict; never evict active.
+            expired_key: str | None = None
+            for k, r in self._paused.items():
+                if r.until_ns <= now_ns:
+                    expired_key = k
+                    break
+            if expired_key is None:
+                # All slots are active — treat as capacity exhausted.
+                return False
+            self._paused.pop(expired_key, None)
             self._evictions_total += 1
         self._paused[market_id] = rec
+        return True
 
     async def observe(
         self,
@@ -236,9 +300,14 @@ class PoisoningTracker:
                 detail=f"detector_error: {type(exc).__name__}",
                 extra={"fail_closed": True, "exception_type": type(exc).__name__},
             )
-            self._touch_paused(market_id, _PauseRecord(
-                since_ns=now_ns, until_ns=until_ns, anomaly=fail_anomaly,
-            ))
+            added = self._try_add_pause(
+                market_id,
+                _PauseRecord(since_ns=now_ns, until_ns=until_ns, anomaly=fail_anomaly),
+                now_ns,
+            )
+            if not added:
+                await self._emit_max_active_pauses_exceeded(market_id, now_ns)
+                return None
             await self._emit(
                 Event.make(
                     EventType.POISONING_DETECTOR_ERROR,
@@ -263,7 +332,10 @@ class PoisoningTracker:
             until_ns=anomaly_ts_ns + self._pause_sec * 1_000_000_000,
             anomaly=anomaly,
         )
-        self._touch_paused(market_id, rec)
+        added = self._try_add_pause(market_id, rec, now_ns)
+        if not added:
+            await self._emit_max_active_pauses_exceeded(market_id, now_ns)
+            return None
         log.warning(
             "risk.poisoning.anomaly",
             market_id=market_id,

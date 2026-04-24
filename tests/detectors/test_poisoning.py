@@ -322,3 +322,110 @@ async def test_tracker_prunes_expired_pauses():
     assert "A" not in tracker._paused
     snap = tracker.snapshot()
     assert snap["prune_cycles"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.13.1 Fix #D — active pauses protected from LRU; MAX_ACTIVE_PAUSES cap
+# ---------------------------------------------------------------------------
+
+
+async def test_active_paused_not_evicted_by_lru():
+    """Flooding _last_prob past MAX_MARKETS with novel market_ids must NOT
+    clear an active safety pause on a pre-existing market. _paused is a
+    separate structure and _last_prob LRU eviction never touches it."""
+    from executor.detectors.poisoning.base import Anomaly, PoisoningDetector as PD
+    from executor.detectors.poisoning.tracker import _PauseRecord, MAX_MARKETS
+
+    class NullDet(PD):
+        name = "null"
+        async def check(self, market_id, prob_delta):
+            return None
+
+    det = NullDet()
+    tracker = PoisoningTracker(det, pause_sec=300)
+    now = time.time_ns()
+    # Seed an active pause on market "A".
+    active_rec = _PauseRecord(
+        since_ns=now,
+        until_ns=now + 300 * 1_000_000_000,
+        anomaly=Anomaly(market_id="A", detector="null", score=0.0, ts_ns=now, detail="seed"),
+    )
+    assert tracker._try_add_pause("A", active_rec, now) is True
+
+    # Flood _last_prob past MAX_MARKETS with novel ids via observe().
+    # (MAX_MARKETS is 10_000; capping the flood at MAX_MARKETS+50 is enough
+    # to force evictions without blowing out test runtime.)
+    for i in range(MAX_MARKETS + 50):
+        await tracker.observe(f"novel_{i}", Decimal("0.5"))
+
+    # _last_prob saw evictions (cap is at MAX_MARKETS).
+    assert len(tracker._last_prob) == MAX_MARKETS
+    # But "A"'s active pause is intact.
+    paused, until_ns, _ = tracker.is_paused("A", now_ns=now + 1)
+    assert paused is True
+    assert until_ns == active_rec.until_ns
+    assert "A" in tracker._paused
+
+
+async def test_max_active_pauses_exceeded_emits_event():
+    """Saturating the active-pause cap (MAX_ACTIVE_PAUSES) causes new
+    pause-adds to be refused: the tracker emits POISONING_DETECTOR_ERROR
+    with detail='max_active_pauses_exceeded' and does not mutate _paused."""
+    from executor.detectors.poisoning.base import Anomaly, PoisoningDetector as PD
+    from executor.detectors.poisoning.tracker import (
+        _PauseRecord,
+        MAX_ACTIVE_PAUSES,
+    )
+
+    # Detector that deterministically flags on every call.
+    class AlwaysFlag(PD):
+        name = "alwaysflag"
+        async def check(self, market_id, prob_delta):
+            return Anomaly(
+                market_id=market_id, detector=self.name, score=9.9,
+                ts_ns=time.time_ns(), detail="flag",
+            )
+
+    det = AlwaysFlag()
+    bus, got = await _sink_bus()
+    tracker = PoisoningTracker(det, pause_sec=300, publish=bus.publish)
+    now = time.time_ns()
+
+    # Fill _paused exactly to the cap with active entries (direct insert,
+    # bypassing the detector path so the test stays fast).
+    for i in range(MAX_ACTIVE_PAUSES):
+        rec = _PauseRecord(
+            since_ns=now,
+            until_ns=now + 300 * 1_000_000_000,
+            anomaly=Anomaly(market_id=f"M{i}", detector="alwaysflag",
+                            score=0.0, ts_ns=now, detail="seed"),
+        )
+        assert tracker._try_add_pause(f"M{i}", rec, now) is True
+    assert tracker._count_active_pauses(now) == MAX_ACTIVE_PAUSES
+
+    # Snapshot _paused state before the attempted add.
+    paused_keys_before = set(tracker._paused.keys())
+
+    # Prime "NEW" with one sample so observe() has a prev to delta against.
+    await tracker.observe("NEW", Decimal("0.500"))
+    # Next observe triggers the detector → anomaly → _try_add_pause → refused.
+    result = await tracker.observe("NEW", Decimal("0.501"))
+    assert result is None  # rejected pause is treated as no-anomaly-recorded
+
+    import asyncio
+    await asyncio.sleep(0.05)
+    await bus.stop()
+
+    # State must NOT have been mutated for "NEW" (no pause entry added).
+    assert "NEW" not in tracker._paused
+    assert set(tracker._paused.keys()) == paused_keys_before
+
+    # Exactly one POISONING_DETECTOR_ERROR with detail=max_active_pauses_exceeded.
+    pe = [
+        e for e in got
+        if e.event_type == EventType.POISONING_DETECTOR_ERROR
+        and e.payload.get("detail") == "max_active_pauses_exceeded"
+    ]
+    assert len(pe) == 1
+    assert pe[0].payload["cap"] == MAX_ACTIVE_PAUSES
+    assert pe[0].market_id == "NEW"
