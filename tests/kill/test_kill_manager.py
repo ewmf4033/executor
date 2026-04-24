@@ -175,6 +175,105 @@ def test_kill_command_received_event(tmp_path: Path) -> None:
     assert ev.payload["chat_id"] == "42"
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.14d — Codex review fix: monotonic kill severity.
+#
+# Severity ordering: NONE < SOFT < HARD. An engage call whose mode is
+# strictly weaker than the current mode must not downgrade state, and a
+# non-panic engage must not clear an existing panic flag. The watchdog
+# (phase 4.14c) calls ``engage(SOFT, ...)``; before this fix that call
+# could silently overwrite an operator-issued HARD/PANIC. Only
+# ``resume()`` may reduce kill state.
+# ---------------------------------------------------------------------------
+
+
+def test_kill_manager_engage_soft_does_not_downgrade_hard(tmp_path: Path) -> None:
+    m, events = _mgr(tmp_path)
+    # Operator engages HARD (no panic).
+    snap = asyncio.run(m.engage(KillMode.HARD, "operator-hard"))
+    assert snap.mode is KillMode.HARD
+    assert snap.reason == "operator-hard"
+    hard_engaged_at = snap.engaged_ts_ns
+
+    # Watchdog (or any later caller) requests SOFT — must not downgrade.
+    snap2 = asyncio.run(
+        m.engage(KillMode.SOFT, "watchdog-soft", source="telegram_watchdog")
+    )
+    assert snap2.mode is KillMode.HARD, "SOFT must not downgrade HARD"
+    assert snap2.reason == "operator-hard", "stricter prior reason preserved"
+    # engaged_ts_ns is not refreshed on no-op engages (no severity raise).
+    assert snap2.engaged_ts_ns == hard_engaged_at
+    # A state_changed event is still emitted for audit visibility, but
+    # from_mode == to_mode == HARD (no-op signal). Phase 4.14d: the
+    # payload now carries explicit effective/skipped_weaker/requested_mode
+    # so consumers don't have to infer the no-op from equal modes.
+    state_changes = [
+        e for e in events if e.event_type == EventType.KILL_STATE_CHANGED
+    ]
+    assert len(state_changes) >= 2
+    last = state_changes[-1].payload
+    assert last["from_mode"] == "HARD"
+    assert last["to_mode"] == "HARD"
+    assert last["requested_mode"] == "SOFT"
+    assert last["effective"] is False
+    assert last["skipped_weaker"] is True
+
+
+def test_kill_manager_hard_can_upgrade_to_panic(tmp_path: Path) -> None:
+    """HARD → HARD+PANIC upgrade: same-severity engage with panic=True
+    must still set panic/manual_only/panic_until_ns even though the
+    mode itself doesn't change. This exercises the ``sets_new_panic``
+    branch of the effective-engage gate."""
+    m, events = _mgr(tmp_path)
+    # Start HARD without panic.
+    snap = asyncio.run(m.engage(KillMode.HARD, "initial-hard"))
+    assert snap.mode is KillMode.HARD
+    assert snap.panic is False
+    assert snap.manual_only is False
+    assert snap.panic_until_ns == 0
+
+    # Upgrade to panic — same mode, but adds panic flag.
+    snap2 = asyncio.run(
+        m.engage(KillMode.HARD, "now-panic", panic=True)
+    )
+    assert snap2.mode is KillMode.HARD
+    assert snap2.panic is True
+    assert snap2.manual_only is True
+    assert snap2.panic_until_ns > 0
+    # Reason on upgrade: raises_severity=False so final_reason falls
+    # back to the prior mode's reason. The panic flag is what
+    # distinguishes this engage in the audit trail.
+    state_changes = [
+        e for e in events if e.event_type == EventType.KILL_STATE_CHANGED
+    ]
+    assert state_changes[-1].payload["panic"] is True
+    assert state_changes[-1].payload["to_mode"] == "HARD"
+    assert state_changes[-1].payload["from_mode"] == "HARD"
+
+
+def test_kill_manager_engage_soft_does_not_clear_panic(tmp_path: Path) -> None:
+    m, events = _mgr(tmp_path)
+    # Operator engages HARD with panic.
+    snap = asyncio.run(m.engage(KillMode.HARD, "operator-panic", panic=True))
+    assert snap.mode is KillMode.HARD
+    assert snap.panic is True
+    assert snap.manual_only is True
+
+    # Watchdog requests SOFT without panic — must not clear panic.
+    snap2 = asyncio.run(
+        m.engage(KillMode.SOFT, "watchdog-soft", source="telegram_watchdog")
+    )
+    assert snap2.mode is KillMode.HARD
+    assert snap2.panic is True, "panic flag must survive weaker engage"
+    assert snap2.manual_only is True
+
+    # A non-panic HARD engage must also not clear an existing panic.
+    snap3 = asyncio.run(
+        m.engage(KillMode.HARD, "second-hard", panic=False)
+    )
+    assert snap3.panic is True
+
+
 def test_state_persists_across_restart(tmp_path: Path) -> None:
     db = tmp_path / "k.sqlite"
 

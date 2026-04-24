@@ -209,33 +209,107 @@ class KillManager:
         Engage SOFT or HARD. HARD additionally cancels all open orders across
         every registered VenueAdapter and emits BASKET_ORPHAN for any partially
         filled ALL_OR_NONE basket.
+
+        Phase 4.14d (Codex review fix) — monotonic kill severity.
+        Severity ordering: NONE < SOFT < HARD. A later weaker engage
+        must NOT downgrade an existing stricter state; this matters
+        because the 4.14c watchdog escalation calls ``engage(SOFT, ...)``
+        which would otherwise silently overwrite an operator-issued
+        HARD/PANIC. Likewise a non-panic engage must not clear an
+        existing ``panic=True`` flag. ``resume()`` remains the only
+        path to reduce/clear kill state.
+
+        When the incoming state is equal or stricter, we update mode
+        (and panic flag upgrade), refresh ``engaged_ts_ns`` to keep
+        callers who consult it aware of the most recent engage, and
+        still mirror into the gate-facing ``KillSwitch``. When the
+        incoming state is strictly weaker (and the incoming
+        ``panic=False`` would not add a new flag), we emit a
+        state-unchanged signal instead and preserve the current
+        mode/reason. Callers (e.g. the watchdog) read the returned
+        snapshot to decide whether their escalation was effective.
         """
         if mode == KillMode.NONE:
             raise ValueError("engage requires SOFT or HARD; use resume() to clear")
         if not reason:
             raise ValueError("engage requires a non-empty reason")
+        severity = {KillMode.NONE: 0, KillMode.SOFT: 1, KillMode.HARD: 2}
         async with self._lock:
             now_ns = time.time_ns()
             prev_mode = self._snapshot.mode
-            self._snapshot.mode = mode
-            self._snapshot.reason = reason
-            self._snapshot.engaged_ts_ns = now_ns
-            if panic:
-                self._snapshot.panic = True
-                self._snapshot.panic_until_ns = (
-                    now_ns + self._panic_cooldown_sec * 1_000_000_000
+            prev_panic = self._snapshot.panic
+
+            incoming_sev = severity[mode]
+            current_sev = severity[prev_mode]
+            # An engage is "effective" if it raises the mode severity or
+            # newly sets panic. Equal severity with no new panic flag is
+            # treated as a no-op that preserves the prior reason so the
+            # operator-issued message survives, but we still refresh
+            # ``engaged_ts_ns`` on upgrades.
+            raises_severity = incoming_sev > current_sev
+            sets_new_panic = panic and not prev_panic
+            effective = raises_severity or sets_new_panic
+
+            # Track the mode we will actually persist. When not
+            # effective we keep the stricter prior mode + reason.
+            final_mode = mode if raises_severity else prev_mode
+            final_reason = reason if raises_severity else self._snapshot.reason
+
+            if effective:
+                self._snapshot.mode = final_mode
+                self._snapshot.reason = final_reason
+                if raises_severity:
+                    self._snapshot.engaged_ts_ns = now_ns
+                if panic:
+                    self._snapshot.panic = True
+                    self._snapshot.panic_until_ns = (
+                        now_ns + self._panic_cooldown_sec * 1_000_000_000
+                    )
+                    self._snapshot.manual_only = True
+                # Mirror into gate-facing KillSwitch as a GLOBAL.
+                try:
+                    self._kill_switch.engage(
+                        KillScope.GLOBAL, (), final_reason
+                    )
+                except ValueError:
+                    pass
+            else:
+                log.info(
+                    "kill.manager.engage_skipped_weaker",
+                    requested_mode=mode.value,
+                    requested_panic=panic,
+                    current_mode=prev_mode.value,
+                    current_panic=prev_panic,
+                    source=source,
+                    reason=reason,
                 )
-                self._snapshot.manual_only = True
-            # Mirror into gate-facing KillSwitch as a GLOBAL.
-            try:
-                self._kill_switch.engage(KillScope.GLOBAL, (), reason)
-            except ValueError:
-                pass
+
             self._store.save(self._snapshot)
 
-            await self._emit_state_changed(prev_mode, mode, reason, source, panic)
+            # Always emit a state-changed record so the audit trail is
+            # complete — even when an engage is a no-op the attempt
+            # itself is a significant operator-surface signal. Callers
+            # can distinguish from_mode==to_mode to spot no-ops.
+            # Phase 4.14d: also carry effective / skipped_weaker /
+            # requested_mode so downstream consumers don't have to
+            # infer them from from_mode==to_mode.
+            await self._emit_state_changed(
+                prev_mode, self._snapshot.mode, final_reason, source,
+                self._snapshot.panic,
+                requested_mode=mode,
+                effective=effective,
+                skipped_weaker=(not effective),
+            )
 
-            if mode == KillMode.HARD and cancel_open_orders:
+            # Cancel-open-orders only runs when this engage actually
+            # transitioned the system into HARD. A no-op engage on an
+            # already-HARD system must not re-trigger cancellation.
+            if (
+                effective
+                and self._snapshot.mode == KillMode.HARD
+                and prev_mode != KillMode.HARD
+                and cancel_open_orders
+            ):
                 await self._hard_cancel_all()
             return self.snapshot()
 
@@ -440,6 +514,10 @@ class KillManager:
         reason: str,
         source: str,
         panic: bool,
+        *,
+        requested_mode: KillMode | None = None,
+        effective: bool = True,
+        skipped_weaker: bool = False,
     ) -> None:
         if self._publish is None:
             return
@@ -451,6 +529,12 @@ class KillManager:
             "panic": panic,
             "manual_only": self._snapshot.manual_only,
             "panic_until_ns": self._snapshot.panic_until_ns,
+            # Phase 4.14d: clearer no-op signal for audit consumers.
+            "requested_mode": (
+                requested_mode.value if requested_mode is not None else new.value
+            ),
+            "effective": bool(effective),
+            "skipped_weaker": bool(skipped_weaker),
         }
         await self._publish(
             Event.make(

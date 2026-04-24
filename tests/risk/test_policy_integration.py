@@ -98,6 +98,78 @@ async def test_reject_on_clip_floor_after_heavy_clip(policy_with_bus):
     assert v.reject_gate == "clip_floor"
 
 
+async def test_dead_man_stale_emits_first_class_event_before_gate_rejected(
+    policy_with_bus,
+):
+    """Phase 4.14d — Codex review fix #4.
+
+    When DeadManGate rejects with kind=dead_man_stale, the policy must
+    emit a first-class DEAD_MAN_TRIPPED event BEFORE the terminal
+    GATE_REJECTED so downstream alerting can distinguish an
+    operator-availability trip from generic gate rejections.
+    """
+    from dataclasses import replace as _replace
+
+    from executor.risk.config import DeadManCfg
+    from executor.risk.state import OperatorLivenessStore
+
+    policy, bus, received = policy_with_bus
+
+    # Enable dead_man and wire an OperatorLivenessStore.
+    cfg_mgr = policy._cfg_mgr
+    cfg_mgr._config = _replace(
+        cfg_mgr._config,
+        dead_man=DeadManCfg(
+            enabled=True,
+            default_timeout_sec=60,
+            min_timeout_sec=10,
+            max_timeout_sec=3600,
+        ),
+    )
+    store = OperatorLivenessStore(policy.state.connection)
+    policy.operator_liveness = store
+
+    # Arm with a short timeout, then evaluate an intent well past the deadline
+    # so the heartbeat is stale.
+    import time as _time
+
+    now = _time.time_ns()
+    store.arm(timeout_sec=10, source="test", kill_mode="NONE", now_ns=now - 60 * 1_000_000_000)
+
+    intent = make_intent(
+        strategy_id="DM",
+        legs=[make_leg(market_id="MA", size=20, price=0.55)],
+    )
+    v = await policy.evaluate(intent)
+    assert v.admitted is False
+    assert v.reject_gate == "dead_man"
+
+    import asyncio
+    await asyncio.sleep(0.05)
+
+    types = [e.event_type for e in received]
+    assert EventType.DEAD_MAN_TRIPPED in types, "first-class trip event missing"
+    assert EventType.GATE_REJECTED in types
+
+    # Ordering: DEAD_MAN_TRIPPED must precede GATE_REJECTED.
+    dm_idx = types.index(EventType.DEAD_MAN_TRIPPED)
+    gr_idx = types.index(EventType.GATE_REJECTED)
+    assert dm_idx < gr_idx, "DEAD_MAN_TRIPPED must emit before GATE_REJECTED"
+
+    # Payload carries forensic fields.
+    dm = [e for e in received if e.event_type == EventType.DEAD_MAN_TRIPPED][0]
+    assert "last_heartbeat_ts_ns" in dm.payload
+    assert "timeout_sec" in dm.payload
+    assert "deadline_ns" in dm.payload
+    assert "now_ns" in dm.payload
+    assert "stale_sec" in dm.payload
+    assert dm.payload["intent_id"] == intent.intent_id
+    assert dm.payload["strategy_id"] == "DM"
+    assert dm.payload["timeout_sec"] == 10
+    # stale_sec should be ~50 (60s elapsed minus 10s timeout).
+    assert dm.payload["stale_sec"] > 0
+
+
 async def test_basket_multi_venue_venue_exposure_clip(policy_with_bus):
     """Basket across two venues; kalshi near venue ceiling via many sub-markets."""
     policy, bus, received = policy_with_bus

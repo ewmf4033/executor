@@ -347,6 +347,40 @@ class RiskPolicy:
     ) -> None:
         if self._publish is None:
             return
+        # Phase 4.14d (Codex review): first-class DEAD_MAN_TRIPPED for
+        # stale operator heartbeat. DeadManGate tags its stale-reject
+        # metadata with kind="dead_man_stale" and the forensic fields
+        # listed below. We emit the trip event BEFORE the terminal
+        # GATE_REJECTED so downstream alerting observes the dead-man
+        # cause-signal first. Dual emission is intentional — general
+        # reject consumers still see GATE_REJECTED.
+        if (
+            gate.name == "dead_man"
+            and result.metadata.get("kind") == "dead_man_stale"
+        ):
+            await self._publish(
+                Event.make(
+                    EventType.DEAD_MAN_TRIPPED,
+                    source=Source.RISK,
+                    intent_id=ctx.original_intent.intent_id,
+                    strategy_id=ctx.original_intent.strategy_id,
+                    payload={
+                        "last_heartbeat_ts_ns": int(
+                            result.metadata.get("last_heartbeat_ts_ns", 0)
+                        ),
+                        "timeout_sec": int(
+                            result.metadata.get("timeout_sec", 0)
+                        ),
+                        "deadline_ns": int(
+                            result.metadata.get("deadline_ns", 0)
+                        ),
+                        "now_ns": int(result.metadata.get("now_ns", 0)),
+                        "stale_sec": result.metadata.get("stale_sec"),
+                        "intent_id": ctx.original_intent.intent_id,
+                        "strategy_id": ctx.original_intent.strategy_id,
+                    },
+                )
+            )
         await self._publish(
             Event.make(
                 EventType.GATE_REJECTED,

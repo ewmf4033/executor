@@ -116,6 +116,13 @@ class EventType(str, Enum):
     TELEGRAM_STALL_DETECTED = "TELEGRAM_STALL_DETECTED"
     TELEGRAM_WATCHDOG_ESCALATED = "TELEGRAM_WATCHDOG_ESCALATED"
 
+    # Phase 4.14d — Codex review fix. Restart lifecycle events so the
+    # watchdog can report per-attempt success/failure (including
+    # timeout containment on hung bot.stop()/bot.start()). Timed-out
+    # or failed attempts still count toward the restart budget.
+    TELEGRAM_WATCHDOG_RESTARTED = "TELEGRAM_WATCHDOG_RESTARTED"
+    TELEGRAM_WATCHDOG_RESTART_FAILED = "TELEGRAM_WATCHDOG_RESTART_FAILED"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
@@ -131,8 +138,10 @@ class EventType(str, Enum):
 # OPERATOR_HEARTBEAT + DEAD_MAN_TRIPPED (dead-man gate lifecycle).
 # Phase 4.14c added TELEGRAM_STALL_DETECTED + TELEGRAM_WATCHDOG_ESCALATED
 # (Telegram polling watchdog).
+# Phase 4.14d added TELEGRAM_WATCHDOG_RESTARTED + TELEGRAM_WATCHDOG_RESTART_FAILED
+# (Codex review: restart attempt observability + timeout containment).
 # Guard against silent drift:
-assert len(EventType) == 49, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 51, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +155,10 @@ class Source:
     RISK = "risk"
     KILL = "kill"
     TELEGRAM = "telegram"
+    # Phase 4.14d — Codex review fix. Watchdog-originated events use a
+    # distinct source so audit/alerting can separate operator-awareness
+    # degradation from command-path Telegram activity.
+    TELEGRAM_WATCHDOG = "telegram_watchdog"
 
     @staticmethod
     def strategy(strategy_id: str) -> str:

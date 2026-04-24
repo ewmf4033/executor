@@ -144,6 +144,30 @@ def test_unauthorized_chat_id_dropped(tmp_path: Path) -> None:
     assert not any(e.event_type == EventType.KILL_COMMAND_RECEIVED for e in events)
 
 
+def test_unauthorized_panic_does_not_bypass_auth(tmp_path: Path) -> None:
+    """Phase 4.14d: the new rate-limit bypass for /kill hard and /kill
+    panic must not circumvent chat-id authorization. Auth runs BEFORE
+    parse_command in handle_text, so an unauthorized sender cannot
+    trigger KillManager.engage via the critical-kill path."""
+    bot, km, events = _bot(tmp_path)
+    reply = asyncio.run(
+        bot.handle_text("/kill panic emergency", chat_id="99999")
+    )
+    assert reply == ""
+    assert km.mode is KillMode.NONE, "unauthorized panic must not engage"
+    assert km.snapshot().panic is False
+    # No audit event — auth ran before the KILL_COMMAND_RECEIVED emit.
+    assert not any(
+        e.event_type == EventType.KILL_COMMAND_RECEIVED for e in events
+    )
+    # And /kill hard is likewise gated.
+    reply2 = asyncio.run(
+        bot.handle_text("/kill hard system down", chat_id="99999")
+    )
+    assert reply2 == ""
+    assert km.mode is KillMode.NONE
+
+
 def test_rate_limit_drops_burst(tmp_path: Path) -> None:
     store = KillStateStore(tmp_path / "kill.sqlite")
     km = KillManager(store=store)
@@ -311,6 +335,91 @@ def test_panic_engages_kill_before_reply_send(tmp_path: Path) -> None:
     assert snap.panic is True
     assert snap.manual_only is True
     assert "PANIC engaged" in reply
+
+
+def test_panic_bypasses_rate_limit_after_recent_noncritical_command(
+    tmp_path: Path,
+) -> None:
+    """Phase 4.14d: /kill panic must bypass the per-chat rate limit so
+    a recent /ping or /kill status cannot suppress the kill signal."""
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    captured: list[Event] = []
+
+    async def pub(ev: Event) -> None:
+        captured.append(ev)
+
+    km = KillManager(store=store, publish=pub, panic_cooldown_sec=1)
+    # Long rate-limit window that would normally suppress a follow-up.
+    bot = TelegramBot(
+        kill_manager=km, token="tok", chat_id="42", rate_limit_sec=60.0
+    )
+
+    # Consume rate budget with a non-critical command.
+    r1 = asyncio.run(bot.handle_text("/kill status", chat_id="42"))
+    assert "mode=" in r1  # status reply, rate slot consumed
+    last_cmd_ts_before = bot._last_cmd_ts.get("42")
+
+    # /kill panic must NOT be rate-limited.
+    reply = asyncio.run(
+        bot.handle_text("/kill panic emergency", chat_id="42")
+    )
+    assert "rate-limited" not in reply
+    assert "PANIC engaged" in reply
+    # Kill-state persisted.
+    assert km.mode is KillMode.HARD
+    snap = km.snapshot()
+    assert snap.panic is True
+    assert snap.manual_only is True
+
+    # Critical bypass must NOT consume budget for subsequent
+    # non-critical commands: _last_cmd_ts is unchanged by the panic.
+    assert bot._last_cmd_ts.get("42") == last_cmd_ts_before
+
+
+def test_hard_bypasses_rate_limit_after_recent_noncritical_command(
+    tmp_path: Path,
+) -> None:
+    """Phase 4.14d: /kill hard shares the same rate-limit bypass as
+    /kill panic."""
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    captured: list[Event] = []
+
+    async def pub(ev: Event) -> None:
+        captured.append(ev)
+
+    km = KillManager(store=store, publish=pub)
+    bot = TelegramBot(
+        kill_manager=km, token="tok", chat_id="42", rate_limit_sec=60.0
+    )
+
+    r1 = asyncio.run(bot.handle_text("/ping", chat_id="42"))
+    assert "pong" in r1  # command landed, rate slot consumed
+    last_cmd_ts_before = bot._last_cmd_ts.get("42")
+    assert last_cmd_ts_before is not None
+
+    reply = asyncio.run(
+        bot.handle_text("/kill hard system fault", chat_id="42")
+    )
+    assert "rate-limited" not in reply
+    assert "HARD engaged" in reply
+    assert km.mode is KillMode.HARD
+    # Budget unchanged.
+    assert bot._last_cmd_ts.get("42") == last_cmd_ts_before
+
+
+def test_soft_and_status_still_respect_rate_limit(tmp_path: Path) -> None:
+    """Phase 4.14d guardrail: non-critical commands (including /kill
+    soft) still hit the per-chat rate limit."""
+    store = KillStateStore(tmp_path / "kill.sqlite")
+    km = KillManager(store=store)
+    bot = TelegramBot(
+        kill_manager=km, token="tok", chat_id="42", rate_limit_sec=60.0
+    )
+
+    r1 = asyncio.run(bot.handle_text("/kill soft first", chat_id="42"))
+    assert "SOFT engaged" in r1
+    r2 = asyncio.run(bot.handle_text("/kill status", chat_id="42"))
+    assert "rate-limited" in r2
 
 
 def test_panic_engagement_survives_send_reply_failure(tmp_path: Path) -> None:

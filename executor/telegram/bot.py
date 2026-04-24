@@ -252,20 +252,35 @@ class TelegramBot:
         Dispatch a single text message. Returns the reply that would be sent.
         Enforces chat_id auth + per-chat rate limit. Always emits an audit
         KILL_COMMAND_RECEIVED for accepted (non-rate-limited) commands.
+
+        Phase 4.14d (Codex review fix): ``/kill hard`` and ``/kill panic``
+        bypass the per-chat rate limit. A recent ``/ping`` or ``/kill
+        status`` must not be able to suppress the operator's kill signal.
+        Bypassing commands also do NOT update ``_last_cmd_ts`` — they do
+        not consume rate budget for subsequent non-critical commands.
         """
         chat_str = str(chat_id)
         if self._chat_id and chat_str != self._chat_id:
             log.warning("telegram.bot.unauthorized_chat", chat_id=chat_str)
             return ""
 
-        now = time.monotonic()
-        last = self._last_cmd_ts.get(chat_str, 0.0)
-        if now - last < self._rate_limit_sec:
-            wait = self._rate_limit_sec - (now - last)
-            return f"rate-limited; wait {wait:.1f}s"
-        self._last_cmd_ts[chat_str] = now
-
+        # Parse BEFORE rate-limit enforcement so we can identify the
+        # small set of critical kill subcommands that must always run.
         parsed = parse_command(text)
+        critical_kill = (
+            parsed.valid
+            and parsed.command == "kill"
+            and parsed.sub in ("hard", "panic")
+        )
+
+        if not critical_kill:
+            now = time.monotonic()
+            last = self._last_cmd_ts.get(chat_str, 0.0)
+            if now - last < self._rate_limit_sec:
+                wait = self._rate_limit_sec - (now - last)
+                return f"rate-limited; wait {wait:.1f}s"
+            self._last_cmd_ts[chat_str] = now
+
         await self._kill.emit_command_received(
             command=parsed.command,
             args=f"{parsed.sub} {parsed.args}".strip(),

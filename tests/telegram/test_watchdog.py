@@ -89,6 +89,8 @@ def _watchdog(
     max_restarts: int = 3,
     restart_window_sec: int = 300,
     escalate_on_max: bool = True,
+    restart_timeout_sec: float = 1.0,
+    post_stop_pause_sec: float = 0.0,
 ) -> TelegramWatchdog:
     return TelegramWatchdog(
         bot=bot,  # type: ignore[arg-type]
@@ -99,6 +101,8 @@ def _watchdog(
         max_restarts=max_restarts,
         restart_window_sec=restart_window_sec,
         escalate_on_max=escalate_on_max,
+        restart_timeout_sec=restart_timeout_sec,
+        post_stop_pause_sec=post_stop_pause_sec,
     )
 
 
@@ -311,3 +315,191 @@ def test_watchdog_run_exits_on_stop(tmp_path: Path) -> None:
         await asyncio.wait_for(task, timeout=2.0)
 
     asyncio.run(_exercise())
+
+
+# --------------------------------------------------------------------------
+# Phase 4.14d — Codex review fixes
+# --------------------------------------------------------------------------
+
+
+class _HangingStopBot(_FakeBot):
+    """bot.stop() never returns — simulates a wedged poll task."""
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        await asyncio.Event().wait()  # forever
+
+
+class _HangingStartBot(_FakeBot):
+    """bot.start() never returns — simulates a wedged network init."""
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        await asyncio.Event().wait()  # forever
+
+
+def test_watchdog_restart_stop_timeout_does_not_hang_loop(tmp_path: Path) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _HangingStopBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(
+        bot=bot,
+        kill_mgr=km,
+        bus=bus,
+        restart_timeout_sec=0.01,
+    )
+
+    async def _exercise() -> None:
+        # _check_once must return promptly even though stop() hangs.
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+
+    asyncio.run(_exercise())
+
+    kinds = [e.event_type for e in bus.events]
+    assert EventType.TELEGRAM_STALL_DETECTED in kinds
+    # Timeout on stop() must surface as a restart-failed event.
+    assert EventType.TELEGRAM_WATCHDOG_RESTART_FAILED in kinds
+    # Failure counts toward the restart budget.
+    assert len(wd._restart_ts) == 1
+    # start() must NOT have been attempted because stop() timed out.
+    assert bot.start_calls == 0
+    # Watchdog can run another check immediately.
+    asyncio.run(asyncio.wait_for(wd._check_once(), timeout=1.0))
+
+
+def test_watchdog_restart_start_timeout_does_not_hang_loop(tmp_path: Path) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _HangingStartBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(
+        bot=bot,
+        kill_mgr=km,
+        bus=bus,
+        restart_timeout_sec=0.01,
+    )
+
+    async def _exercise() -> None:
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+
+    asyncio.run(_exercise())
+
+    kinds = [e.event_type for e in bus.events]
+    assert EventType.TELEGRAM_STALL_DETECTED in kinds
+    assert EventType.TELEGRAM_WATCHDOG_RESTART_FAILED in kinds
+    # phase must be "start" since stop() succeeded.
+    failed = [
+        e for e in bus.events
+        if e.event_type == EventType.TELEGRAM_WATCHDOG_RESTART_FAILED
+    ]
+    assert failed and failed[0].payload.get("phase") == "start"
+    assert len(wd._restart_ts) == 1
+    assert bot.stop_calls == 1
+
+
+def test_watchdog_restart_timeout_counts_toward_escalation_budget(
+    tmp_path: Path,
+) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _HangingStopBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(
+        bot=bot,
+        kill_mgr=km,
+        bus=bus,
+        restart_timeout_sec=0.01,
+        max_restarts=2,
+    )
+
+    async def _exercise() -> None:
+        # Two failed restart attempts fill the budget.
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+        # Third stall with full budget -> escalation.
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+
+    asyncio.run(_exercise())
+
+    kinds = [e.event_type for e in bus.events]
+    assert EventType.TELEGRAM_WATCHDOG_ESCALATED in kinds
+    # Budget full.
+    assert len(wd._restart_ts) >= 2
+    # SOFT kill engaged (monotonic severity: no prior stricter kill).
+    assert km.mode is KillMode.SOFT
+
+
+def test_watchdog_escalation_does_not_downgrade_existing_hard_or_panic(
+    tmp_path: Path,
+) -> None:
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    # Operator engages HARD+PANIC before watchdog escalation.
+    asyncio.run(km.engage(KillMode.HARD, "operator panic", panic=True))
+    assert km.mode is KillMode.HARD
+    assert km.snapshot().panic is True
+
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(bot=bot, kill_mgr=km, bus=bus, max_restarts=1)
+    wd._restart_ts.append(time.monotonic() - 10.0)  # budget full
+
+    asyncio.run(wd._check_once())
+
+    # Escalation event still emitted (forensic trail).
+    kinds = [e.event_type for e in bus.events]
+    assert EventType.TELEGRAM_WATCHDOG_ESCALATED in kinds
+    # Final state preserves stricter HARD + panic.
+    assert km.mode is KillMode.HARD
+    assert km.snapshot().panic is True
+
+    # Escalation payload reports that the SOFT engage was skipped.
+    esc = [
+        e for e in bus.events
+        if e.event_type == EventType.TELEGRAM_WATCHDOG_ESCALATED
+    ][0]
+    assert esc.payload.get("action") == "soft_engage_attempted"
+    assert esc.payload.get("result") == "skipped_existing_stricter_kill"
+    assert esc.payload.get("current_mode") == "HARD"
+    assert esc.payload.get("panic") is True
+
+
+def test_watchdog_events_use_telegram_watchdog_source(tmp_path: Path) -> None:
+    """All watchdog-originated events use Source.TELEGRAM_WATCHDOG."""
+    captured: list[Event] = []
+    bus = _CapturingBus()
+    km = _kill_mgr(tmp_path, captured)
+    bot = _FakeBot(last_activity=time.monotonic() - 200.0)
+    bot.refresh_on_start = False
+    wd = _watchdog(
+        bot=bot, kill_mgr=km, bus=bus, restart_timeout_sec=0.01, max_restarts=1
+    )
+
+    async def _exercise() -> None:
+        # One successful restart, then a second stall → escalation.
+        bot.refresh_on_start = True
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+        bot.refresh_on_start = False
+        bot.set_last_activity(time.monotonic() - 200.0)
+        await asyncio.wait_for(wd._check_once(), timeout=1.0)
+
+    asyncio.run(_exercise())
+
+    watchdog_event_types = {
+        EventType.TELEGRAM_STALL_DETECTED,
+        EventType.TELEGRAM_WATCHDOG_RESTARTED,
+        EventType.TELEGRAM_WATCHDOG_RESTART_FAILED,
+        EventType.TELEGRAM_WATCHDOG_ESCALATED,
+    }
+    for ev in bus.events:
+        if ev.event_type in watchdog_event_types:
+            assert ev.source == "telegram_watchdog", (
+                f"{ev.event_type} has source={ev.source}, expected telegram_watchdog"
+            )
+    # Verify at least some watchdog events were emitted.
+    assert any(ev.event_type in watchdog_event_types for ev in bus.events)

@@ -579,10 +579,23 @@ class DeadManGate(Gate):
         )
         if ctx.now_ns > deadline_ns:
             stale_sec = (ctx.now_ns - deadline_ns) / 1e9
+            # Phase 4.14d (Codex review): tag reject metadata so
+            # RiskPolicy can emit a first-class DEAD_MAN_TRIPPED event
+            # alongside the terminal GATE_REJECTED. DEAD_MAN_TRIPPED
+            # exists for alerting to separate operator-availability
+            # trips from generic gate rejections.
             return GateResult.reject(
                 f"dead_man_stale: heartbeat stale by {stale_sec:.1f}s "
                 f"(timeout={snap.timeout_sec}s, "
-                f"last_hb_ns={snap.last_heartbeat_ts_ns})"
+                f"last_hb_ns={snap.last_heartbeat_ts_ns})",
+                metadata={
+                    "kind": "dead_man_stale",
+                    "last_heartbeat_ts_ns": int(snap.last_heartbeat_ts_ns),
+                    "timeout_sec": int(snap.timeout_sec),
+                    "deadline_ns": int(deadline_ns),
+                    "now_ns": int(ctx.now_ns),
+                    "stale_sec": round(stale_sec, 3),
+                },
             )
         return GateResult.approve()
 
