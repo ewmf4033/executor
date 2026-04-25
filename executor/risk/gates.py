@@ -11,6 +11,8 @@ Gate order (per Decision 3):
   1.5 Fee                (Phase 4.15 — admission-time fee/edge protection)
   1.6 OrderPolicy        (Phase 4.15 — leg.metadata venue-write shape)
   2   KillSwitch
+  2.1 HostHealth         (Phase 4.16 — disk/inode/swap/optional rss/load)
+  2.2 ClockHealth        (Phase 4.16 — wall regression / skew / NTP sync)
   2.5 VenueHealth
   2.6 Poisoning          (0g — extended from the spec's adverse-selection slot)
   3   AdverseSelection   (0e — venue-level pause since Phase 4.7)
@@ -34,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.intent import BasketIntent, Leg
 from ..core.types import Side
+from . import clock_probe, host_probe
 from .exposure import (
     ONE,
     ZERO,
@@ -392,6 +395,213 @@ class KillGate(Gate):
             if killed:
                 return GateResult.reject(f"kill_switch: {reason}")
         return GateResult.approve()
+
+
+# ---------------------------------------------------------------------------
+# 2.1 Host health (Phase 4.16)
+# ---------------------------------------------------------------------------
+
+
+class HostHealthGate(Gate):
+    """Gate 2.1 — Phase 4.16 host-health admission gate.
+
+    Point-sample stdlib probes only (disk, inode, swap, optional RSS,
+    optional loadavg). No background task, no psutil dependency.
+
+    Bypasses entirely when:
+      - cfg.host_health.enabled is False, or
+      - capital_mode is False AND apply_in_paper_mode is False.
+
+    On a configured threshold breach, rejects the intent with the first
+    breaching field surfaced in metadata.kind="host_threshold_exceeded".
+    On an unexpected probe exception, fail-closed in capital mode (when
+    fail_closed_on_probe_error_in_capital_mode=True), otherwise approve
+    with metadata.probe_error noting the cause.
+    """
+
+    name = "host_health"
+    order = "2.1"
+
+    async def check(self, ctx: GateCtx) -> GateResult:
+        cfg = ctx.policy.config.host_health
+        if not cfg.enabled:
+            return GateResult.approve(metadata={"bypassed": "disabled"})
+        capital_mode = ctx.policy.config.capital_mode
+        if not capital_mode and not cfg.apply_in_paper_mode:
+            return GateResult.approve(metadata={"bypassed": "paper_mode"})
+
+        try:
+            sample = host_probe.sample_host(
+                check_rss=cfg.rss_mb_max > 0,
+                check_loadavg=cfg.loadavg_1m_max > 0,
+            )
+        except Exception as exc:
+            if (
+                capital_mode
+                and cfg.fail_closed_on_probe_error_in_capital_mode
+            ):
+                return GateResult.reject(
+                    f"host_health: probe_error: {exc}",
+                    metadata={
+                        "kind": "probe_error",
+                        "error": str(exc),
+                    },
+                )
+            return GateResult.approve(
+                metadata={"probe_error": str(exc)}
+            )
+
+        thresholds = {
+            "disk_pct_max": cfg.disk_pct_max,
+            "inode_pct_max": cfg.inode_pct_max,
+            "swap_pct_max": cfg.swap_pct_max,
+            "rss_mb_max": cfg.rss_mb_max,
+            "loadavg_1m_max": cfg.loadavg_1m_max,
+        }
+        # Threshold checks in declaration order. First breach wins.
+        breach: tuple[str, float, float] | None = None
+        if sample["disk_pct"] > cfg.disk_pct_max:
+            breach = ("disk_pct", sample["disk_pct"], cfg.disk_pct_max)
+        elif sample["inode_pct"] > cfg.inode_pct_max:
+            breach = ("inode_pct", sample["inode_pct"], cfg.inode_pct_max)
+        elif sample["swap_pct"] > cfg.swap_pct_max:
+            breach = ("swap_pct", sample["swap_pct"], cfg.swap_pct_max)
+        elif cfg.rss_mb_max > 0 and sample.get("rss_mb", 0) > cfg.rss_mb_max:
+            breach = ("rss_mb", sample["rss_mb"], cfg.rss_mb_max)
+        elif (
+            cfg.loadavg_1m_max > 0
+            and sample.get("loadavg_1m", 0) > cfg.loadavg_1m_max
+        ):
+            breach = (
+                "loadavg_1m",
+                sample["loadavg_1m"],
+                cfg.loadavg_1m_max,
+            )
+
+        if breach is not None:
+            field_name, value, limit = breach
+            return GateResult.reject(
+                f"host_health: {field_name}={value} > {limit}",
+                metadata={
+                    "kind": "host_threshold_exceeded",
+                    "breach_field": field_name,
+                    "breach_value": value,
+                    "breach_threshold": limit,
+                    "sample": dict(sample),
+                    "thresholds": thresholds,
+                },
+            )
+        return GateResult.approve(
+            metadata={"sample": dict(sample), "thresholds": thresholds}
+        )
+
+
+# ---------------------------------------------------------------------------
+# 2.2 Clock health (Phase 4.16)
+# ---------------------------------------------------------------------------
+
+
+class ClockHealthGate(Gate):
+    """Gate 2.2 — Phase 4.16 clock-health admission gate.
+
+    stdlib monotonic/wall-clock skew + wall-clock regression detection,
+    plus an optional `timedatectl` NTP-synchronization probe (capital
+    mode only when require_ntp_sync_in_capital_mode=True).
+
+    Bypasses entirely when:
+      - cfg.clock_health.enabled is False, or
+      - capital_mode is False AND apply_in_paper_mode is False.
+
+    Paper mode (when not bypassed) and capital mode without
+    require_ntp_sync_in_capital_mode=True both skip the timedatectl
+    subprocess invocation entirely — the spec is explicit that paper
+    mode must NOT call timedatectl by default.
+
+    First probe with no baseline approves (no evidence of skew yet).
+    """
+
+    name = "clock_health"
+    order = "2.2"
+
+    async def check(self, ctx: GateCtx) -> GateResult:
+        cfg = ctx.policy.config.clock_health
+        if not cfg.enabled:
+            return GateResult.approve(metadata={"bypassed": "disabled"})
+        capital_mode = ctx.policy.config.capital_mode
+        if not capital_mode and not cfg.apply_in_paper_mode:
+            return GateResult.approve(metadata={"bypassed": "paper_mode"})
+
+        try:
+            sample = clock_probe.sample_clock(
+                max_skew_ms=cfg.max_monotonic_wall_skew_ms,
+            )
+        except Exception as exc:
+            if (
+                capital_mode
+                and cfg.fail_closed_on_probe_error_in_capital_mode
+            ):
+                return GateResult.reject(
+                    f"clock_health: probe_error: {exc}",
+                    metadata={"kind": "probe_error", "error": str(exc)},
+                )
+            return GateResult.approve(
+                metadata={"probe_error": str(exc)}
+            )
+
+        status = sample["status"]
+        if status == "wall_clock_regression" and cfg.reject_wall_clock_regression:
+            return GateResult.reject(
+                "clock_health: wall_clock_regression detected",
+                metadata={"kind": "wall_clock_regression", "sample": dict(sample)},
+            )
+        if status == "monotonic_wall_skew_exceeded":
+            return GateResult.reject(
+                f"clock_health: monotonic_wall_skew_exceeded "
+                f"(skew_ms={sample['skew_ms']} > "
+                f"{cfg.max_monotonic_wall_skew_ms})",
+                metadata={
+                    "kind": "monotonic_wall_skew_exceeded",
+                    "sample": dict(sample),
+                },
+            )
+        # status is "ok", "first_probe_no_baseline", or
+        # "wall_clock_regression" with reject_wall_clock_regression=False.
+
+        ntp_meta: dict[str, Any] | None = None
+        ntp_required = capital_mode and cfg.require_ntp_sync_in_capital_mode
+        if ntp_required:
+            try:
+                ntp_result = clock_probe.check_ntp_synchronized(
+                    timeout_sec=cfg.timedatectl_timeout_sec,
+                )
+            except Exception as exc:
+                if cfg.fail_closed_on_probe_error_in_capital_mode:
+                    return GateResult.reject(
+                        f"clock_health: ntp_probe error: {exc}",
+                        metadata={
+                            "kind": "ntp_probe_error",
+                            "error": str(exc),
+                            "sample": dict(sample),
+                        },
+                    )
+                ntp_meta = {"ntp_error": str(exc)}
+            else:
+                ntp_meta = dict(ntp_result)
+                ntp_status = ntp_result["status"]
+                if ntp_status != "ok":
+                    return GateResult.reject(
+                        f"clock_health: {ntp_status}",
+                        metadata={
+                            "kind": ntp_status,
+                            "ntp": dict(ntp_result),
+                            "sample": dict(sample),
+                        },
+                    )
+
+        meta: dict[str, Any] = {"sample": dict(sample)}
+        if ntp_meta is not None:
+            meta["ntp"] = ntp_meta
+        return GateResult.approve(metadata=meta)
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1103,8 @@ def default_gate_chain() -> list[Gate]:
         FeeGate(),
         OrderPolicyGate(),
         KillGate(),
+        HostHealthGate(),
+        ClockHealthGate(),
         VenueHealthGate(),
         PoisoningGate(),
         AdverseSelectionGate(),

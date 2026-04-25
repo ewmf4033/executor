@@ -773,3 +773,365 @@ async def test_fee_lookup_longest_prefix_wins():
     bps, src = _fee_lookup(cfg, "kalshi", "MKT-A-001")
     assert bps == Decimal("9")
     assert src == "per_series:MKT-A-"
+
+
+# ===========================================================================
+# Phase 4.16 — HostHealthGate (2.1)
+# ===========================================================================
+
+
+from executor.risk import clock_probe, host_probe
+from executor.risk.config import ClockHealthCfg, HostHealthCfg
+from executor.risk.gates import ClockHealthGate, HostHealthGate
+
+
+def _stub_host_sample(monkeypatch, **overrides):
+    """Default healthy sample (well below caps); overrides apply selectively."""
+    sample = {"disk_pct": 1.0, "inode_pct": 1.0, "swap_pct": 1.0}
+    sample.update(overrides)
+
+    def _fake_sample(*, check_rss=False, check_loadavg=False, **_kw):
+        out = dict(sample)
+        if check_rss:
+            out.setdefault("rss_mb", 0.0)
+        if check_loadavg:
+            out.setdefault("loadavg_1m", 0.0)
+        return out
+
+    monkeypatch.setattr(host_probe, "sample_host", _fake_sample)
+
+
+async def test_host_health_disabled_approves(policy, monkeypatch):
+    # Default cfg has enabled=False.
+    _stub_host_sample(monkeypatch, disk_pct=99.0)  # would breach if it ran
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata.get("bypassed") == "disabled"
+
+
+async def test_host_health_paper_mode_default_bypasses(policy, monkeypatch):
+    _set_cfg(policy, host_health=HostHealthCfg(enabled=True))
+    _stub_host_sample(monkeypatch, disk_pct=99.0)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata.get("bypassed") == "paper_mode"
+
+
+async def test_host_health_disk_over_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        host_health=HostHealthCfg(enabled=True, disk_pct_max=90),
+    )
+    _stub_host_sample(monkeypatch, disk_pct=95.0)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "host_threshold_exceeded"
+    assert r.metadata["breach_field"] == "disk_pct"
+    assert r.metadata["breach_value"] == 95.0
+    assert r.metadata["breach_threshold"] == 90
+
+
+async def test_host_health_inode_over_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        host_health=HostHealthCfg(enabled=True, inode_pct_max=90),
+    )
+    _stub_host_sample(monkeypatch, inode_pct=95.0)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["breach_field"] == "inode_pct"
+
+
+async def test_host_health_swap_over_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        host_health=HostHealthCfg(enabled=True, swap_pct_max=50),
+    )
+    _stub_host_sample(monkeypatch, swap_pct=75.0)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["breach_field"] == "swap_pct"
+
+
+async def test_host_health_probe_error_paper_apply_approves(policy, monkeypatch):
+    """apply_in_paper_mode=True and no capital_mode → probe_error must NOT fail closed."""
+    _set_cfg(
+        policy,
+        host_health=HostHealthCfg(
+            enabled=True,
+            apply_in_paper_mode=True,
+            fail_closed_on_probe_error_in_capital_mode=True,
+        ),
+    )
+
+    def _explode(**_):
+        raise OSError("disk gone")
+    monkeypatch.setattr(host_probe, "sample_host", _explode)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert "probe_error" in r.metadata
+
+
+async def test_host_health_probe_error_capital_fail_closed(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        host_health=HostHealthCfg(
+            enabled=True,
+            fail_closed_on_probe_error_in_capital_mode=True,
+        ),
+    )
+
+    def _explode(**_):
+        raise OSError("disk gone")
+    monkeypatch.setattr(host_probe, "sample_host", _explode)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "probe_error"
+    assert "disk gone" in r.metadata["error"]
+
+
+async def test_host_health_approve_metadata_includes_sample_and_thresholds(
+    policy, monkeypatch,
+):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        host_health=HostHealthCfg(enabled=True),
+    )
+    _stub_host_sample(monkeypatch, disk_pct=10.0, inode_pct=20.0, swap_pct=5.0)
+    r = await HostHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata["sample"]["disk_pct"] == 10.0
+    assert r.metadata["thresholds"]["disk_pct_max"] == 90
+
+
+# ===========================================================================
+# Phase 4.16 — ClockHealthGate (2.2)
+# ===========================================================================
+
+
+def _stub_clock_sample(monkeypatch, **fields):
+    """Stub clock_probe.sample_clock to return a synthesized status dict."""
+    base = {
+        "status": "ok",
+        "wall_ns": 1, "monotonic_ns": 1,
+        "wall_delta_ns": 0, "monotonic_delta_ns": 0,
+        "skew_ms": 0.0, "max_skew_ms": 2000,
+    }
+    base.update(fields)
+    monkeypatch.setattr(clock_probe, "sample_clock", lambda **_kw: dict(base))
+
+
+def _stub_ntp(monkeypatch, status="ok", value="yes", **extra):
+    out = {"status": status, "value": value}
+    out.update(extra)
+    monkeypatch.setattr(
+        clock_probe, "check_ntp_synchronized", lambda **_kw: dict(out),
+    )
+
+
+def _ntp_should_not_run(monkeypatch):
+    def _boom(**_kw):
+        raise AssertionError("timedatectl should NOT have been invoked")
+    monkeypatch.setattr(clock_probe, "check_ntp_synchronized", _boom)
+
+
+async def test_clock_health_disabled_approves(policy, monkeypatch):
+    _stub_clock_sample(monkeypatch, status="wall_clock_regression", wall_delta_ns=-5)
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata.get("bypassed") == "disabled"
+
+
+async def test_clock_health_paper_mode_default_bypasses(policy, monkeypatch):
+    _set_cfg(policy, clock_health=ClockHealthCfg(enabled=True))
+    _stub_clock_sample(monkeypatch, status="wall_clock_regression", wall_delta_ns=-5)
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata.get("bypassed") == "paper_mode"
+
+
+async def test_clock_health_wall_regression_rejects_in_capital(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(enabled=True, reject_wall_clock_regression=True),
+    )
+    _stub_clock_sample(monkeypatch, status="wall_clock_regression", wall_delta_ns=-100)
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "wall_clock_regression"
+
+
+async def test_clock_health_skew_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(enabled=True, max_monotonic_wall_skew_ms=2000),
+    )
+    _stub_clock_sample(
+        monkeypatch,
+        status="monotonic_wall_skew_exceeded",
+        skew_ms=5000.0,
+    )
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "monotonic_wall_skew_exceeded"
+
+
+async def test_clock_health_first_probe_approves_in_capital(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=False,
+        ),
+    )
+    _stub_clock_sample(
+        monkeypatch,
+        status="first_probe_no_baseline",
+        wall_delta_ns=None,
+        monotonic_delta_ns=None,
+        skew_ms=None,
+    )
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_clock_health_ntp_synced_approves_in_capital(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=True,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    _stub_ntp(monkeypatch, status="ok", value="yes")
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata["ntp"]["status"] == "ok"
+
+
+async def test_clock_health_ntp_unsynced_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=True,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    _stub_ntp(monkeypatch, status="ntp_unsynced", value="no")
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "ntp_unsynced"
+
+
+async def test_clock_health_ntp_binary_missing_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=True,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    _stub_ntp(monkeypatch, status="ntp_binary_missing", value=None)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "ntp_binary_missing"
+
+
+async def test_clock_health_ntp_probe_failed_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=True,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    monkeypatch.setattr(
+        clock_probe,
+        "check_ntp_synchronized",
+        lambda **_kw: {"status": "ntp_probe_failed", "returncode": 1, "stderr": "x"},
+    )
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "ntp_probe_failed"
+
+
+async def test_clock_health_ntp_probe_timeout_rejects(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=True,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    monkeypatch.setattr(
+        clock_probe,
+        "check_ntp_synchronized",
+        lambda **_kw: {"status": "ntp_probe_timeout", "timeout_sec": 2.0},
+    )
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "ntp_probe_timeout"
+
+
+async def test_clock_health_ntp_not_called_in_paper_apply_mode(policy, monkeypatch):
+    """apply_in_paper_mode lets the gate run in paper mode, but capital_mode
+    is still False so timedatectl must NOT be invoked."""
+    _set_cfg(
+        policy,
+        clock_health=ClockHealthCfg(
+            enabled=True,
+            apply_in_paper_mode=True,
+            require_ntp_sync_in_capital_mode=True,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_clock_health_ntp_not_called_when_require_disabled(policy, monkeypatch):
+    """Capital mode but require_ntp_sync_in_capital_mode=False → no timedatectl."""
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=False,
+        ),
+    )
+    _stub_clock_sample(monkeypatch)
+    _ntp_should_not_run(monkeypatch)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_clock_health_approve_metadata_includes_sample(policy, monkeypatch):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        clock_health=ClockHealthCfg(
+            enabled=True, require_ntp_sync_in_capital_mode=False,
+        ),
+    )
+    _stub_clock_sample(monkeypatch, status="ok", skew_ms=12.5, wall_delta_ns=999)
+    r = await ClockHealthGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata["sample"]["status"] == "ok"
+    assert r.metadata["sample"]["skew_ms"] == 12.5

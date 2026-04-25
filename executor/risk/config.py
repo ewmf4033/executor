@@ -157,6 +157,42 @@ class OrderPolicyCfg:
 
 
 @dataclass(frozen=True, slots=True)
+class HostHealthCfg:
+    """Phase 4.16 — host-health admission gate.
+
+    Disabled by default. Paper-bypassed unless apply_in_paper_mode=True.
+    Probes are point-sampled stdlib only (no psutil, no background task).
+    rss_mb_max=0 disables the RSS check; loadavg_1m_max=0 disables loadavg.
+    """
+    enabled: bool = False
+    apply_in_paper_mode: bool = False
+    disk_pct_max: int = 90
+    inode_pct_max: int = 90
+    swap_pct_max: int = 50
+    rss_mb_max: int = 0
+    loadavg_1m_max: float = 0.0
+    fail_closed_on_probe_error_in_capital_mode: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ClockHealthCfg:
+    """Phase 4.16 — clock-health admission gate.
+
+    Disabled by default. Paper-bypassed unless apply_in_paper_mode=True.
+    Detects monotonic/wall-clock skew, wall-clock regressions, and (in
+    capital mode only, if require_ntp_sync_in_capital_mode=True) NTP
+    synchronization via the `timedatectl` binary.
+    """
+    enabled: bool = False
+    apply_in_paper_mode: bool = False
+    require_ntp_sync_in_capital_mode: bool = True
+    max_monotonic_wall_skew_ms: int = 2000
+    reject_wall_clock_regression: bool = True
+    timedatectl_timeout_sec: float = 2.0
+    fail_closed_on_probe_error_in_capital_mode: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramWatchdogCfg:
     """Phase 4.14c — Telegram polling watchdog.
 
@@ -212,6 +248,8 @@ class RiskConfig:
     telegram: TelegramCfg = field(default_factory=TelegramCfg)
     fee_gate: FeeGateCfg = field(default_factory=FeeGateCfg)
     order_policy: OrderPolicyCfg = field(default_factory=OrderPolicyCfg)
+    host_health: HostHealthCfg = field(default_factory=HostHealthCfg)
+    clock_health: ClockHealthCfg = field(default_factory=ClockHealthCfg)
 
     def fingerprint(self) -> str:
         """Stable SHA256 of the config; used for CONFIG_RELOADED payload."""
@@ -321,6 +359,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
             telegram=_parse_telegram(raw.get("telegram", {})),
             fee_gate=_parse_fee_gate(raw.get("fee_gate", {})),
             order_policy=_parse_order_policy(raw.get("order_policy", {})),
+            host_health=_parse_host_health(raw.get("host_health", {})),
+            clock_health=_parse_clock_health(raw.get("clock_health", {})),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
@@ -508,6 +548,36 @@ def _parse_telegram(d: dict[str, Any]) -> TelegramCfg:
     return TelegramCfg(watchdog=_parse_telegram_watchdog(d.get("watchdog", {})))
 
 
+def _require_non_negative_float(
+    value: Any, field_name: str, *, max_val: float | None = None
+) -> float:
+    """Coerce to float; require value >= 0; optional upper bound."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be a number, got {value!r}") from exc
+    if v < 0:
+        raise ConfigError(f"{field_name} must be non-negative, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_positive_float(
+    value: Any, field_name: str, *, max_val: float | None = None
+) -> float:
+    """Coerce to float; require value > 0; optional upper bound."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be a number, got {value!r}") from exc
+    if v <= 0:
+        raise ConfigError(f"{field_name} must be positive, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
 def _require_non_negative_decimal(value: Any, field_name: str) -> Decimal:
     """Coerce to Decimal; require value >= 0."""
     try:
@@ -583,6 +653,70 @@ def _parse_order_policy(d: dict[str, Any]) -> OrderPolicyCfg:
         ),
         require_buy_max_cost_for_buys_in_capital_mode=bool(
             d.get("require_buy_max_cost_for_buys_in_capital_mode", True)
+        ),
+    )
+
+
+def _parse_host_health(d: dict[str, Any]) -> HostHealthCfg:
+    """Phase 4.16: parse host_health config.
+
+    Percent thresholds (disk/inode/swap) bounded to [0, 100]. rss_mb_max
+    and loadavg_1m_max accept 0 to disable; otherwise non-negative.
+    """
+    return HostHealthCfg(
+        enabled=bool(d.get("enabled", False)),
+        apply_in_paper_mode=bool(d.get("apply_in_paper_mode", False)),
+        disk_pct_max=_require_non_negative_int(
+            d.get("disk_pct_max", 90), "host_health.disk_pct_max", max_val=100
+        ),
+        inode_pct_max=_require_non_negative_int(
+            d.get("inode_pct_max", 90), "host_health.inode_pct_max", max_val=100
+        ),
+        swap_pct_max=_require_non_negative_int(
+            d.get("swap_pct_max", 50), "host_health.swap_pct_max", max_val=100
+        ),
+        rss_mb_max=_require_non_negative_int(
+            d.get("rss_mb_max", 0), "host_health.rss_mb_max", max_val=10_000_000
+        ),
+        loadavg_1m_max=_require_non_negative_float(
+            d.get("loadavg_1m_max", 0.0),
+            "host_health.loadavg_1m_max",
+            max_val=10_000.0,
+        ),
+        fail_closed_on_probe_error_in_capital_mode=bool(
+            d.get("fail_closed_on_probe_error_in_capital_mode", True)
+        ),
+    )
+
+
+def _parse_clock_health(d: dict[str, Any]) -> ClockHealthCfg:
+    """Phase 4.16: parse clock_health config.
+
+    max_monotonic_wall_skew_ms must be > 0; the gate rejects when an
+    observed skew exceeds this. timedatectl_timeout_sec must be > 0
+    (subprocess timeout).
+    """
+    return ClockHealthCfg(
+        enabled=bool(d.get("enabled", False)),
+        apply_in_paper_mode=bool(d.get("apply_in_paper_mode", False)),
+        require_ntp_sync_in_capital_mode=bool(
+            d.get("require_ntp_sync_in_capital_mode", True)
+        ),
+        max_monotonic_wall_skew_ms=_require_positive_int(
+            d.get("max_monotonic_wall_skew_ms", 2000),
+            "clock_health.max_monotonic_wall_skew_ms",
+            max_val=86_400_000,
+        ),
+        reject_wall_clock_regression=bool(
+            d.get("reject_wall_clock_regression", True)
+        ),
+        timedatectl_timeout_sec=_require_positive_float(
+            d.get("timedatectl_timeout_sec", 2.0),
+            "clock_health.timedatectl_timeout_sec",
+            max_val=60.0,
+        ),
+        fail_closed_on_probe_error_in_capital_mode=bool(
+            d.get("fail_closed_on_probe_error_in_capital_mode", True)
         ),
     )
 

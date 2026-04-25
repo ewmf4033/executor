@@ -42,8 +42,10 @@ async def test_three_strategies_mixed_outcomes(policy_with_bus):
     # cfg.dead_man.enabled is False (default) but still counts as passed.
     # Phase 4.15 added FeeGate (1.5) and OrderPolicyGate (1.6); both
     # bypass in paper mode (apply_in_paper_mode=false default) and count
-    # as passed. 14 -> 15 (4.14b) -> 17 (4.15).
-    assert len(va.gates_passed) == 17
+    # as passed. Phase 4.16 added HostHealthGate (2.1) and
+    # ClockHealthGate (2.2); both bypass when enabled=false (default).
+    # 14 -> 15 (4.14b) -> 17 (4.15) -> 19 (4.16).
+    assert len(va.gates_passed) == 19
     assert "structural" in va.gate_timings_ms
     assert "clip_floor" in va.gate_timings_ms
 

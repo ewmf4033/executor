@@ -415,3 +415,76 @@ def test_backwards_compat_omitted_sections(tmp_path: Path):
     assert cfg.fee_gate.enabled is True
     assert cfg.fee_gate.default_fee_bps == Decimal("0")
     assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.16 — host_health / clock_health
+# ---------------------------------------------------------------------------
+
+
+def test_host_health_defaults_parse():
+    cfg = load_config(None)
+    assert cfg.host_health.enabled is False
+    assert cfg.host_health.apply_in_paper_mode is False
+    assert cfg.host_health.disk_pct_max == 90
+    assert cfg.host_health.inode_pct_max == 90
+    assert cfg.host_health.swap_pct_max == 50
+    assert cfg.host_health.rss_mb_max == 0
+    assert cfg.host_health.loadavg_1m_max == 0.0
+    assert cfg.host_health.fail_closed_on_probe_error_in_capital_mode is True
+
+
+def test_host_health_rejects_negative_threshold(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"host_health": {"disk_pct_max": -1}}))
+    with pytest.raises(ConfigError, match="disk_pct_max"):
+        load_config(p)
+
+
+def test_host_health_rejects_out_of_range_pct(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"host_health": {"swap_pct_max": 200}}))
+    with pytest.raises(ConfigError, match="swap_pct_max"):
+        load_config(p)
+
+
+def test_clock_health_defaults_parse():
+    cfg = load_config(None)
+    assert cfg.clock_health.enabled is False
+    assert cfg.clock_health.apply_in_paper_mode is False
+    assert cfg.clock_health.require_ntp_sync_in_capital_mode is True
+    assert cfg.clock_health.max_monotonic_wall_skew_ms == 2000
+    assert cfg.clock_health.reject_wall_clock_regression is True
+    assert cfg.clock_health.timedatectl_timeout_sec == 2.0
+    assert cfg.clock_health.fail_closed_on_probe_error_in_capital_mode is True
+
+
+def test_clock_health_rejects_zero_skew(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"clock_health": {"max_monotonic_wall_skew_ms": 0}}))
+    with pytest.raises(ConfigError, match="max_monotonic_wall_skew_ms"):
+        load_config(p)
+
+
+def test_clock_health_rejects_zero_timedatectl_timeout(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"clock_health": {"timedatectl_timeout_sec": 0}}))
+    with pytest.raises(ConfigError, match="timedatectl_timeout_sec"):
+        load_config(p)
+
+
+def test_risk_config_includes_host_clock_sections():
+    cfg = RiskConfig()
+    assert hasattr(cfg, "host_health")
+    assert hasattr(cfg, "clock_health")
+
+
+def test_backwards_compat_omitted_host_clock_sections(tmp_path: Path):
+    """A YAML missing host_health/clock_health still loads with defaults."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"per_intent": {"max_intent_dollars": "100.00"}}))
+    cfg = load_config(p)
+    assert cfg.host_health.enabled is False
+    assert cfg.host_health.disk_pct_max == 90
+    assert cfg.clock_health.enabled is False
+    assert cfg.clock_health.max_monotonic_wall_skew_ms == 2000

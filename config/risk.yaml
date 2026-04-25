@@ -119,3 +119,30 @@ order_policy:
   forbid_reduce_only: false
   require_order_group_id_in_capital_mode: true
   require_buy_max_cost_for_buys_in_capital_mode: true
+
+# Phase 4.16 — host-health admission gate (slot 2.1). stdlib point-sample
+# probes only (no psutil). Disabled and paper-bypassed by default. In
+# capital mode, threshold breach or unexpected probe error fails closed.
+# rss_mb_max=0 disables the RSS check; loadavg_1m_max=0 disables loadavg.
+host_health:
+  enabled: false
+  apply_in_paper_mode: false
+  disk_pct_max: 90
+  inode_pct_max: 90
+  swap_pct_max: 50
+  rss_mb_max: 0
+  loadavg_1m_max: 0
+  fail_closed_on_probe_error_in_capital_mode: true
+
+# Phase 4.16 — clock-health admission gate (slot 2.2). Detects wall-clock
+# regression and monotonic/wall skew between successive probes; in capital
+# mode (require_ntp_sync_in_capital_mode=true) also probes timedatectl
+# for NTP sync. Paper mode never invokes timedatectl.
+clock_health:
+  enabled: false
+  apply_in_paper_mode: false
+  require_ntp_sync_in_capital_mode: true
+  max_monotonic_wall_skew_ms: 2000
+  reject_wall_clock_regression: true
+  timedatectl_timeout_sec: 2.0
+  fail_closed_on_probe_error_in_capital_mode: true
