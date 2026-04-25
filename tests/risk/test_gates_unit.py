@@ -462,3 +462,314 @@ async def test_dead_man_enabled_armed_boundary_exact_timeout_rejects(policy):
     )
     r2 = await DeadManGate().check(at_deadline_ctx)
     assert r2.decision == GateDecision.APPROVE
+
+
+# ===========================================================================
+# Phase 4.15 — FeeGate (1.5)
+# ===========================================================================
+
+
+from dataclasses import replace as _dc_replace
+
+from executor.risk.config import FeeGateCfg, OrderPolicyCfg
+from executor.risk.gates import FeeGate, OrderPolicyGate, _fee_lookup
+
+
+def _set_cfg(policy, **kw):
+    """Replace policy.config in-place with overrides applied.
+
+    RiskPolicy reads cfg via property -> ConfigManager.config, so we mutate
+    the manager's _config via dataclass.replace.
+    """
+    new = _dc_replace(policy.config, **kw)
+    policy._cfg_mgr._config = new
+    return new
+
+
+async def test_fee_gate_disabled_approves(policy):
+    _set_cfg(policy, fee_gate=FeeGateCfg(enabled=False))
+    intent = make_intent()
+    r = await FeeGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata.get("bypassed") == "disabled"
+
+
+async def test_fee_gate_paper_mode_default_bypasses(policy):
+    # capital_mode defaults to False; apply_in_paper_mode defaults to False.
+    _set_cfg(policy, fee_gate=FeeGateCfg(enabled=True, apply_in_paper_mode=False))
+    r = await FeeGate().check(await _ctx(policy, make_intent()))
+    assert r.decision == GateDecision.APPROVE
+    assert r.metadata.get("bypassed") == "paper_mode"
+
+
+async def test_fee_gate_active_rejects_negative_executable_edge(policy):
+    # edge=0.001, size=10 => gross=0.01; fee=10bps of 10 = 0.01 => executable=0.
+    leg = make_leg(edge=0.001, size=10)
+    intent = make_intent(legs=[leg])
+    _set_cfg(
+        policy,
+        fee_gate=FeeGateCfg(
+            enabled=True, apply_in_paper_mode=True,
+            default_fee_bps=Decimal("10"),
+        ),
+    )
+    r = await FeeGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert "fee_gate" in r.reason
+    assert r.metadata["kind"] == "fee_negative_edge"
+
+
+async def test_fee_gate_active_approves_positive_executable_edge(policy):
+    # edge=0.05, size=1000 => gross=50; fee=10bps = 1; safety=0; executable=49.
+    leg = make_leg(edge=0.05, size=1000)
+    intent = make_intent(legs=[leg])
+    _set_cfg(
+        policy,
+        fee_gate=FeeGateCfg(
+            enabled=True, apply_in_paper_mode=True,
+            default_fee_bps=Decimal("10"),
+        ),
+    )
+    r = await FeeGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+    legs_meta = r.metadata["legs"]
+    assert len(legs_meta) == 1
+    lm = legs_meta[0]
+    assert Decimal(lm["gross_edge_dollars"]) == Decimal("50.000")
+    assert Decimal(lm["estimated_fee_dollars"]) == Decimal("1.0000")
+    assert Decimal(lm["safety_margin_dollars"]) == Decimal("0")
+    assert Decimal(lm["executable_edge_dollars"]) == Decimal("49.0000")
+    assert lm["fee_source"] == "default"
+
+
+async def test_fee_gate_unit_assertion(policy):
+    """Spec-pinned assertion:
+    edge_estimate=0.05, target_exposure=1000, fee_bps=10, safety=0
+    => gross=50, fee=1, executable=49"""
+    leg = make_leg(edge=0.05, size=1000)
+    intent = make_intent(legs=[leg])
+    _set_cfg(
+        policy,
+        fee_gate=FeeGateCfg(
+            enabled=True, apply_in_paper_mode=True,
+            default_fee_bps=Decimal("10"),
+            safety_margin_bps=Decimal("0"),
+        ),
+    )
+    r = await FeeGate().check(await _ctx(policy, intent))
+    lm = r.metadata["legs"][0]
+    assert Decimal(lm["gross_edge_dollars"]) == Decimal("50.000")
+    assert Decimal(lm["estimated_fee_dollars"]) == Decimal("1.0000")
+    assert Decimal(lm["executable_edge_dollars"]) == Decimal("49.0000")
+
+
+async def test_fee_gate_per_market_override_wins(policy):
+    leg = make_leg(market_id="MKT-1", edge=0.05, size=1000)
+    intent = make_intent(legs=[leg])
+    _set_cfg(
+        policy,
+        fee_gate=FeeGateCfg(
+            enabled=True, apply_in_paper_mode=True,
+            default_fee_bps=Decimal("100"),
+            per_series_fee_bps={"MKT-": Decimal("50")},
+            per_market_fee_bps={"kalshi:MKT-1": Decimal("7")},
+        ),
+    )
+    r = await FeeGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+    lm = r.metadata["legs"][0]
+    assert lm["fee_bps"] == "7"
+    assert lm["fee_source"] == "per_market"
+
+
+async def test_fee_gate_per_series_override_wins_over_default(policy):
+    leg = make_leg(market_id="MKT-1", edge=0.05, size=1000)
+    intent = make_intent(legs=[leg])
+    _set_cfg(
+        policy,
+        fee_gate=FeeGateCfg(
+            enabled=True, apply_in_paper_mode=True,
+            default_fee_bps=Decimal("100"),
+            per_series_fee_bps={"MKT-": Decimal("3")},
+        ),
+    )
+    r = await FeeGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+    lm = r.metadata["legs"][0]
+    assert lm["fee_bps"] == "3"
+    assert lm["fee_source"] == "per_series:MKT-"
+
+
+async def test_fee_gate_metadata_includes_all_fields(policy):
+    leg = make_leg(edge=0.05, size=1000)
+    intent = make_intent(legs=[leg])
+    _set_cfg(
+        policy,
+        fee_gate=FeeGateCfg(
+            enabled=True, apply_in_paper_mode=True,
+            default_fee_bps=Decimal("5"),
+            safety_margin_bps=Decimal("2"),
+        ),
+    )
+    r = await FeeGate().check(await _ctx(policy, intent))
+    lm = r.metadata["legs"][0]
+    for key in (
+        "fee_bps", "fee_source", "gross_edge_dollars",
+        "estimated_fee_dollars", "safety_margin_dollars",
+        "executable_edge_dollars", "leg_id",
+    ):
+        assert key in lm
+
+
+# ===========================================================================
+# Phase 4.15 — OrderPolicyGate (1.6)
+# ===========================================================================
+
+
+def _leg_with_meta(meta, **kw):
+    leg = make_leg(**kw)
+    return _dc_replace(leg, metadata=meta)
+
+
+def _intent_with_leg(leg):
+    """Build a BasketIntent directly so leg.metadata survives.
+
+    The conftest make_intent helper routes through Intent.single, which
+    drops Leg.metadata unless leg_metadata= is passed explicitly. This
+    helper preserves it.
+    """
+    from executor.core.intent import Atomicity, BasketIntent
+    from uuid6 import uuid7
+    now = time.time_ns()
+    return BasketIntent(
+        intent_id=str(uuid7()),
+        strategy_id="s1",
+        legs=(leg,),
+        atomicity=Atomicity.INDEPENDENT,
+        max_slippage_per_leg=Decimal("0.02"),
+        basket_target_exposure=leg.target_exposure,
+        created_ts=now,
+        expires_ts=now + 60 * 1_000_000_000,
+    )
+
+
+async def test_order_policy_disabled_approves(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg(enabled=False))
+    intent = _intent_with_leg(_leg_with_meta({"tif": "GTC", "post_only": True}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_order_policy_paper_mode_missing_metadata_approves(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg())  # defaults
+    intent = _intent_with_leg(_leg_with_meta({}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_order_policy_paper_mode_explicit_ioc_approves(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg())
+    intent = _intent_with_leg(_leg_with_meta({"tif": "IOC"}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_order_policy_paper_mode_gtc_rejects(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg())
+    intent = _intent_with_leg(_leg_with_meta({"tif": "GTC"}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "tif_not_allowed"
+
+
+async def test_order_policy_paper_mode_post_only_rejects(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg())
+    intent = _intent_with_leg(_leg_with_meta({"post_only": True}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "post_only_forbidden"
+
+
+async def test_order_policy_paper_mode_reduce_only_allowed_when_not_forbidden(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg(forbid_reduce_only=False))
+    intent = _intent_with_leg(_leg_with_meta({"reduce_only": True}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_order_policy_paper_mode_reduce_only_rejected_when_forbidden(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg(forbid_reduce_only=True))
+    intent = _intent_with_leg(_leg_with_meta({"reduce_only": True}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "reduce_only_forbidden"
+
+
+async def test_order_policy_capital_mode_missing_order_group_id_rejects(policy):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        order_policy=OrderPolicyCfg(),
+    )
+    intent = _intent_with_leg(_leg_with_meta({"tif": "IOC", "buy_max_cost": "100"}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "order_group_id_missing"
+
+
+async def test_order_policy_capital_mode_buy_missing_buy_max_cost_rejects(policy):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        order_policy=OrderPolicyCfg(),
+    )
+    leg = _leg_with_meta(
+        {"tif": "IOC", "order_group_id": "grp-1"},
+        side=Side.BUY,
+    )
+    intent = _intent_with_leg(leg)
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.REJECT
+    assert r.metadata["kind"] == "buy_max_cost_missing"
+
+
+async def test_order_policy_capital_mode_buy_with_required_meta_approves(policy):
+    _set_cfg(
+        policy,
+        capital_mode=True,
+        order_policy=OrderPolicyCfg(),
+    )
+    leg = _leg_with_meta(
+        {"tif": "IOC", "order_group_id": "grp-1", "buy_max_cost": "100.00"},
+        side=Side.BUY,
+    )
+    intent = _intent_with_leg(leg)
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_order_policy_tif_lowercase_normalizes(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg())
+    intent = _intent_with_leg(_leg_with_meta({"tif": "ioc"}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_order_policy_time_in_force_alias_recognized(policy):
+    _set_cfg(policy, order_policy=OrderPolicyCfg())
+    intent = _intent_with_leg(_leg_with_meta({"time_in_force": "fok"}))
+    r = await OrderPolicyGate().check(await _ctx(policy, intent))
+    assert r.decision == GateDecision.APPROVE
+
+
+async def test_fee_lookup_longest_prefix_wins():
+    cfg = FeeGateCfg(
+        default_fee_bps=Decimal("1"),
+        per_series_fee_bps={
+            "MKT-": Decimal("5"),
+            "MKT-A-": Decimal("9"),
+        },
+    )
+    bps, src = _fee_lookup(cfg, "kalshi", "MKT-A-001")
+    assert bps == Decimal("9")
+    assert src == "per_series:MKT-A-"

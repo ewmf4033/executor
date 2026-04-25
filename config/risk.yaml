@@ -95,3 +95,27 @@ telegram:
     max_restarts: 3
     restart_window_sec: 300
     escalate_on_max: true
+
+# Phase 4.15 — fee-aware executable-edge gate (slot 1.5).
+# bps-of-notional placeholder; Phase 5a replaces with venue-native fees.
+# In paper mode the gate is bypassed unless apply_in_paper_mode=true.
+fee_gate:
+  enabled: true
+  apply_in_paper_mode: false
+  default_fee_bps: "0"
+  safety_margin_bps: "0"
+  per_market_fee_bps: {}
+  per_series_fee_bps: {}
+
+# Phase 4.15 — order-policy gate (slot 1.6). Validates leg.metadata
+# bridge keys: tif/time_in_force, order_group_id, buy_max_cost,
+# post_only, reduce_only. Paper mode is permissive about absence of
+# metadata, strict about explicit unsafe metadata.
+order_policy:
+  enabled: true
+  apply_in_paper_mode: false
+  allowed_time_in_force: ["IOC", "FOK"]
+  forbid_post_only: true
+  forbid_reduce_only: false
+  require_order_group_id_in_capital_mode: true
+  require_buy_max_cost_for_buys_in_capital_mode: true

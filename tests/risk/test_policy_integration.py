@@ -38,10 +38,12 @@ async def test_three_strategies_mixed_outcomes(policy_with_bus):
     vc = await policy.evaluate(c)
 
     assert va.admitted is True and va.reject_gate is None
-    # Phase 4.14b added DeadManGate (order 8.5); it bypasses when
-    # cfg.dead_man.enabled is False (the default) so it is counted as a
-    # passed gate. 14 -> 15.
-    assert len(va.gates_passed) == 15
+    # Phase 4.14b added DeadManGate (order 8.5) — bypasses when
+    # cfg.dead_man.enabled is False (default) but still counts as passed.
+    # Phase 4.15 added FeeGate (1.5) and OrderPolicyGate (1.6); both
+    # bypass in paper mode (apply_in_paper_mode=false default) and count
+    # as passed. 14 -> 15 (4.14b) -> 17 (4.15).
+    assert len(va.gates_passed) == 17
     assert "structural" in va.gate_timings_ms
     assert "clip_floor" in va.gate_timings_ms
 

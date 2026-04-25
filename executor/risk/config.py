@@ -121,6 +121,42 @@ class DeadManCfg:
 
 
 @dataclass(frozen=True, slots=True)
+class FeeGateCfg:
+    """Phase 4.15 — fee-aware executable-edge gate (slot 1.5).
+
+    bps-of-notional is intentionally a placeholder; Phase 5a will replace
+    the bps formula with a venue-native maker/taker fee estimator without
+    restructuring the gate. Lookup precedence:
+      1. per_market_fee_bps["venue:market_id"]
+      2. per_series_fee_bps[prefix] (longest matching prefix on market_id)
+      3. default_fee_bps
+    """
+    enabled: bool = True
+    apply_in_paper_mode: bool = False
+    default_fee_bps: Decimal = Decimal("0")
+    safety_margin_bps: Decimal = Decimal("0")
+    per_market_fee_bps: dict[str, Decimal] = field(default_factory=dict)
+    per_series_fee_bps: dict[str, Decimal] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class OrderPolicyCfg:
+    """Phase 4.15 — order-policy gate (slot 1.6).
+
+    Validates leg.metadata for venue-write shape. Paper mode is
+    permissive about ABSENCE of metadata but strict about PRESENCE of
+    explicitly unsafe metadata. Capital mode adds required-key checks.
+    """
+    enabled: bool = True
+    apply_in_paper_mode: bool = False
+    allowed_time_in_force: tuple[str, ...] = ("IOC", "FOK")
+    forbid_post_only: bool = True
+    forbid_reduce_only: bool = False
+    require_order_group_id_in_capital_mode: bool = True
+    require_buy_max_cost_for_buys_in_capital_mode: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramWatchdogCfg:
     """Phase 4.14c — Telegram polling watchdog.
 
@@ -174,6 +210,8 @@ class RiskConfig:
     attribution: AttributionCfg = field(default_factory=AttributionCfg)
     dead_man: DeadManCfg = field(default_factory=DeadManCfg)
     telegram: TelegramCfg = field(default_factory=TelegramCfg)
+    fee_gate: FeeGateCfg = field(default_factory=FeeGateCfg)
+    order_policy: OrderPolicyCfg = field(default_factory=OrderPolicyCfg)
 
     def fingerprint(self) -> str:
         """Stable SHA256 of the config; used for CONFIG_RELOADED payload."""
@@ -281,6 +319,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
             attribution=_parse_attribution(raw.get("attribution", {})),
             dead_man=_parse_dead_man(raw.get("dead_man", {})),
             telegram=_parse_telegram(raw.get("telegram", {})),
+            fee_gate=_parse_fee_gate(raw.get("fee_gate", {})),
+            order_policy=_parse_order_policy(raw.get("order_policy", {})),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
@@ -466,6 +506,85 @@ def _parse_telegram_watchdog(d: dict[str, Any]) -> TelegramWatchdogCfg:
 
 def _parse_telegram(d: dict[str, Any]) -> TelegramCfg:
     return TelegramCfg(watchdog=_parse_telegram_watchdog(d.get("watchdog", {})))
+
+
+def _require_non_negative_decimal(value: Any, field_name: str) -> Decimal:
+    """Coerce to Decimal; require value >= 0."""
+    try:
+        v = Decimal(str(value))
+    except Exception as exc:
+        raise ConfigError(f"{field_name} must be a number, got {value!r}") from exc
+    if v < 0:
+        raise ConfigError(f"{field_name} must be non-negative, got {v}")
+    return v
+
+
+def _parse_fee_gate(d: dict[str, Any]) -> FeeGateCfg:
+    """Phase 4.15: parse fee_gate config.
+
+    Enforces non-negative bps for default, safety margin, and every
+    per-market / per-series override.
+    """
+    enabled = bool(d.get("enabled", True))
+    apply_in_paper_mode = bool(d.get("apply_in_paper_mode", False))
+    default_fee_bps = _require_non_negative_decimal(
+        d.get("default_fee_bps", 0), "fee_gate.default_fee_bps"
+    )
+    safety_margin_bps = _require_non_negative_decimal(
+        d.get("safety_margin_bps", 0), "fee_gate.safety_margin_bps"
+    )
+    per_market: dict[str, Decimal] = {}
+    for k, v in (d.get("per_market_fee_bps") or {}).items():
+        per_market[str(k)] = _require_non_negative_decimal(
+            v, f"fee_gate.per_market_fee_bps[{k!r}]"
+        )
+    per_series: dict[str, Decimal] = {}
+    for k, v in (d.get("per_series_fee_bps") or {}).items():
+        per_series[str(k)] = _require_non_negative_decimal(
+            v, f"fee_gate.per_series_fee_bps[{k!r}]"
+        )
+    return FeeGateCfg(
+        enabled=enabled,
+        apply_in_paper_mode=apply_in_paper_mode,
+        default_fee_bps=default_fee_bps,
+        safety_margin_bps=safety_margin_bps,
+        per_market_fee_bps=per_market,
+        per_series_fee_bps=per_series,
+    )
+
+
+def _parse_order_policy(d: dict[str, Any]) -> OrderPolicyCfg:
+    """Phase 4.15: parse order_policy config.
+
+    allowed_time_in_force is normalized to uppercase. An empty list is
+    rejected — that would mean every intent is unconditionally rejected.
+    """
+    enabled = bool(d.get("enabled", True))
+    apply_in_paper_mode = bool(d.get("apply_in_paper_mode", False))
+    raw_tif = d.get("allowed_time_in_force", ("IOC", "FOK"))
+    if not isinstance(raw_tif, (list, tuple)):
+        raise ConfigError(
+            f"order_policy.allowed_time_in_force must be a list, got {type(raw_tif).__name__}"
+        )
+    if len(raw_tif) == 0:
+        raise ConfigError(
+            "order_policy.allowed_time_in_force must be non-empty; "
+            "empty list would reject every intent"
+        )
+    allowed = tuple(str(x).upper() for x in raw_tif)
+    return OrderPolicyCfg(
+        enabled=enabled,
+        apply_in_paper_mode=apply_in_paper_mode,
+        allowed_time_in_force=allowed,
+        forbid_post_only=bool(d.get("forbid_post_only", True)),
+        forbid_reduce_only=bool(d.get("forbid_reduce_only", False)),
+        require_order_group_id_in_capital_mode=bool(
+            d.get("require_order_group_id_in_capital_mode", True)
+        ),
+        require_buy_max_cost_for_buys_in_capital_mode=bool(
+            d.get("require_buy_max_cost_for_buys_in_capital_mode", True)
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

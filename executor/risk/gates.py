@@ -8,6 +8,8 @@ recording clip history / emitting audit events.
 
 Gate order (per Decision 3):
   1   Structural
+  1.5 Fee                (Phase 4.15 — admission-time fee/edge protection)
+  1.6 OrderPolicy        (Phase 4.15 — leg.metadata venue-write shape)
   2   KillSwitch
   2.5 VenueHealth
   2.6 Poisoning          (0g — extended from the spec's adverse-selection slot)
@@ -20,6 +22,7 @@ Gate order (per Decision 3):
   7   GlobalPortfolio
   7.5 StrategyAllocation
   8   DailyLoss
+  8.5 DeadMan            (Phase 4.14b — operator availability)
   9   ClipFloor
 """
 from __future__ import annotations
@@ -120,6 +123,252 @@ class StructuralGate(Gate):
                     f"edge_estimate {leg.edge_estimate} < min {min_edge} for "
                     f"{intent.strategy_id}"
                 )
+        return GateResult.approve()
+
+
+# ---------------------------------------------------------------------------
+# 1.5 Fee-aware executable-edge gate (Phase 4.15)
+# ---------------------------------------------------------------------------
+
+
+_BPS_DENOM = Decimal("10000")
+
+
+def _fee_lookup(
+    cfg: "Any",
+    venue: str,
+    market_id: str,
+) -> tuple[Decimal, str]:
+    """Resolve fee_bps for a leg with precedence:
+      1. per_market_fee_bps["venue:market_id"]
+      2. per_series_fee_bps[prefix]    (longest prefix match on market_id)
+      3. default_fee_bps
+
+    Returns (fee_bps, fee_source) where fee_source is one of
+    "per_market" | "per_series:<prefix>" | "default".
+
+    Encapsulated as a free function so Phase 5a can replace the body
+    with a venue-native fee estimator without touching the gate.
+    """
+    market_key = f"{venue}:{market_id}"
+    if market_key in cfg.per_market_fee_bps:
+        return cfg.per_market_fee_bps[market_key], "per_market"
+    # Longest matching prefix wins so "MKT-A-" beats "MKT-".
+    best_prefix: str | None = None
+    for prefix in cfg.per_series_fee_bps:
+        if market_id.startswith(prefix):
+            if best_prefix is None or len(prefix) > len(best_prefix):
+                best_prefix = prefix
+    if best_prefix is not None:
+        return cfg.per_series_fee_bps[best_prefix], f"per_series:{best_prefix}"
+    return cfg.default_fee_bps, "default"
+
+
+class FeeGate(Gate):
+    """Gate 1.5 — Phase 4.15 fee-aware executable-edge gate.
+
+    Computes (in dollars):
+      gross_edge       = leg.edge_estimate * leg.target_exposure
+      estimated_fee    = leg.target_exposure * fee_bps / 10000
+      safety_margin    = leg.target_exposure * safety_margin_bps / 10000
+      executable_edge  = gross_edge - estimated_fee - safety_margin
+
+    Rejects the intent if any leg has executable_edge_dollars <= 0.
+
+    Bypasses entirely when:
+      - cfg.fee_gate.enabled is False, or
+      - capital_mode is False AND apply_in_paper_mode is False.
+
+    bps-of-notional is a Phase 4.15 placeholder. Phase 5a replaces
+    `_fee_lookup` with a venue-native maker/taker estimator.
+    """
+
+    name = "fee_gate"
+    order = "1.5"
+
+    async def check(self, ctx: GateCtx) -> GateResult:
+        cfg = ctx.policy.config.fee_gate
+        if not cfg.enabled:
+            return GateResult.approve(metadata={"bypassed": "disabled"})
+        if not ctx.policy.config.capital_mode and not cfg.apply_in_paper_mode:
+            return GateResult.approve(metadata={"bypassed": "paper_mode"})
+
+        intent = ctx.current_intent
+        leg_metas: list[dict[str, Any]] = []
+        for leg in intent.legs:
+            fee_bps, fee_source = _fee_lookup(cfg, leg.venue, leg.market_id)
+            gross_edge_dollars = leg.edge_estimate * leg.target_exposure
+            estimated_fee_dollars = (
+                leg.target_exposure * fee_bps / _BPS_DENOM
+            )
+            safety_margin_dollars = (
+                leg.target_exposure * cfg.safety_margin_bps / _BPS_DENOM
+            )
+            executable_edge_dollars = (
+                gross_edge_dollars - estimated_fee_dollars - safety_margin_dollars
+            )
+            leg_meta = {
+                "leg_id": leg.leg_id,
+                "fee_bps": str(fee_bps),
+                "fee_source": fee_source,
+                "gross_edge_dollars": str(gross_edge_dollars),
+                "estimated_fee_dollars": str(estimated_fee_dollars),
+                "safety_margin_dollars": str(safety_margin_dollars),
+                "executable_edge_dollars": str(executable_edge_dollars),
+            }
+            leg_metas.append(leg_meta)
+            if executable_edge_dollars <= 0:
+                return GateResult.reject(
+                    f"fee_gate: executable_edge_dollars={executable_edge_dollars} "
+                    f"<= 0 for leg {leg.leg_id} on {leg.venue}:{leg.market_id} "
+                    f"(gross={gross_edge_dollars}, fee={estimated_fee_dollars}, "
+                    f"margin={safety_margin_dollars}, fee_source={fee_source})",
+                    metadata={
+                        "kind": "fee_negative_edge",
+                        "leg_id": leg.leg_id,
+                        "fee_bps": str(fee_bps),
+                        "fee_source": fee_source,
+                        "gross_edge_dollars": str(gross_edge_dollars),
+                        "estimated_fee_dollars": str(estimated_fee_dollars),
+                        "safety_margin_dollars": str(safety_margin_dollars),
+                        "executable_edge_dollars": str(executable_edge_dollars),
+                    },
+                )
+        return GateResult.approve(metadata={"legs": leg_metas})
+
+
+# ---------------------------------------------------------------------------
+# 1.6 Order policy gate (Phase 4.15)
+# ---------------------------------------------------------------------------
+
+
+def _md_get(meta: dict[str, Any], *keys: str) -> Any:
+    """Look up first present key in metadata. Returns None if none present."""
+    for k in keys:
+        if k in meta:
+            return meta[k]
+    return None
+
+
+def _is_truthy_bool(v: Any) -> bool:
+    """Strict-ish truthiness: True/"true"/"1"/1 are True; anything else False.
+    Used so leg.metadata={"post_only": "true"} from a YAML/JSON path still
+    counts as true."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y")
+    return False
+
+
+class OrderPolicyGate(Gate):
+    """Gate 1.6 — Phase 4.15 order-policy gate (leg.metadata bridge).
+
+    Validates per-leg metadata for venue-write shape. Paper mode is
+    permissive about ABSENCE of metadata but strict about PRESENCE of
+    explicitly unsafe values. Capital mode adds required-key checks.
+
+    Bridge keys recognized on leg.metadata:
+      - "tif" or "time_in_force"  (case-insensitive)
+      - "order_group_id"
+      - "buy_max_cost"
+      - "post_only"
+      - "reduce_only"
+
+    Does NOT auto-generate any field — strategies are responsible.
+    """
+
+    name = "order_policy"
+    order = "1.6"
+
+    async def check(self, ctx: GateCtx) -> GateResult:
+        cfg = ctx.policy.config.order_policy
+        if not cfg.enabled:
+            return GateResult.approve(metadata={"bypassed": "disabled"})
+
+        capital_mode = ctx.policy.config.capital_mode
+        # paper-permissive: only enforce required-key checks when active.
+        active = capital_mode or cfg.apply_in_paper_mode
+
+        intent = ctx.current_intent
+        for leg in intent.legs:
+            meta = leg.metadata or {}
+
+            # 1. time_in_force: default missing to IOC; reject explicit
+            # unsafe values regardless of mode.
+            raw_tif = _md_get(meta, "tif", "time_in_force")
+            if raw_tif is None:
+                tif_norm = "IOC"
+                tif_explicit = False
+            else:
+                tif_norm = str(raw_tif).strip().upper()
+                tif_explicit = True
+            if tif_norm not in cfg.allowed_time_in_force:
+                return GateResult.reject(
+                    f"order_policy: tif={raw_tif!r} not in allowed "
+                    f"{list(cfg.allowed_time_in_force)} for leg {leg.leg_id}",
+                    metadata={
+                        "kind": "tif_not_allowed",
+                        "leg_id": leg.leg_id,
+                        "tif": tif_norm,
+                        "tif_explicit": tif_explicit,
+                        "allowed": list(cfg.allowed_time_in_force),
+                    },
+                )
+
+            # 2. post_only: reject if present-and-true and forbidden.
+            if cfg.forbid_post_only and "post_only" in meta:
+                if _is_truthy_bool(meta["post_only"]):
+                    return GateResult.reject(
+                        f"order_policy: post_only=true forbidden for leg {leg.leg_id}",
+                        metadata={
+                            "kind": "post_only_forbidden",
+                            "leg_id": leg.leg_id,
+                        },
+                    )
+
+            # 3. reduce_only: reject only if forbidden by config and present-and-true.
+            if cfg.forbid_reduce_only and "reduce_only" in meta:
+                if _is_truthy_bool(meta["reduce_only"]):
+                    return GateResult.reject(
+                        f"order_policy: reduce_only=true forbidden for leg {leg.leg_id}",
+                        metadata={
+                            "kind": "reduce_only_forbidden",
+                            "leg_id": leg.leg_id,
+                        },
+                    )
+
+            # 4. capital-mode required keys.
+            if active and cfg.require_order_group_id_in_capital_mode:
+                ogi = meta.get("order_group_id")
+                if ogi is None or str(ogi).strip() == "":
+                    return GateResult.reject(
+                        f"order_policy: order_group_id required in capital mode "
+                        f"for leg {leg.leg_id}",
+                        metadata={
+                            "kind": "order_group_id_missing",
+                            "leg_id": leg.leg_id,
+                        },
+                    )
+
+            if (
+                active
+                and cfg.require_buy_max_cost_for_buys_in_capital_mode
+                and leg.side == Side.BUY
+            ):
+                bmc = meta.get("buy_max_cost")
+                if bmc is None or str(bmc).strip() == "":
+                    return GateResult.reject(
+                        f"order_policy: buy_max_cost required for BUY leg "
+                        f"{leg.leg_id} in capital mode",
+                        metadata={
+                            "kind": "buy_max_cost_missing",
+                            "leg_id": leg.leg_id,
+                        },
+                    )
+
         return GateResult.approve()
 
 
@@ -641,6 +890,8 @@ def _clip_proportional(
 def default_gate_chain() -> list[Gate]:
     return [
         StructuralGate(),
+        FeeGate(),
+        OrderPolicyGate(),
         KillGate(),
         VenueHealthGate(),
         PoisoningGate(),

@@ -308,3 +308,110 @@ def test_telegram_watchdog_invalid_bounds_rejected(tmp_path: Path):
     }))
     with pytest.raises(ConfigError, match="restart_window_sec"):
         load_config(p4)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.15 — FeeGateCfg / OrderPolicyCfg parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_fee_gate_defaults():
+    cfg = load_config(None)
+    assert cfg.fee_gate.enabled is True
+    assert cfg.fee_gate.apply_in_paper_mode is False
+    assert cfg.fee_gate.default_fee_bps == Decimal("0")
+    assert cfg.fee_gate.safety_margin_bps == Decimal("0")
+    assert cfg.fee_gate.per_market_fee_bps == {}
+    assert cfg.fee_gate.per_series_fee_bps == {}
+
+
+def test_fee_gate_parses_full(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "fee_gate": {
+            "enabled": True,
+            "apply_in_paper_mode": True,
+            "default_fee_bps": "5",
+            "safety_margin_bps": "2",
+            "per_market_fee_bps": {"kalshi:MKT-X": "10"},
+            "per_series_fee_bps": {"MKT-": "7"},
+        }
+    }))
+    cfg = load_config(p)
+    assert cfg.fee_gate.apply_in_paper_mode is True
+    assert cfg.fee_gate.default_fee_bps == Decimal("5")
+    assert cfg.fee_gate.safety_margin_bps == Decimal("2")
+    assert cfg.fee_gate.per_market_fee_bps["kalshi:MKT-X"] == Decimal("10")
+    assert cfg.fee_gate.per_series_fee_bps["MKT-"] == Decimal("7")
+
+
+def test_fee_gate_rejects_negative_default_bps(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"fee_gate": {"default_fee_bps": "-1"}}))
+    with pytest.raises(ConfigError, match="fee_gate.default_fee_bps"):
+        load_config(p)
+
+
+def test_fee_gate_rejects_negative_per_market_bps(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "fee_gate": {"per_market_fee_bps": {"kalshi:X": "-3"}}
+    }))
+    with pytest.raises(ConfigError, match="fee_gate.per_market_fee_bps"):
+        load_config(p)
+
+
+def test_fee_gate_rejects_negative_safety_margin(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"fee_gate": {"safety_margin_bps": "-1"}}))
+    with pytest.raises(ConfigError, match="fee_gate.safety_margin_bps"):
+        load_config(p)
+
+
+def test_order_policy_defaults():
+    cfg = load_config(None)
+    assert cfg.order_policy.enabled is True
+    assert cfg.order_policy.apply_in_paper_mode is False
+    assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK")
+    assert cfg.order_policy.forbid_post_only is True
+    assert cfg.order_policy.forbid_reduce_only is False
+    assert cfg.order_policy.require_order_group_id_in_capital_mode is True
+    assert cfg.order_policy.require_buy_max_cost_for_buys_in_capital_mode is True
+
+
+def test_order_policy_parses_allowed_tif_uppercased(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "order_policy": {"allowed_time_in_force": ["ioc", "fok", "Day"]}
+    }))
+    cfg = load_config(p)
+    assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK", "DAY")
+
+
+def test_order_policy_rejects_empty_allowed_tif(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "order_policy": {"allowed_time_in_force": []}
+    }))
+    with pytest.raises(ConfigError, match="allowed_time_in_force"):
+        load_config(p)
+
+
+def test_risk_config_includes_new_sections():
+    """Defaults RiskConfig() must already carry both new sections so
+    callers that don't write YAML keep working."""
+    from executor.risk.config import RiskConfig
+    cfg = RiskConfig()
+    assert hasattr(cfg, "fee_gate")
+    assert hasattr(cfg, "order_policy")
+
+
+def test_backwards_compat_omitted_sections(tmp_path: Path):
+    """Loading a YAML that does not mention fee_gate/order_policy must
+    still succeed and apply defaults."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"per_intent": {"max_intent_dollars": "100.00"}}))
+    cfg = load_config(p)
+    assert cfg.fee_gate.enabled is True
+    assert cfg.fee_gate.default_fee_bps == Decimal("0")
+    assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK")
