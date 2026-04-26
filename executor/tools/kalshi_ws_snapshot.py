@@ -79,7 +79,7 @@ FORBIDDEN_WS_CHANNELS: frozenset[str] = frozenset({
 # Output and credential constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_OUTPUT_DIR = Path("/root/executor/audit-logs/market_snapshots/kalshi_ws")
+DEFAULT_OUTPUT_DIR = Path("audit-logs/market_snapshots/kalshi_ws")
 SOURCE_TAG = "kalshi_ws_readonly"
 
 RECORDER_API_KEY_ENV = "KALSHI_RECORDER_API_KEY_ID"

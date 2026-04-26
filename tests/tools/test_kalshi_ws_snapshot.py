@@ -816,8 +816,12 @@ def test_dry_run_with_read_only_flag_does_not_print_warning(
 
 def test_default_output_path_under_audit_logs_market_snapshots() -> None:
     p = wsmod.default_output_path()
-    expected_parent = Path("/root/executor/audit-logs/market_snapshots/kalshi_ws")
+    # Repo-relative — operator runs from /root/executor; CI runs from the
+    # checked-out tree. Either way the JSONL lands under the repo's
+    # audit-logs/ tree, never at an absolute system path.
+    expected_parent = Path("audit-logs/market_snapshots/kalshi_ws")
     assert p.parent == expected_parent
+    assert not p.is_absolute()
     assert p.suffix == ".jsonl"
     assert p.name.count("-") == 2  # YYYY-MM-DD.jsonl
 

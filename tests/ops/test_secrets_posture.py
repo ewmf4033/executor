@@ -53,12 +53,19 @@ SECRET_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
 }
 
-pytestmark = pytest.mark.skipif(
+# Host-dependent tests (those that inspect filesystem state under
+# ``/root/executor`` or other absolute paths) carry an explicit per-test
+# ``host_guard`` decorator. The module no longer applies a blanket
+# ``pytestmark`` skip — that previously caused the in-repo
+# service-boundary regression to be silently skipped on CI/dev laptops, which
+# was the whole point of the regression test.
+host_guard = pytest.mark.skipif(
     not HOST_GUARD.exists(),
     reason="not on production host (no /root/executor)",
 )
 
 
+@host_guard
 def test_env_file_mode_no_group_or_world() -> None:
     """`.env` must not be readable by group or world, and must be root-owned."""
     if not ENV_FILE.exists():
@@ -72,6 +79,7 @@ def test_env_file_mode_no_group_or_world() -> None:
     assert st.st_uid == 0, f"{ENV_FILE} not root-owned (uid={st.st_uid})"
 
 
+@host_guard
 def test_no_env_bak_left_in_repo() -> None:
     """Stale `.env.bak.*` backups must live outside the repo (e.g. /root/secret-archives)."""
     leftovers = sorted(HOST_GUARD.glob(ENV_BAK_GLOB))
@@ -82,6 +90,7 @@ def test_no_env_bak_left_in_repo() -> None:
     )
 
 
+@host_guard
 @pytest.mark.parametrize("key_path", KALSHI_KEY_FILES)
 def test_kalshi_private_key_mode(key_path: Path) -> None:
     """Kalshi private key files (if present) must be root-only readable."""
@@ -113,6 +122,7 @@ def _iter_scan_files() -> "list[Path]":
     return out
 
 
+@host_guard
 def test_no_obvious_secret_strings_in_source() -> None:
     """Scan tracked source dirs for secret-shaped strings.
 
