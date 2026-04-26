@@ -14,8 +14,10 @@ Slippage breakdown (positive = adverse for the strategy):
                                               order placement)
   execution_cost      = arrival - fill       (adverse if we paid worse than
                                               the mid at arrival)
-  short_term_alpha    = fill - exit          (positive when we earned mark-to-mark
-                                              alpha after the fill)
+  short_term_alpha    = signed(side, fill - exit)
+                        positive = adverse to strategy (mid moved against fill).
+                        For PnL gating, see record_pnl plumbing in settle_due
+                        which uses true realized PnL, not short_term_alpha.
 
 Sign convention for BUY (long YES): all "adverse" terms above are computed
 with the assumption that lower price = good when buying back, and we negate
@@ -327,18 +329,39 @@ class AttributionTracker:
                 )
             p.record.settled_ts_ns = now_ns
             self._upsert(p.record)
-            # Phase 4.11 Item 2 (Review 8 0c-3): realized-alpha → daily PnL.
-            # _signed() already normalizes so that positive short_term_alpha
-            # means the strategy earned alpha (positive PnL). We write a
-            # delta = short_term_alpha * size, which is the strategy's
-            # realized PnL on that fill over the exit horizon. Done after
-            # the DB upsert so a record write failure doesn't desync.
+            # Phase 4.11.2: see record_pnl call below for true PnL computation.
+            # short_term_alpha is preserved on the record for attribution
+            # analysis but is NOT used as a PnL feed (adverse-positive
+            # convention would invert gate_13/daily_loss economics).
+            #
+            # Phase 4.11.2 (Codex Review 10): replace alpha-derived PnL with
+            # true realized PnL at exit horizon. short_term_alpha uses
+            # adverse-positive convention (see _signed() docstring), making
+            # it unsuitable as a direct PnL feed to record_pnl(). True PnL
+            # is direction-aware:
+            #   BUY:  pnl = (exit_price - fill_price) * size  (price up = profit)
+            #   SELL: pnl = (fill_price - exit_price) * size  (price down = profit)
+            # We use a sign multiplier for compactness.
+            #
+            # Phase 4.13.2 (GPT-5.5 architectural review #2, 2026-04-23):
+            # subtract fees so gate_13 (daily_loss) sees NET-of-fees PnL.
+            # Kalshi fees are always a cost paid by the trader (stored as a
+            # positive Decimal on AttributionRecord), so net = gross - fee
+            # regardless of side. At small T1 trade sizes, fee rounding can
+            # flip a gross-profitable strategy to net-negative, so gate_13
+            # must be fed the net number.
             if (
                 self._risk_state is not None
-                and p.record.short_term_alpha is not None
+                and p.record.exit_price is not None
+                and p.record.fill_price is not None
             ):
                 try:
-                    pnl_delta = p.record.short_term_alpha * p.record.size
+                    side_sign = Decimal("1") if p.record.side == Side.BUY else Decimal("-1")
+                    gross_pnl = side_sign * (p.record.exit_price - p.record.fill_price) * p.record.size
+                    # Fee is a cost (always subtracted); None → 0 for paper
+                    # fills and any path that hasn't populated fee yet.
+                    fee = p.record.fee if p.record.fee is not None else Decimal("0")
+                    pnl_delta = gross_pnl - fee
                     self._risk_state.record_pnl(
                         p.record.strategy_id,
                         pnl_delta,

@@ -29,7 +29,9 @@ live_only = pytest.mark.skipif(
 @pytest.fixture
 def kalshi_env(monkeypatch):
     """Set the Kalshi credentials the spec mandates for this droplet."""
-    monkeypatch.setenv("KALSHI_API_KEY_ID", "02861f16-f9de-4874-b202-93c4746ab3eb")
+    # Synthetic UUID — production key id should never live in tests. The
+    # signature/auth tests don't validate the id format against Kalshi.
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "00000000-0000-0000-0000-000000000001")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", "/root/kalshi_sports.key")
     monkeypatch.setenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
     monkeypatch.setenv("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")

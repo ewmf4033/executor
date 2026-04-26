@@ -193,69 +193,108 @@ async def test_item1_shared_kill_switch_rejects_new_intent(tmp_path: Path) -> No
 # --------------------------------------------------------------------------
 
 
-async def test_item2_settle_due_records_daily_pnl(tmp_path: Path) -> None:
+async def _settle_one_fill(
+    *,
+    state: RiskState,
+    tmp_path: Path,
+    side: Side,
+    fill_price: str,
+    exit_price: str,
+    size: str = "10",
+    strategy_id: str = "test_strat",
+    fill_id: str = "f1",
+) -> tuple[AttributionTracker, int]:
+    """Helper: on_fill + settle_due with exit_horizon=0 so the fill is
+    immediately due. Returns (tracker, settle_now_ns) so callers can thread
+    the same now_ns into state.daily_pnl() — avoids a UTC-midnight race
+    where settle_due keys the PnL under date X but a naive daily_pnl call
+    resolves to date X+1."""
+    tracker = AttributionTracker(
+        db_path=tmp_path / f"attr-{fill_id}.sqlite",
+        exit_horizon_sec=0,
+        risk_state=state,
+    )
+    tracker.update_mid("kalshi", "m1", Decimal(exit_price))
+    tracker.on_fill(
+        fill_id=fill_id,
+        order_id=f"o-{fill_id}",
+        intent_id=f"i-{fill_id}",
+        leg_id=f"l-{fill_id}",
+        strategy_id=strategy_id,
+        venue="kalshi",
+        market_id="m1",
+        side=side,
+        size=Decimal(size),
+        fill_price=Decimal(fill_price),
+        fill_ts_ns=time.time_ns(),
+        intent_price=Decimal(fill_price),
+    )
+    settle_now_ns = time.time_ns() + 1_000_000_000
+    settled = await tracker.settle_due(now_ns=settle_now_ns)
+    assert len(settled) == 1
+    return tracker, settle_now_ns
+
+
+async def test_item2_settle_due_records_daily_pnl_losing_buy(tmp_path: Path) -> None:
+    """Phase 4.11.2: losing BUY (fill 0.50, exit 0.40, size 10) → pnl -1.00."""
     state = RiskState(db_path=tmp_path / "rstate.sqlite")
     await state.load()
     try:
-        tracker = AttributionTracker(
-            db_path=tmp_path / "attr.sqlite",
-            exit_horizon_sec=0,
-            risk_state=state,
+        tracker, settle_now_ns = await _settle_one_fill(
+            state=state, tmp_path=tmp_path,
+            side=Side.BUY, fill_price="0.50", exit_price="0.40",
         )
-        # Fill + exit_price → short_term_alpha = _signed(BUY, fill-exit).
-        # For BUY: fill 0.50, exit 0.45 → alpha = +0.05 (we got out at a
-        # worse price, so short_term_alpha negative actually... let me re-check).
-        # _signed(BUY, raw) returns raw. fill-exit = 0.50-0.45 = +0.05.
-        # Sign convention: "positive = earned alpha." We BOUGHT at 0.50 and
-        # the mark went to 0.45. We LOST 5c per contract. So +alpha should
-        # mean earned. Re-reading attribution.tracker _signed comment:
-        # "positive = adverse for the strategy." So short_term_alpha > 0
-        # would be adverse. But spec says "positive short_term_alpha means
-        # earned alpha." There's a sign convention mismatch in the docs.
-        # The spec of THIS phase says "positive short_term_alpha means
-        # earned alpha = positive PnL." So we follow the spec: compute
-        # pnl_delta = short_term_alpha * size. A loss should produce
-        # daily_pnl < 0. Use an exit that produces an unambiguous loss.
-        #
-        # For this test: BUY at 0.60, exit at 0.50 → fill-exit = 0.10.
-        # _signed(BUY, 0.10) = 0.10. pnl_delta = 0.10 * 10 = 1.00. Positive.
-        # But buying at 0.60 and marking to 0.50 is a LOSS (paid 0.60,
-        # worth 0.50). So the sign convention in tracker.py means
-        # "short_term_alpha > 0" under _signed = "the mark moved adversely"
-        # for BUY, which the phase-4.11 spec labels as positive alpha /
-        # positive PnL. That's inconsistent with common finance semantics
-        # but matches the spec as written. We go with spec.
-        #
-        # To keep the intent clear we just write a test that verifies the
-        # plumbing fires and daily_pnl updates; we don't attempt to
-        # second-guess the sign convention here.
-        tracker.update_mid("kalshi", "m1", Decimal("0.50"))
-        tracker.on_fill(
-            fill_id="f1",
-            order_id="o1",
-            intent_id="i1",
-            leg_id="l1",
-            strategy_id="test_strat",
-            venue="kalshi",
-            market_id="m1",
-            side=Side.BUY,
-            size=Decimal("10"),
-            fill_price=Decimal("0.60"),
-            fill_ts_ns=time.time_ns(),
-            intent_price=Decimal("0.60"),
-        )
-        # exit_horizon_sec=0 means it's immediately due.
-        settled = await tracker.settle_due(
-            now_ns=time.time_ns() + 1_000_000_000
-        )
-        assert len(settled) == 1
-        assert settled[0].short_term_alpha is not None
+        pnl = state.daily_pnl("test_strat", now_ns=settle_now_ns)
+        assert pnl == Decimal("-1.00"), f"expected -1.00 (loss), got {pnl}"
+        tracker.close()
+    finally:
+        state.close()
 
-        # state.daily_pnl should now be non-zero for test_strat.
-        pnl = state.daily_pnl("test_strat")
-        # Alpha * size = 0.10 * 10 = 1.00 (positive per tracker's _signed).
-        assert pnl == Decimal("1.00"), f"expected 1.00, got {pnl}"
 
+async def test_item2_settle_due_records_daily_pnl_winning_buy(tmp_path: Path) -> None:
+    """Phase 4.11.2: winning BUY (fill 0.40, exit 0.50, size 10) → pnl +1.00."""
+    state = RiskState(db_path=tmp_path / "rstate.sqlite")
+    await state.load()
+    try:
+        tracker, settle_now_ns = await _settle_one_fill(
+            state=state, tmp_path=tmp_path,
+            side=Side.BUY, fill_price="0.40", exit_price="0.50",
+        )
+        pnl = state.daily_pnl("test_strat", now_ns=settle_now_ns)
+        assert pnl == Decimal("1.00"), f"expected +1.00 (gain), got {pnl}"
+        tracker.close()
+    finally:
+        state.close()
+
+
+async def test_item2_settle_due_records_daily_pnl_losing_sell(tmp_path: Path) -> None:
+    """Phase 4.11.2: losing SELL (sold 0.40, mid → 0.50, size 10) → pnl -1.00.
+    Shorted at 0.40; mid moved up so it costs more to cover."""
+    state = RiskState(db_path=tmp_path / "rstate.sqlite")
+    await state.load()
+    try:
+        tracker, settle_now_ns = await _settle_one_fill(
+            state=state, tmp_path=tmp_path,
+            side=Side.SELL, fill_price="0.40", exit_price="0.50",
+        )
+        pnl = state.daily_pnl("test_strat", now_ns=settle_now_ns)
+        assert pnl == Decimal("-1.00"), f"expected -1.00 (loss), got {pnl}"
+        tracker.close()
+    finally:
+        state.close()
+
+
+async def test_item2_settle_due_records_daily_pnl_winning_sell(tmp_path: Path) -> None:
+    """Phase 4.11.2: winning SELL (sold 0.50, mid → 0.40, size 10) → pnl +1.00."""
+    state = RiskState(db_path=tmp_path / "rstate.sqlite")
+    await state.load()
+    try:
+        tracker, settle_now_ns = await _settle_one_fill(
+            state=state, tmp_path=tmp_path,
+            side=Side.SELL, fill_price="0.50", exit_price="0.40",
+        )
+        pnl = state.daily_pnl("test_strat", now_ns=settle_now_ns)
+        assert pnl == Decimal("1.00"), f"expected +1.00 (gain), got {pnl}"
         tracker.close()
     finally:
         state.close()
@@ -264,18 +303,51 @@ async def test_item2_settle_due_records_daily_pnl(tmp_path: Path) -> None:
 async def test_item2_daily_pnl_gate_rejects_after_accumulated_loss(
     tmp_path: Path,
 ) -> None:
-    """End-to-end: settled losses drive daily_pnl negative; a fresh intent
-    hits gate_13 (daily_loss). Uses the default daily_loss cap of $200."""
+    """End-to-end: settled losses drive daily_pnl negative through the REAL
+    attribution plumbing (settle_due → record_pnl) — not a bypass via
+    direct state.record_pnl — and a fresh intent hits gate_13 (daily_loss).
+
+    Phase 4.11.2 (Codex Review 10): previously this test bypassed the
+    attribution path, failing to validate end-to-end PnL accrual. Now we
+    drive 250 losing BUY fills (each = $1.00 loss) through settle_due and
+    assert daily_pnl crosses the default -$200 daily_loss threshold, then
+    that a subsequent policy.evaluate() rejects with gate=daily_loss."""
     state = RiskState(db_path=tmp_path / "rstate.sqlite")
     await state.load()
     try:
-        # Drive daily_pnl directly negative — we've already proven settle_due
-        # writes via record_pnl in the prior test. Here we need an integer
-        # loss below the default cap (-200.00).
-        state.record_pnl("test_strat", Decimal("-250.00"))
-        assert state.daily_pnl("test_strat") == Decimal("-250.00")
+        tracker = AttributionTracker(
+            db_path=tmp_path / "attr.sqlite",
+            exit_horizon_sec=0,
+            risk_state=state,
+        )
+        # Each fill: BUY at 0.50, mid drops to 0.40, size 10 → pnl -1.00.
+        # 30 fills × -1.00 = -$30.00. Need to exceed default daily_loss cap
+        # of -$200, so do 250 fills → -$250.00.
+        tracker.update_mid("kalshi", "m1", Decimal("0.40"))
+        now = time.time_ns()
+        for i in range(250):
+            tracker.on_fill(
+                fill_id=f"f{i}",
+                order_id=f"o{i}",
+                intent_id=f"i{i}",
+                leg_id=f"l{i}",
+                strategy_id="test_strat",
+                venue="kalshi",
+                market_id="m1",
+                side=Side.BUY,
+                size=Decimal("10"),
+                fill_price=Decimal("0.50"),
+                fill_ts_ns=now,
+                intent_price=Decimal("0.50"),
+            )
+        settle_now_ns = now + 1_000_000_000
+        settled = await tracker.settle_due(now_ns=settle_now_ns)
+        assert len(settled) == 250
+        pnl = state.daily_pnl("test_strat", now_ns=settle_now_ns)
+        assert pnl == Decimal("-250.00"), f"expected -250.00, got {pnl}"
 
-        # Build policy + evaluate.
+        # Now evaluate a fresh intent for the same strategy — gate_13
+        # (daily_loss) must reject it.
         cfg_mgr = ConfigManager(path=None)
         policy = RiskPolicy(
             config_manager=cfg_mgr,
@@ -292,6 +364,8 @@ async def test_item2_daily_pnl_gate_rejects_after_accumulated_loss(
         verdict = await policy.evaluate(intent)
         assert verdict.admitted is False
         assert verdict.reject_gate == "daily_loss"
+
+        tracker.close()
     finally:
         state.close()
 
@@ -430,7 +504,11 @@ def test_item5_corrupt_db_renamed_and_rebuilt(tmp_path: Path) -> None:
 
     assert store.rebuilt_from_corruption is True
     snap = store.load()
-    assert snap.mode == KillMode.NONE
+    # Phase 4.13: rebuild now fail-closes into HARD+manual_only (was NONE).
+    # See docstring on KillStateStore for rationale.
+    assert snap.mode == KillMode.HARD
+    assert snap.manual_only is True
+    assert snap.reason == "KILL_DB_CORRUPT_REBUILT"
 
     pattern = re.compile(r"^kill_state\.sqlite\.corrupt-\d{19}$")
     siblings = [p.name for p in tmp_path.iterdir()]

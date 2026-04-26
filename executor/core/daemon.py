@@ -34,6 +34,7 @@ from typing import Any
 
 from ..attribution.tracker import AttributionTracker
 from ..audit.writer import AuditWriter
+from ..control.socket_server import ControlSocketServer
 from ..detectors.adverse_selection import (
     NullAdverseSelectionDetector,
     WindowAdverseSelectionDetector,
@@ -43,9 +44,10 @@ from ..kill.state import KillStateStore
 from ..risk.config import ConfigManager, RiskConfig
 from ..risk.kill import KillSwitch
 from ..risk.policy import RiskPolicy
-from ..risk.state import RiskState
+from ..risk.state import OperatorLivenessStore, RiskState
 from ..strategies.yes_no_cross.strategy import CrossPair, YESNOCrossDetect
 from ..telegram.bot import TelegramBot
+from ..telegram.watchdog import TelegramWatchdog
 from .event_bus import EventBus
 from .events import Event, EventType, Source
 from .logging import configure, get_logger
@@ -106,6 +108,8 @@ class DaemonService:
         self.orchestrator: Orchestrator | None = None
         self.strategy: YESNOCrossDetect | None = None
         self.telegram_bot: TelegramBot | None = None
+        self.telegram_watchdog: TelegramWatchdog | None = None
+        self.control_server: ControlSocketServer | None = None
 
         self._stop_event = asyncio.Event()
         self._bg_tasks: list[asyncio.Task[Any]] = []
@@ -134,8 +138,16 @@ class DaemonService:
 
         # Risk subsystem.
         self.config_mgr = ConfigManager(self.risk_yaml if self.risk_yaml.exists() else None)
+        # Phase 4.13.1 Fix #B: propagate capital_mode into AuditWriter so
+        # audit-write-failure escalation picks HARD + cancel_open_orders
+        # under real capital (SOFT-only under paper).
+        capital_mode = bool(self.config_mgr.config.capital_mode)
+        self.audit.set_capital_mode(capital_mode)
         self.risk_state = RiskState(db_path=self.risk_state_db)
-        await self.risk_state.load()
+        # Phase 4.13.1 Fix #C: under real capital, refuse to start on a
+        # reconstructed cache. Paper mode retains rebuild-from-venues +
+        # audit-replay behavior.
+        await self.risk_state.load(capital_mode=capital_mode)
 
         self.kill_store = KillStateStore(self.kill_db)
         # Phase 4.11 Item 1 (Review 8 0c-7, Review 9 #2): share a single
@@ -160,7 +172,29 @@ class DaemonService:
         # Phase 4.11 Item 5 (Review 8 0c-5): if the kill DB was corrupt and
         # rebuilt, surface an ERROR event so the operator knows to
         # investigate. The manager exists now so we have a bus reference.
+        # Phase 4.13.1 Fix #A: conditionally emit KILL_STATE_FORCE_RESET
+        # when the operator used EXECUTOR_FORCE_RESET_KILL_STATE=1 to
+        # bypass fail-closed rebuild. Note text varies accordingly so
+        # forensics can distinguish force-reset from fail-closed seed.
         if self.kill_store.rebuilt_from_corruption:
+            force_reset_used = getattr(self.kill_store, "force_reset_used", False)
+            if force_reset_used:
+                err_note = (
+                    "Corrupt kill_state.sqlite was renamed aside and a fresh "
+                    "DB was seeded in mode=NONE via force-reset operator "
+                    "override (EXECUTOR_FORCE_RESET_KILL_STATE=1). "
+                    "Investigate why the DB became corrupt."
+                )
+            else:
+                err_note = (
+                    "Corrupt kill_state.sqlite was renamed aside and "
+                    "a fresh DB was seeded in mode=HARD with "
+                    "manual_only=True (reason=KILL_DB_CORRUPT_REBUILT). "
+                    "Trading is stopped until an operator inspects the "
+                    ".corrupt-* backup and explicitly resolves via "
+                    "KillManager. Set EXECUTOR_FORCE_RESET_KILL_STATE=1 "
+                    "at daemon startup to bypass (seeds NONE instead)."
+                )
             await self.bus.publish(
                 Event.make(
                     EventType.ERROR,
@@ -168,25 +202,78 @@ class DaemonService:
                     payload={
                         "kind": "KILL_DB_REBUILT_FROM_CORRUPTION",
                         "kill_db_path": str(self.kill_db),
-                        "note": (
-                            "Corrupt kill_state.sqlite was renamed aside and "
-                            "a fresh DB was created in mode=NONE. Operator "
-                            "should inspect the .corrupt-* backup to decide "
-                            "whether a kill state needs to be re-engaged."
-                        ),
+                        "note": err_note,
                     },
                 )
             )
+            if force_reset_used:
+                backup_path = getattr(self.kill_store, "_corruption_backup_path", None)
+                await self.bus.publish(
+                    Event.make(
+                        EventType.KILL_STATE_FORCE_RESET,
+                        source=Source.KILL,
+                        payload={
+                            "kill_db_path": str(self.kill_db),
+                            "ns_ts": int(
+                                getattr(self.kill_store, "_corruption_ts_ns", 0)
+                            ),
+                            "backup_path": str(backup_path)
+                            if backup_path is not None
+                            else "",
+                            "note": (
+                                "Operator used EXECUTOR_FORCE_RESET_KILL_STATE=1 "
+                                "to bypass fail-closed after corruption. "
+                                "Investigate why corruption occurred."
+                            ),
+                        },
+                    )
+                )
         # Phase 4.9 Item 1: plumb kill_mgr into AuditWriter so persistent
         # audit write failures can engage the kill switch (fail-closed).
         self.audit.set_kill_manager(self.kill_mgr)
+
+        # Phase 4.14a: out-of-process operator control channel. AF_UNIX
+        # socket authenticated by filesystem permissions (mode 0600 +
+        # User=root). Route kill commands through the already-wired
+        # KillManager — same audit trail, same state machine, same
+        # fail-closed semantics. No changes to KillManager or the
+        # Telegram surface. Socket location defaults to /run/executor
+        # (systemd RuntimeDirectory) and is overridable via env var for
+        # tests and dev.
+        socket_path = os.environ.get(
+            "EXECUTOR_CONTROL_SOCKET", "/run/executor/control.sock"
+        )
+        # Phase 4.14b: operator liveness store shares the risk_state
+        # SQLite connection; table is created by RiskState's SCHEMA_SQL
+        # and the singleton row is seeded by the store on construction.
+        self._operator_liveness = OperatorLivenessStore(
+            self.risk_state.connection
+        )
+        self.control_server = ControlSocketServer(
+            socket_path=socket_path,
+            kill_mgr=self.kill_mgr,
+            daemon_started_ts_ns=time.time_ns(),
+            git_sha=os.environ.get("EXECUTOR_GIT_SHA"),
+            operator_liveness=self._operator_liveness,
+            risk_config_getter=lambda: self.config_mgr.config,
+            publish=self.bus.publish,
+        )
+        await self.control_server.start()
 
         # Phase 4.11.1: wire TelegramBot into the daemon lifecycle so /kill
         # commands land on the shared KillManager. The bot reads
         # TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from os.environ at __init__;
         # if either is missing, start() silently no-ops (logs
         # telegram.bot.disabled.no_token / .no_chat_id) and _task stays None.
-        self.telegram_bot = TelegramBot(kill_manager=self.kill_mgr)
+        self.telegram_bot = TelegramBot(
+            kill_manager=self.kill_mgr,
+            # Phase 4.14b: same operator_liveness store the control
+            # server and risk policy share — Telegram /arm, /heartbeat,
+            # etc. must update the same row the DeadManGate reads.
+            operator_liveness=self._operator_liveness,
+            dead_man_cfg_getter=lambda: self.config_mgr.config.dead_man,
+            publish=self.bus.publish,
+        )
         await self.telegram_bot.start()
         await self.bus.publish(
             Event.make(
@@ -198,6 +285,30 @@ class DaemonService:
                 },
             )
         )
+
+        # Phase 4.14c: Telegram polling watchdog. Detects when the
+        # getUpdates loop stalls (hung request, dead task) and either
+        # restarts the bot or — after repeated failures — engages
+        # kill_mgr in SOFT mode. Routed directly through KillManager so
+        # the escalation path does not depend on Telegram itself.
+        wd_cfg = self.config_mgr.config.telegram.watchdog
+        if wd_cfg.enabled:
+            self.telegram_watchdog = TelegramWatchdog(
+                bot=self.telegram_bot,
+                kill_mgr=self.kill_mgr,
+                bus=self.bus,
+                stall_threshold_sec=wd_cfg.stall_threshold_sec,
+                poll_interval_sec=wd_cfg.poll_interval_sec,
+                max_restarts=wd_cfg.max_restarts,
+                restart_window_sec=wd_cfg.restart_window_sec,
+                escalate_on_max=wd_cfg.escalate_on_max,
+            )
+            self._bg_tasks.append(
+                asyncio.create_task(
+                    self.telegram_watchdog.run(),
+                    name="telegram-watchdog",
+                )
+            )
 
         self.attribution = AttributionTracker(
             db_path=self.attribution_db,
@@ -227,6 +338,9 @@ class DaemonService:
             # /kill hard engages the exact instance the gate chain and the
             # kill_switch_recheck both consult.
             kill_switch=self._shared_kill_switch,
+            # Phase 4.14b: dead-man gate reads the same operator_liveness
+            # store the control server writes to.
+            operator_liveness=self._operator_liveness,
         )
         # Phase 4.11 Item 1: invariant assertion — catches regressions
         # where a future refactor forgets to share the instance and silently
@@ -513,14 +627,22 @@ class DaemonService:
         """Phase 4.7 Q6 shutdown order (drain before unsubscribe):
 
             1. Signal + cancel strategy/background tasks (no new intents).
+            1a. Stop control socket FIRST (Phase 4.14e H1) — no new
+                executorctl commands can enter while subsystems tear
+                down. Draining the bus or stopping the orchestrator
+                while the control socket still accepts arm/kill/resume
+                commands would race new state changes against teardown.
             2. Short sleep to let in-flight emits reach the bus.
             3. Publish STOPPING + STATE_SAVED lifecycle events.
             4. Drain the bus inbox so pending events reach orchestrator.
-            5. orchestrator.stop() — unsubscribe AFTER drain.
-            6. telemetry.stop().
-            7. bus.stop() — final close / sentinel delivery.
-            8. audit.stop() — flush last (so STATE_SAVED lands).
-            9. Close attribution / risk_state / kill_store.
+            5. telegram watchdog.stop() (before bot so the watchdog
+               does not see bot.stop() as a stall).
+            6. telegram bot.stop().
+            7. orchestrator.stop() — unsubscribe AFTER drain.
+            8. telemetry.stop().
+            9. bus.stop() — final close / sentinel delivery.
+            10. audit.stop() — flush last (so STATE_SAVED lands).
+            11. Close attribution / risk_state / kill_store.
         """
         self._stop_event.set()
         # (1) Cancel background tasks so no new intents are produced.
@@ -532,6 +654,19 @@ class DaemonService:
             except (asyncio.CancelledError, Exception):
                 pass
         self._bg_tasks.clear()
+
+        # (1a) Phase 4.14e — stop the control socket listener immediately
+        # after background tasks, BEFORE we drain the bus and tear down
+        # subsystems. Any new executorctl connection after this point
+        # gets ECONNREFUSED; any in-flight handler is cancelled via
+        # server.close() + wait_closed(). Ultrareview Run 2 (H1) flagged
+        # the prior ordering — control_server stopped near the end — as
+        # allowing kill/resume/arm to land on partially-shutdown state.
+        if self.control_server is not None:
+            try:
+                await self.control_server.stop()
+            except Exception:
+                pass
 
         # (2) Brief settle window for any in-flight publishes.
         try:
@@ -574,36 +709,44 @@ class DaemonService:
         except Exception as exc:
             log.warning("daemon.stop.drain_failed", error=str(exc))
 
-        # (5) Now safe to unsubscribe orchestrator.
-        if self.orchestrator is not None:
+        # (5) Phase 4.14c: stop the Telegram watchdog before the bot so it
+        # cannot observe a bot.stop() as a "stall" and attempt a restart
+        # during shutdown.
+        if self.telegram_watchdog is not None:
             try:
-                await self.orchestrator.stop()
+                await self.telegram_watchdog.stop()
             except Exception:
                 pass
-        # (6) Telemetry.
-        if self.telemetry is not None:
-            try:
-                await self.telemetry.stop()
-            except Exception:
-                pass
-        # Phase 4.11.1: stop the Telegram bot before closing the bus so its
-        # poll loop is torn down cleanly and can't race the sentinel.
+        # (6) Phase 4.11.1: stop the Telegram bot before closing the bus so
+        # its poll loop is torn down cleanly and can't race the sentinel.
         if self.telegram_bot is not None:
             try:
                 await self.telegram_bot.stop()
             except Exception:
                 pass
-        # (7) Bus final close.
+        # (7) Now safe to unsubscribe orchestrator.
+        if self.orchestrator is not None:
+            try:
+                await self.orchestrator.stop()
+            except Exception:
+                pass
+        # (8) Telemetry.
+        if self.telemetry is not None:
+            try:
+                await self.telemetry.stop()
+            except Exception:
+                pass
+        # (9) Bus final close.
         try:
             await self.bus.stop()
         except Exception:
             pass
-        # (8) Audit flush/close.
+        # (10) Audit flush/close.
         try:
             await self.audit.stop()
         except Exception:
             pass
-        # (9) Close backing stores.
+        # (11) Close backing stores.
         if self.attribution is not None:
             try:
                 self.attribution.close()

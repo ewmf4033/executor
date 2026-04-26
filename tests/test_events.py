@@ -24,6 +24,17 @@ def test_event_type_count_and_uniqueness():
         "SELF_CHECK_OK", "SELF_CHECK_FAIL", "STATE_SAVED",
         # Phase 4.11 — post-admission kill recheck (Review 9 #3)
         "ORDER_CANCELLED_PRE_SEND",
+        # Phase 4.12 — 0g hardening (Codex Review 7 v2 findings #3, #4)
+        "POISONING_INPUT_REJECTED", "POISONING_DETECTOR_ERROR",
+        # Phase 4.13 — operator bypass of fail-closed kill-DB-corruption rebuild
+        "KILL_STATE_FORCE_RESET",
+        # Phase 4.14b — dead-man gate (Gate 8.5) lifecycle
+        "OPERATOR_ARMED", "OPERATOR_DISARMED", "OPERATOR_HEARTBEAT",
+        "DEAD_MAN_TRIPPED",
+        # Phase 4.14c — Telegram polling watchdog
+        "TELEGRAM_STALL_DETECTED", "TELEGRAM_WATCHDOG_ESCALATED",
+        # Phase 4.14d — watchdog restart-lifecycle observability
+        "TELEGRAM_WATCHDOG_RESTARTED", "TELEGRAM_WATCHDOG_RESTART_FAILED",
     }
     got = {e.value for e in EventType}
     assert got == expected, f"mismatch: missing={expected - got} extra={got - expected}"

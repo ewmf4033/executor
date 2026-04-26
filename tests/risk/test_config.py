@@ -91,3 +91,400 @@ def test_fingerprint_stable(tmp_path: Path):
     a = load_config(p)
     b = load_config(p)
     assert a.fingerprint() == b.fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Phase 4.13 — range validation on numeric config fields (Finding #6)
+# --------------------------------------------------------------------------
+
+
+def test_config_rejects_negative_window_sec(tmp_path: Path):
+    """Negative poisoning.window_sec must raise ConfigError at parse time."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"poisoning": {"window_sec": -5}}))
+    with pytest.raises(ConfigError, match="poisoning.window_sec"):
+        load_config(p)
+
+
+def test_config_rejects_zero_min_samples(tmp_path: Path):
+    """Zero poisoning.min_samples would disable the detector — reject."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"poisoning": {"min_samples": 0}}))
+    with pytest.raises(ConfigError, match="poisoning.min_samples"):
+        load_config(p)
+
+
+def test_config_rejects_out_of_range_z_threshold(tmp_path: Path):
+    """z_threshold must stay in [0.5, 20.0]: below = too-sensitive,
+    above = effectively disabled."""
+    p_low = tmp_path / "low.yaml"
+    p_low.write_text(yaml.safe_dump({"poisoning": {"z_threshold": 0.1}}))
+    with pytest.raises(ConfigError, match="poisoning.z_threshold"):
+        load_config(p_low)
+
+    p_high = tmp_path / "high.yaml"
+    p_high.write_text(yaml.safe_dump({"poisoning": {"z_threshold": 100.0}}))
+    with pytest.raises(ConfigError, match="poisoning.z_threshold"):
+        load_config(p_high)
+
+
+def test_config_rejects_negative_panic_cooldown(tmp_path: Path):
+    """kill_switch.panic_cooldown_sec must be >= 0."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"kill_switch": {"panic_cooldown_sec": -1}}))
+    with pytest.raises(ConfigError, match="kill_switch.panic_cooldown_sec"):
+        load_config(p)
+
+
+def test_config_accepts_valid_ranges_unchanged(tmp_path: Path):
+    """Smoke test: known-valid values still load with no regression on
+    default behavior or parsed values."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "poisoning": {
+            "window_sec": 1800,
+            "z_threshold": 3.5,
+            "min_samples": 50,
+            "pause_sec": 600,
+        },
+        "kill_switch": {
+            "auto_resume_strike_limit": 5,
+            "panic_cooldown_sec": 0,  # non-negative OK
+        },
+        "venue_health": {
+            "window_sec": 30,
+            "trip_threshold": 3,
+            "pause_sec": 60,
+        },
+    }))
+    cfg = load_config(p)
+    assert cfg.poisoning.window_sec == 1800
+    assert cfg.poisoning.z_threshold == 3.5
+    assert cfg.poisoning.min_samples == 50
+    assert cfg.kill_switch.panic_cooldown_sec == 0
+    assert cfg.venue_health.window_sec == 30
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — DeadManCfg parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_dead_man_disabled_by_default():
+    cfg = load_config(None)
+    assert cfg.dead_man.enabled is False
+    assert cfg.dead_man.default_timeout_sec == 21600
+    assert cfg.dead_man.min_timeout_sec == 300
+    assert cfg.dead_man.max_timeout_sec == 43200
+
+
+def test_dead_man_cfg_defaults_parse(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 1800,
+            "min_timeout_sec": 60,
+            "max_timeout_sec": 7200,
+        }
+    }))
+    cfg = load_config(p)
+    assert cfg.dead_man.enabled is True
+    assert cfg.dead_man.default_timeout_sec == 1800
+    assert cfg.dead_man.min_timeout_sec == 60
+    assert cfg.dead_man.max_timeout_sec == 7200
+
+
+def test_dead_man_cfg_invalid_bounds_rejected(tmp_path: Path):
+    # min > default
+    p1 = tmp_path / "bad1.yaml"
+    p1.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 60,
+            "min_timeout_sec": 120,
+            "max_timeout_sec": 600,
+        }
+    }))
+    with pytest.raises(ConfigError):
+        load_config(p1)
+
+    # max < default
+    p2 = tmp_path / "bad2.yaml"
+    p2.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 1800,
+            "min_timeout_sec": 60,
+            "max_timeout_sec": 600,
+        }
+    }))
+    with pytest.raises(ConfigError):
+        load_config(p2)
+
+    # Negative / zero rejected by _require_positive_int
+    p3 = tmp_path / "bad3.yaml"
+    p3.write_text(yaml.safe_dump({
+        "dead_man": {
+            "enabled": True,
+            "default_timeout_sec": 600,
+            "min_timeout_sec": 0,
+            "max_timeout_sec": 3600,
+        }
+    }))
+    with pytest.raises(ConfigError):
+        load_config(p3)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14c — TelegramWatchdogCfg parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_telegram_watchdog_enabled_by_default():
+    cfg = load_config(None)
+    assert cfg.telegram.watchdog.enabled is True
+    assert cfg.telegram.watchdog.stall_threshold_sec == 120
+    assert cfg.telegram.watchdog.poll_interval_sec == 10
+    assert cfg.telegram.watchdog.max_restarts == 3
+    assert cfg.telegram.watchdog.restart_window_sec == 300
+    assert cfg.telegram.watchdog.escalate_on_max is True
+
+
+def test_telegram_watchdog_defaults_parse(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "telegram": {
+            "watchdog": {
+                "enabled": True,
+                "stall_threshold_sec": 60,
+                "poll_interval_sec": 5,
+                "max_restarts": 2,
+                "restart_window_sec": 120,
+                "escalate_on_max": False,
+            }
+        }
+    }))
+    cfg = load_config(p)
+    assert cfg.telegram.watchdog.enabled is True
+    assert cfg.telegram.watchdog.stall_threshold_sec == 60
+    assert cfg.telegram.watchdog.poll_interval_sec == 5
+    assert cfg.telegram.watchdog.max_restarts == 2
+    assert cfg.telegram.watchdog.restart_window_sec == 120
+    assert cfg.telegram.watchdog.escalate_on_max is False
+
+
+def test_telegram_watchdog_invalid_bounds_rejected(tmp_path: Path):
+    # poll_interval_sec >= stall_threshold_sec is rejected.
+    p1 = tmp_path / "bad1.yaml"
+    p1.write_text(yaml.safe_dump({
+        "telegram": {
+            "watchdog": {"stall_threshold_sec": 10, "poll_interval_sec": 10}
+        }
+    }))
+    with pytest.raises(ConfigError, match="poll_interval_sec"):
+        load_config(p1)
+
+    # stall_threshold_sec below 10s minimum is rejected.
+    p2 = tmp_path / "bad2.yaml"
+    p2.write_text(yaml.safe_dump({
+        "telegram": {"watchdog": {"stall_threshold_sec": 5}}
+    }))
+    with pytest.raises(ConfigError, match="stall_threshold_sec"):
+        load_config(p2)
+
+    # Negative max_restarts rejected (non-negative int enforced).
+    p3 = tmp_path / "bad3.yaml"
+    p3.write_text(yaml.safe_dump({
+        "telegram": {"watchdog": {"max_restarts": -1}}
+    }))
+    with pytest.raises(ConfigError, match="max_restarts"):
+        load_config(p3)
+
+    # restart_window_sec below 60s minimum rejected.
+    p4 = tmp_path / "bad4.yaml"
+    p4.write_text(yaml.safe_dump({
+        "telegram": {"watchdog": {"restart_window_sec": 30}}
+    }))
+    with pytest.raises(ConfigError, match="restart_window_sec"):
+        load_config(p4)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.15 — FeeGateCfg / OrderPolicyCfg parsing.
+# ---------------------------------------------------------------------------
+
+
+def test_fee_gate_defaults():
+    cfg = load_config(None)
+    assert cfg.fee_gate.enabled is True
+    assert cfg.fee_gate.apply_in_paper_mode is False
+    assert cfg.fee_gate.default_fee_bps == Decimal("0")
+    assert cfg.fee_gate.safety_margin_bps == Decimal("0")
+    assert cfg.fee_gate.per_market_fee_bps == {}
+    assert cfg.fee_gate.per_series_fee_bps == {}
+
+
+def test_fee_gate_parses_full(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "fee_gate": {
+            "enabled": True,
+            "apply_in_paper_mode": True,
+            "default_fee_bps": "5",
+            "safety_margin_bps": "2",
+            "per_market_fee_bps": {"kalshi:MKT-X": "10"},
+            "per_series_fee_bps": {"MKT-": "7"},
+        }
+    }))
+    cfg = load_config(p)
+    assert cfg.fee_gate.apply_in_paper_mode is True
+    assert cfg.fee_gate.default_fee_bps == Decimal("5")
+    assert cfg.fee_gate.safety_margin_bps == Decimal("2")
+    assert cfg.fee_gate.per_market_fee_bps["kalshi:MKT-X"] == Decimal("10")
+    assert cfg.fee_gate.per_series_fee_bps["MKT-"] == Decimal("7")
+
+
+def test_fee_gate_rejects_negative_default_bps(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"fee_gate": {"default_fee_bps": "-1"}}))
+    with pytest.raises(ConfigError, match="fee_gate.default_fee_bps"):
+        load_config(p)
+
+
+def test_fee_gate_rejects_negative_per_market_bps(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "fee_gate": {"per_market_fee_bps": {"kalshi:X": "-3"}}
+    }))
+    with pytest.raises(ConfigError, match="fee_gate.per_market_fee_bps"):
+        load_config(p)
+
+
+def test_fee_gate_rejects_negative_safety_margin(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"fee_gate": {"safety_margin_bps": "-1"}}))
+    with pytest.raises(ConfigError, match="fee_gate.safety_margin_bps"):
+        load_config(p)
+
+
+def test_order_policy_defaults():
+    cfg = load_config(None)
+    assert cfg.order_policy.enabled is True
+    assert cfg.order_policy.apply_in_paper_mode is False
+    assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK")
+    assert cfg.order_policy.forbid_post_only is True
+    assert cfg.order_policy.forbid_reduce_only is False
+    assert cfg.order_policy.require_order_group_id_in_capital_mode is True
+    assert cfg.order_policy.require_buy_max_cost_for_buys_in_capital_mode is True
+
+
+def test_order_policy_parses_allowed_tif_uppercased(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "order_policy": {"allowed_time_in_force": ["ioc", "fok", "Day"]}
+    }))
+    cfg = load_config(p)
+    assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK", "DAY")
+
+
+def test_order_policy_rejects_empty_allowed_tif(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({
+        "order_policy": {"allowed_time_in_force": []}
+    }))
+    with pytest.raises(ConfigError, match="allowed_time_in_force"):
+        load_config(p)
+
+
+def test_risk_config_includes_new_sections():
+    """Defaults RiskConfig() must already carry both new sections so
+    callers that don't write YAML keep working."""
+    from executor.risk.config import RiskConfig
+    cfg = RiskConfig()
+    assert hasattr(cfg, "fee_gate")
+    assert hasattr(cfg, "order_policy")
+
+
+def test_backwards_compat_omitted_sections(tmp_path: Path):
+    """Loading a YAML that does not mention fee_gate/order_policy must
+    still succeed and apply defaults."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"per_intent": {"max_intent_dollars": "100.00"}}))
+    cfg = load_config(p)
+    assert cfg.fee_gate.enabled is True
+    assert cfg.fee_gate.default_fee_bps == Decimal("0")
+    assert cfg.order_policy.allowed_time_in_force == ("IOC", "FOK")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.16 — host_health / clock_health
+# ---------------------------------------------------------------------------
+
+
+def test_host_health_defaults_parse():
+    cfg = load_config(None)
+    assert cfg.host_health.enabled is False
+    assert cfg.host_health.apply_in_paper_mode is False
+    assert cfg.host_health.disk_pct_max == 90
+    assert cfg.host_health.inode_pct_max == 90
+    assert cfg.host_health.swap_pct_max == 50
+    assert cfg.host_health.rss_mb_max == 0
+    assert cfg.host_health.loadavg_1m_max == 0.0
+    assert cfg.host_health.fail_closed_on_probe_error_in_capital_mode is True
+
+
+def test_host_health_rejects_negative_threshold(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"host_health": {"disk_pct_max": -1}}))
+    with pytest.raises(ConfigError, match="disk_pct_max"):
+        load_config(p)
+
+
+def test_host_health_rejects_out_of_range_pct(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"host_health": {"swap_pct_max": 200}}))
+    with pytest.raises(ConfigError, match="swap_pct_max"):
+        load_config(p)
+
+
+def test_clock_health_defaults_parse():
+    cfg = load_config(None)
+    assert cfg.clock_health.enabled is False
+    assert cfg.clock_health.apply_in_paper_mode is False
+    assert cfg.clock_health.require_ntp_sync_in_capital_mode is True
+    assert cfg.clock_health.max_monotonic_wall_skew_ms == 2000
+    assert cfg.clock_health.reject_wall_clock_regression is True
+    assert cfg.clock_health.timedatectl_timeout_sec == 2.0
+    assert cfg.clock_health.fail_closed_on_probe_error_in_capital_mode is True
+
+
+def test_clock_health_rejects_zero_skew(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"clock_health": {"max_monotonic_wall_skew_ms": 0}}))
+    with pytest.raises(ConfigError, match="max_monotonic_wall_skew_ms"):
+        load_config(p)
+
+
+def test_clock_health_rejects_zero_timedatectl_timeout(tmp_path: Path):
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"clock_health": {"timedatectl_timeout_sec": 0}}))
+    with pytest.raises(ConfigError, match="timedatectl_timeout_sec"):
+        load_config(p)
+
+
+def test_risk_config_includes_host_clock_sections():
+    cfg = RiskConfig()
+    assert hasattr(cfg, "host_health")
+    assert hasattr(cfg, "clock_health")
+
+
+def test_backwards_compat_omitted_host_clock_sections(tmp_path: Path):
+    """A YAML missing host_health/clock_health still loads with defaults."""
+    p = tmp_path / "risk.yaml"
+    p.write_text(yaml.safe_dump({"per_intent": {"max_intent_dollars": "100.00"}}))
+    cfg = load_config(p)
+    assert cfg.host_health.enabled is False
+    assert cfg.host_health.disk_pct_max == 90
+    assert cfg.clock_health.enabled is False
+    assert cfg.clock_health.max_monotonic_wall_skew_ms == 2000

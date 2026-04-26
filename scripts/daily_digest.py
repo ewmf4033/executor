@@ -192,10 +192,31 @@ def collect_attribution_data(attr_db: str, target_date: dt.date) -> dict:
             result["fills_by_venue"][row["venue"]] = row["cnt"]
         result["fill_count"] = sum(result["fills_by_venue"].values())
 
-        # Gross paper P&L proxy
+        # Net paper P&L — direction-aware true realized PnL, net of fees.
+        # Phase 4.11.3: mirrors the fix in AttributionTracker.settle_due
+        # (Phase 4.11.2). short_term_alpha uses adverse-positive convention
+        # and is NOT a PnL feed; true realized PnL is:
+        #   BUY:  (exit_price - fill_price) * size
+        #   SELL: (fill_price - exit_price) * size
+        # Rows with NULL exit_price (unsettled fills) are excluded to mirror
+        # the fail-closed guard in tracker.py:345-349.
+        #
+        # Phase 4.13.2 (GPT-5.5 architectural review #2, 2026-04-23): subtract
+        # fees from per-row PnL so paper_pnl reflects NET economics — matches
+        # the fee-inclusive signal now fed to gate_13 in tracker.settle_due.
+        # total_fees (separate metric below) remains the gross fee-paid sum.
         row = conn.execute(
-            "SELECT COALESCE(SUM(CAST(short_term_alpha AS REAL) * CAST(size AS REAL)), 0.0) as pnl "
-            "FROM attribution WHERE fill_ts_ns >= ? AND fill_ts_ns < ?",
+            "SELECT COALESCE(SUM("
+            "  (CASE "
+            "    WHEN side = 'BUY' THEN (CAST(exit_price AS REAL) - CAST(fill_price AS REAL)) * CAST(size AS REAL) "
+            "    WHEN side = 'SELL' THEN (CAST(fill_price AS REAL) - CAST(exit_price AS REAL)) * CAST(size AS REAL) "
+            "    ELSE 0 "
+            "  END) "
+            "  - CAST(COALESCE(fee, '0') AS REAL)"
+            "), 0.0) as pnl "
+            "FROM attribution "
+            "WHERE fill_ts_ns >= ? AND fill_ts_ns < ? "
+            "AND exit_price IS NOT NULL AND fill_price IS NOT NULL",
             (start_ns, end_ns),
         ).fetchone()
         result["paper_pnl"] = round(float(row["pnl"]), 4) if row else 0.0

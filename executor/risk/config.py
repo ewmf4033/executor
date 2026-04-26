@@ -103,7 +103,124 @@ class AttributionCfg:
 
 
 @dataclass(frozen=True, slots=True)
+class DeadManCfg:
+    """Phase 4.14b — operator availability gate (Gate 8.5).
+
+    When ``enabled`` is False the DeadManGate bypasses entirely (paper
+    default). When True, the operator must explicitly arm the dead-man
+    and provide heartbeats within ``timeout_sec``; stale or disarmed
+    state blocks new intents.
+
+    Bounds: 300s (5 min) <= min_timeout_sec <= default_timeout_sec
+    <= max_timeout_sec <= 43200s (12h).
+    """
+    enabled: bool = False
+    default_timeout_sec: int = 21600  # 6h
+    min_timeout_sec: int = 300        # 5 min
+    max_timeout_sec: int = 43200      # 12h
+
+
+@dataclass(frozen=True, slots=True)
+class FeeGateCfg:
+    """Phase 4.15 — fee-aware executable-edge gate (slot 1.5).
+
+    bps-of-notional is intentionally a placeholder; Phase 5a will replace
+    the bps formula with a venue-native maker/taker fee estimator without
+    restructuring the gate. Lookup precedence:
+      1. per_market_fee_bps["venue:market_id"]
+      2. per_series_fee_bps[prefix] (longest matching prefix on market_id)
+      3. default_fee_bps
+    """
+    enabled: bool = True
+    apply_in_paper_mode: bool = False
+    default_fee_bps: Decimal = Decimal("0")
+    safety_margin_bps: Decimal = Decimal("0")
+    per_market_fee_bps: dict[str, Decimal] = field(default_factory=dict)
+    per_series_fee_bps: dict[str, Decimal] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class OrderPolicyCfg:
+    """Phase 4.15 — order-policy gate (slot 1.6).
+
+    Validates leg.metadata for venue-write shape. Paper mode is
+    permissive about ABSENCE of metadata but strict about PRESENCE of
+    explicitly unsafe metadata. Capital mode adds required-key checks.
+    """
+    enabled: bool = True
+    apply_in_paper_mode: bool = False
+    allowed_time_in_force: tuple[str, ...] = ("IOC", "FOK")
+    forbid_post_only: bool = True
+    forbid_reduce_only: bool = False
+    require_order_group_id_in_capital_mode: bool = True
+    require_buy_max_cost_for_buys_in_capital_mode: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class HostHealthCfg:
+    """Phase 4.16 — host-health admission gate.
+
+    Disabled by default. Paper-bypassed unless apply_in_paper_mode=True.
+    Probes are point-sampled stdlib only (no psutil, no background task).
+    rss_mb_max=0 disables the RSS check; loadavg_1m_max=0 disables loadavg.
+    """
+    enabled: bool = False
+    apply_in_paper_mode: bool = False
+    disk_pct_max: int = 90
+    inode_pct_max: int = 90
+    swap_pct_max: int = 50
+    rss_mb_max: int = 0
+    loadavg_1m_max: float = 0.0
+    fail_closed_on_probe_error_in_capital_mode: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ClockHealthCfg:
+    """Phase 4.16 — clock-health admission gate.
+
+    Disabled by default. Paper-bypassed unless apply_in_paper_mode=True.
+    Detects monotonic/wall-clock skew, wall-clock regressions, and (in
+    capital mode only, if require_ntp_sync_in_capital_mode=True) NTP
+    synchronization via the `timedatectl` binary.
+    """
+    enabled: bool = False
+    apply_in_paper_mode: bool = False
+    require_ntp_sync_in_capital_mode: bool = True
+    max_monotonic_wall_skew_ms: int = 2000
+    reject_wall_clock_regression: bool = True
+    timedatectl_timeout_sec: float = 2.0
+    fail_closed_on_probe_error_in_capital_mode: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramWatchdogCfg:
+    """Phase 4.14c — Telegram polling watchdog.
+
+    Detects stalls in the TelegramBot.getUpdates loop. Monitors
+    TelegramBot.last_activity_ts() every ``poll_interval_sec``. When the
+    gap exceeds ``stall_threshold_sec``, restarts the bot task; if
+    restarts within ``restart_window_sec`` exceed ``max_restarts`` and
+    ``escalate_on_max`` is True, engages the kill-switch in SOFT mode.
+    """
+    enabled: bool = True
+    stall_threshold_sec: int = 120
+    poll_interval_sec: int = 10
+    max_restarts: int = 3
+    restart_window_sec: int = 300
+    escalate_on_max: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramCfg:
+    watchdog: TelegramWatchdogCfg = field(default_factory=TelegramWatchdogCfg)
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
+    # Phase 4.13: when True, safety gates fail-closed rather than no-op when
+    # their backing detector/tracker is unavailable. Default False preserves
+    # paper-mode behavior for tests that disable subsystems.
+    capital_mode: bool = False
     structural: StructuralCfg = field(default_factory=StructuralCfg)
     venue_health: VenueHealthCfg = field(default_factory=VenueHealthCfg)
     per_intent: PerIntentCfg = field(default_factory=PerIntentCfg)
@@ -127,6 +244,12 @@ class RiskConfig:
     adverse_selection: AdverseSelectionCfg = field(default_factory=AdverseSelectionCfg)
     kill_switch: KillSwitchCfg = field(default_factory=KillSwitchCfg)
     attribution: AttributionCfg = field(default_factory=AttributionCfg)
+    dead_man: DeadManCfg = field(default_factory=DeadManCfg)
+    telegram: TelegramCfg = field(default_factory=TelegramCfg)
+    fee_gate: FeeGateCfg = field(default_factory=FeeGateCfg)
+    order_policy: OrderPolicyCfg = field(default_factory=OrderPolicyCfg)
+    host_health: HostHealthCfg = field(default_factory=HostHealthCfg)
+    clock_health: ClockHealthCfg = field(default_factory=ClockHealthCfg)
 
     def fingerprint(self) -> str:
         """Stable SHA256 of the config; used for CONFIG_RELOADED payload."""
@@ -155,6 +278,48 @@ class ConfigError(Exception):
     """Raised on malformed risk.yaml."""
 
 
+def _require_positive_int(value: Any, field_name: str, *, max_val: int | None = None) -> int:
+    """Coerce to int; require value > 0; optional upper bound.
+
+    Raises ConfigError on type failure, non-positive value, or over-max.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be an integer, got {value!r}") from exc
+    if v <= 0:
+        raise ConfigError(f"{field_name} must be positive, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_non_negative_int(value: Any, field_name: str, *, max_val: int | None = None) -> int:
+    """Coerce to int; require value >= 0; optional upper bound."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be an integer, got {value!r}") from exc
+    if v < 0:
+        raise ConfigError(f"{field_name} must be non-negative, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_range_float(value: Any, field_name: str, min_val: float, max_val: float) -> float:
+    """Coerce to float; require min_val <= value <= max_val."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be a float, got {value!r}") from exc
+    if not (min_val <= v <= max_val):
+        raise ConfigError(
+            f"{field_name} must be in [{min_val}, {max_val}], got {v}"
+        )
+    return v
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
     """Load RiskConfig from YAML at `path`. Returns defaults if path is None/missing."""
     if path is None:
@@ -174,6 +339,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
 
     try:
         cfg = RiskConfig(
+            capital_mode=bool(raw.get("capital_mode", False)),
             structural=_parse_structural(raw.get("structural", {})),
             venue_health=_parse_venue_health(raw.get("venue_health", {})),
             per_intent=_parse_per_intent(raw.get("per_intent", {})),
@@ -189,6 +355,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> RiskConfig:
             adverse_selection=_parse_adverse_selection(raw.get("adverse_selection", {})),
             kill_switch=_parse_kill_switch(raw.get("kill_switch", {})),
             attribution=_parse_attribution(raw.get("attribution", {})),
+            dead_man=_parse_dead_man(raw.get("dead_man", {})),
+            telegram=_parse_telegram(raw.get("telegram", {})),
+            fee_gate=_parse_fee_gate(raw.get("fee_gate", {})),
+            order_policy=_parse_order_policy(raw.get("order_policy", {})),
+            host_health=_parse_host_health(raw.get("host_health", {})),
+            clock_health=_parse_clock_health(raw.get("clock_health", {})),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
@@ -210,9 +382,9 @@ def _parse_structural(d: dict[str, Any]) -> StructuralCfg:
 
 def _parse_venue_health(d: dict[str, Any]) -> VenueHealthCfg:
     return VenueHealthCfg(
-        window_sec=int(d.get("window_sec", 60)),
-        trip_threshold=int(d.get("trip_threshold", 2)),
-        pause_sec=int(d.get("pause_sec", 120)),
+        window_sec=_require_positive_int(d.get("window_sec", 60), "venue_health.window_sec", max_val=86400),
+        trip_threshold=_require_positive_int(d.get("trip_threshold", 2), "venue_health.trip_threshold", max_val=10000),
+        pause_sec=_require_positive_int(d.get("pause_sec", 120), "venue_health.pause_sec", max_val=86400),
     )
 
 
@@ -251,10 +423,10 @@ def _parse_poisoning(d: dict[str, Any]) -> PoisoningCfg:
     return PoisoningCfg(
         enabled=bool(d.get("enabled", True)),
         detector=str(d.get("detector", "zscore")),
-        window_sec=int(d.get("window_sec", 3600)),
-        z_threshold=float(d.get("z_threshold", 5.0)),
-        pause_sec=int(d.get("pause_sec", 300)),
-        min_samples=int(d.get("min_samples", 20)),
+        window_sec=_require_positive_int(d.get("window_sec", 3600), "poisoning.window_sec", max_val=86400),
+        z_threshold=_require_range_float(d.get("z_threshold", 5.0), "poisoning.z_threshold", 0.5, 20.0),
+        pause_sec=_require_positive_int(d.get("pause_sec", 300), "poisoning.pause_sec", max_val=86400),
+        min_samples=_require_positive_int(d.get("min_samples", 20), "poisoning.min_samples", max_val=10000),
         detector_kwargs=dict(d.get("detector_kwargs", {}) or {}),
     )
 
@@ -270,13 +442,283 @@ def _parse_adverse_selection(d: dict[str, Any]) -> AdverseSelectionCfg:
 
 def _parse_kill_switch(d: dict[str, Any]) -> KillSwitchCfg:
     return KillSwitchCfg(
-        auto_resume_strike_limit=int(d.get("auto_resume_strike_limit", 3)),
-        panic_cooldown_sec=int(d.get("panic_cooldown_sec", 300)),
+        auto_resume_strike_limit=_require_positive_int(
+            d.get("auto_resume_strike_limit", 3),
+            "kill_switch.auto_resume_strike_limit",
+            max_val=100,
+        ),
+        panic_cooldown_sec=_require_non_negative_int(
+            d.get("panic_cooldown_sec", 300),
+            "kill_switch.panic_cooldown_sec",
+            max_val=86400,
+        ),
     )
 
 
 def _parse_attribution(d: dict[str, Any]) -> AttributionCfg:
     return AttributionCfg(exit_horizon_sec=int(d.get("exit_horizon_sec", 300)))
+
+
+def _parse_dead_man(d: dict[str, Any]) -> DeadManCfg:
+    """Phase 4.14b: parse + bounds-check dead-man config.
+
+    Hard limits: 1 <= min_timeout_sec <= default_timeout_sec <=
+    max_timeout_sec <= 86400s (1d). The 86400 cap is a defensive
+    upper bound; the spec recommends 43200s (12h) and below.
+    """
+    enabled = bool(d.get("enabled", False))
+    min_t = _require_positive_int(
+        d.get("min_timeout_sec", 300), "dead_man.min_timeout_sec", max_val=86400
+    )
+    default_t = _require_positive_int(
+        d.get("default_timeout_sec", 21600),
+        "dead_man.default_timeout_sec",
+        max_val=86400,
+    )
+    max_t = _require_positive_int(
+        d.get("max_timeout_sec", 43200), "dead_man.max_timeout_sec", max_val=86400
+    )
+    if not (min_t <= default_t <= max_t):
+        raise ConfigError(
+            f"dead_man bounds violated: require min_timeout_sec <= "
+            f"default_timeout_sec <= max_timeout_sec, got "
+            f"min={min_t} default={default_t} max={max_t}"
+        )
+    return DeadManCfg(
+        enabled=enabled,
+        default_timeout_sec=default_t,
+        min_timeout_sec=min_t,
+        max_timeout_sec=max_t,
+    )
+
+
+def _parse_telegram_watchdog(d: dict[str, Any]) -> TelegramWatchdogCfg:
+    """Phase 4.14c: parse + bounds-check Telegram watchdog config.
+
+    Bounds: stall_threshold_sec in [10, 3600]; poll_interval_sec in
+    [1, 60] and < stall_threshold_sec; max_restarts in [0, 10];
+    restart_window_sec in [60, 3600].
+    """
+    enabled = bool(d.get("enabled", True))
+    stall_threshold_sec = _require_positive_int(
+        d.get("stall_threshold_sec", 120),
+        "telegram.watchdog.stall_threshold_sec",
+        max_val=3600,
+    )
+    if stall_threshold_sec < 10:
+        raise ConfigError(
+            f"telegram.watchdog.stall_threshold_sec must be >= 10, got {stall_threshold_sec}"
+        )
+    poll_interval_sec = _require_positive_int(
+        d.get("poll_interval_sec", 10),
+        "telegram.watchdog.poll_interval_sec",
+        max_val=60,
+    )
+    if poll_interval_sec >= stall_threshold_sec:
+        raise ConfigError(
+            f"telegram.watchdog.poll_interval_sec ({poll_interval_sec}) must be < "
+            f"stall_threshold_sec ({stall_threshold_sec})"
+        )
+    max_restarts = _require_non_negative_int(
+        d.get("max_restarts", 3),
+        "telegram.watchdog.max_restarts",
+        max_val=10,
+    )
+    restart_window_sec = _require_positive_int(
+        d.get("restart_window_sec", 300),
+        "telegram.watchdog.restart_window_sec",
+        max_val=3600,
+    )
+    if restart_window_sec < 60:
+        raise ConfigError(
+            f"telegram.watchdog.restart_window_sec must be >= 60, got {restart_window_sec}"
+        )
+    escalate_on_max = bool(d.get("escalate_on_max", True))
+    return TelegramWatchdogCfg(
+        enabled=enabled,
+        stall_threshold_sec=stall_threshold_sec,
+        poll_interval_sec=poll_interval_sec,
+        max_restarts=max_restarts,
+        restart_window_sec=restart_window_sec,
+        escalate_on_max=escalate_on_max,
+    )
+
+
+def _parse_telegram(d: dict[str, Any]) -> TelegramCfg:
+    return TelegramCfg(watchdog=_parse_telegram_watchdog(d.get("watchdog", {})))
+
+
+def _require_non_negative_float(
+    value: Any, field_name: str, *, max_val: float | None = None
+) -> float:
+    """Coerce to float; require value >= 0; optional upper bound."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be a number, got {value!r}") from exc
+    if v < 0:
+        raise ConfigError(f"{field_name} must be non-negative, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_positive_float(
+    value: Any, field_name: str, *, max_val: float | None = None
+) -> float:
+    """Coerce to float; require value > 0; optional upper bound."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be a number, got {value!r}") from exc
+    if v <= 0:
+        raise ConfigError(f"{field_name} must be positive, got {v}")
+    if max_val is not None and v > max_val:
+        raise ConfigError(f"{field_name} must be <= {max_val}, got {v}")
+    return v
+
+
+def _require_non_negative_decimal(value: Any, field_name: str) -> Decimal:
+    """Coerce to Decimal; require value >= 0."""
+    try:
+        v = Decimal(str(value))
+    except Exception as exc:
+        raise ConfigError(f"{field_name} must be a number, got {value!r}") from exc
+    if v < 0:
+        raise ConfigError(f"{field_name} must be non-negative, got {v}")
+    return v
+
+
+def _parse_fee_gate(d: dict[str, Any]) -> FeeGateCfg:
+    """Phase 4.15: parse fee_gate config.
+
+    Enforces non-negative bps for default, safety margin, and every
+    per-market / per-series override.
+    """
+    enabled = bool(d.get("enabled", True))
+    apply_in_paper_mode = bool(d.get("apply_in_paper_mode", False))
+    default_fee_bps = _require_non_negative_decimal(
+        d.get("default_fee_bps", 0), "fee_gate.default_fee_bps"
+    )
+    safety_margin_bps = _require_non_negative_decimal(
+        d.get("safety_margin_bps", 0), "fee_gate.safety_margin_bps"
+    )
+    per_market: dict[str, Decimal] = {}
+    for k, v in (d.get("per_market_fee_bps") or {}).items():
+        per_market[str(k)] = _require_non_negative_decimal(
+            v, f"fee_gate.per_market_fee_bps[{k!r}]"
+        )
+    per_series: dict[str, Decimal] = {}
+    for k, v in (d.get("per_series_fee_bps") or {}).items():
+        per_series[str(k)] = _require_non_negative_decimal(
+            v, f"fee_gate.per_series_fee_bps[{k!r}]"
+        )
+    return FeeGateCfg(
+        enabled=enabled,
+        apply_in_paper_mode=apply_in_paper_mode,
+        default_fee_bps=default_fee_bps,
+        safety_margin_bps=safety_margin_bps,
+        per_market_fee_bps=per_market,
+        per_series_fee_bps=per_series,
+    )
+
+
+def _parse_order_policy(d: dict[str, Any]) -> OrderPolicyCfg:
+    """Phase 4.15: parse order_policy config.
+
+    allowed_time_in_force is normalized to uppercase. An empty list is
+    rejected — that would mean every intent is unconditionally rejected.
+    """
+    enabled = bool(d.get("enabled", True))
+    apply_in_paper_mode = bool(d.get("apply_in_paper_mode", False))
+    raw_tif = d.get("allowed_time_in_force", ("IOC", "FOK"))
+    if not isinstance(raw_tif, (list, tuple)):
+        raise ConfigError(
+            f"order_policy.allowed_time_in_force must be a list, got {type(raw_tif).__name__}"
+        )
+    if len(raw_tif) == 0:
+        raise ConfigError(
+            "order_policy.allowed_time_in_force must be non-empty; "
+            "empty list would reject every intent"
+        )
+    allowed = tuple(str(x).upper() for x in raw_tif)
+    return OrderPolicyCfg(
+        enabled=enabled,
+        apply_in_paper_mode=apply_in_paper_mode,
+        allowed_time_in_force=allowed,
+        forbid_post_only=bool(d.get("forbid_post_only", True)),
+        forbid_reduce_only=bool(d.get("forbid_reduce_only", False)),
+        require_order_group_id_in_capital_mode=bool(
+            d.get("require_order_group_id_in_capital_mode", True)
+        ),
+        require_buy_max_cost_for_buys_in_capital_mode=bool(
+            d.get("require_buy_max_cost_for_buys_in_capital_mode", True)
+        ),
+    )
+
+
+def _parse_host_health(d: dict[str, Any]) -> HostHealthCfg:
+    """Phase 4.16: parse host_health config.
+
+    Percent thresholds (disk/inode/swap) bounded to [0, 100]. rss_mb_max
+    and loadavg_1m_max accept 0 to disable; otherwise non-negative.
+    """
+    return HostHealthCfg(
+        enabled=bool(d.get("enabled", False)),
+        apply_in_paper_mode=bool(d.get("apply_in_paper_mode", False)),
+        disk_pct_max=_require_non_negative_int(
+            d.get("disk_pct_max", 90), "host_health.disk_pct_max", max_val=100
+        ),
+        inode_pct_max=_require_non_negative_int(
+            d.get("inode_pct_max", 90), "host_health.inode_pct_max", max_val=100
+        ),
+        swap_pct_max=_require_non_negative_int(
+            d.get("swap_pct_max", 50), "host_health.swap_pct_max", max_val=100
+        ),
+        rss_mb_max=_require_non_negative_int(
+            d.get("rss_mb_max", 0), "host_health.rss_mb_max", max_val=10_000_000
+        ),
+        loadavg_1m_max=_require_non_negative_float(
+            d.get("loadavg_1m_max", 0.0),
+            "host_health.loadavg_1m_max",
+            max_val=10_000.0,
+        ),
+        fail_closed_on_probe_error_in_capital_mode=bool(
+            d.get("fail_closed_on_probe_error_in_capital_mode", True)
+        ),
+    )
+
+
+def _parse_clock_health(d: dict[str, Any]) -> ClockHealthCfg:
+    """Phase 4.16: parse clock_health config.
+
+    max_monotonic_wall_skew_ms must be > 0; the gate rejects when an
+    observed skew exceeds this. timedatectl_timeout_sec must be > 0
+    (subprocess timeout).
+    """
+    return ClockHealthCfg(
+        enabled=bool(d.get("enabled", False)),
+        apply_in_paper_mode=bool(d.get("apply_in_paper_mode", False)),
+        require_ntp_sync_in_capital_mode=bool(
+            d.get("require_ntp_sync_in_capital_mode", True)
+        ),
+        max_monotonic_wall_skew_ms=_require_positive_int(
+            d.get("max_monotonic_wall_skew_ms", 2000),
+            "clock_health.max_monotonic_wall_skew_ms",
+            max_val=86_400_000,
+        ),
+        reject_wall_clock_regression=bool(
+            d.get("reject_wall_clock_regression", True)
+        ),
+        timedatectl_timeout_sec=_require_positive_float(
+            d.get("timedatectl_timeout_sec", 2.0),
+            "clock_health.timedatectl_timeout_sec",
+            max_val=60.0,
+        ),
+        fail_closed_on_probe_error_in_capital_mode=bool(
+            d.get("fail_closed_on_probe_error_in_capital_mode", True)
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

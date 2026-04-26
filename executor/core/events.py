@@ -92,6 +92,37 @@ class EventType(str, Enum):
     # were killed after risk admission but before venue emission.
     ORDER_CANCELLED_PRE_SEND = "ORDER_CANCELLED_PRE_SEND"
 
+    # Phase 4.12 — 0g hardening: reject malformed inputs at poisoning boundary.
+    POISONING_INPUT_REJECTED = "POISONING_INPUT_REJECTED"
+    # Phase 4.12 — 0g hardening: detector raised; tracker fail-closed the market.
+    POISONING_DETECTOR_ERROR = "POISONING_DETECTOR_ERROR"
+
+    # Phase 4.13 — operator bypass of fail-closed kill-DB-corruption rebuild.
+    KILL_STATE_FORCE_RESET = "KILL_STATE_FORCE_RESET"
+
+    # Phase 4.14b — dead-man gate (Gate 8.5). Operator-availability
+    # lifecycle: explicit arm/disarm + periodic heartbeat; trip when
+    # heartbeat goes stale. Distinct event types so downstream alerting
+    # can separate operator-liveness signals from kill-switch signals.
+    OPERATOR_ARMED = "OPERATOR_ARMED"
+    OPERATOR_DISARMED = "OPERATOR_DISARMED"
+    OPERATOR_HEARTBEAT = "OPERATOR_HEARTBEAT"
+    DEAD_MAN_TRIPPED = "DEAD_MAN_TRIPPED"
+
+    # Phase 4.14c — Telegram polling watchdog. Detects stalls in the
+    # getUpdates loop and escalates via SOFT kill when restart retries
+    # exhaust. Distinct from kill events so alerting can separate
+    # operator-awareness degradation from kill-switch lifecycle.
+    TELEGRAM_STALL_DETECTED = "TELEGRAM_STALL_DETECTED"
+    TELEGRAM_WATCHDOG_ESCALATED = "TELEGRAM_WATCHDOG_ESCALATED"
+
+    # Phase 4.14d — Codex review fix. Restart lifecycle events so the
+    # watchdog can report per-attempt success/failure (including
+    # timeout containment on hung bot.stop()/bot.start()). Timed-out
+    # or failed attempts still count toward the restart budget.
+    TELEGRAM_WATCHDOG_RESTARTED = "TELEGRAM_WATCHDOG_RESTARTED"
+    TELEGRAM_WATCHDOG_RESTART_FAILED = "TELEGRAM_WATCHDOG_RESTART_FAILED"
+
 
 # Decision 4 prose reads "29 event types" but the enumerated list across
 # groups (3+4+3+5+4+10+2+3) totals 34. We implement every name the spec
@@ -100,9 +131,17 @@ class EventType(str, Enum):
 # (telegram bot + kill-switch lifecycle). Phase 4.5 added SELF_CHECK_OK,
 # SELF_CHECK_FAIL, STATE_SAVED (daemon lifecycle + pipeline self-check).
 # Phase 4.11 added ORDER_CANCELLED_PRE_SEND (Review 9 #3: kill switch
-# between risk admission and venue emit).
+# between risk admission and venue emit). Phase 4.12 added
+# POISONING_INPUT_REJECTED + POISONING_DETECTOR_ERROR (0g hardening:
+# input validation + detector exception fail-closed).
+# Phase 4.14b added OPERATOR_ARMED + OPERATOR_DISARMED +
+# OPERATOR_HEARTBEAT + DEAD_MAN_TRIPPED (dead-man gate lifecycle).
+# Phase 4.14c added TELEGRAM_STALL_DETECTED + TELEGRAM_WATCHDOG_ESCALATED
+# (Telegram polling watchdog).
+# Phase 4.14d added TELEGRAM_WATCHDOG_RESTARTED + TELEGRAM_WATCHDOG_RESTART_FAILED
+# (Codex review: restart attempt observability + timeout containment).
 # Guard against silent drift:
-assert len(EventType) == 40, f"EventType count drift: {len(EventType)}"
+assert len(EventType) == 51, f"EventType count drift: {len(EventType)}"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +155,10 @@ class Source:
     RISK = "risk"
     KILL = "kill"
     TELEGRAM = "telegram"
+    # Phase 4.14d — Codex review fix. Watchdog-originated events use a
+    # distinct source so audit/alerting can separate operator-awareness
+    # degradation from command-path Telegram activity.
+    TELEGRAM_WATCHDOG = "telegram_watchdog"
 
     @staticmethod
     def strategy(strategy_id: str) -> str:

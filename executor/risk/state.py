@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -103,6 +104,20 @@ CREATE TABLE IF NOT EXISTS adverse_selection_pauses (
     reason TEXT,
     source_market_id TEXT
 );
+-- Phase 4.14b: singleton row tracking operator liveness for Gate 8.5.
+-- armed state + timeout + last heartbeat persist across daemon restart,
+-- so a crash mid-session does not secretly disarm the dead-man.
+CREATE TABLE IF NOT EXISTS operator_liveness (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    armed INTEGER NOT NULL DEFAULT 0,
+    armed_ts_ns INTEGER NOT NULL DEFAULT 0,
+    timeout_sec INTEGER NOT NULL DEFAULT 0,
+    last_heartbeat_ts_ns INTEGER NOT NULL DEFAULT 0,
+    armed_by_source TEXT,
+    kill_mode_at_arm TEXT,
+    disarmed_reason TEXT
+);
+INSERT OR IGNORE INTO operator_liveness (id) VALUES (1);
 """
 
 
@@ -113,6 +128,18 @@ class ExposureRecord:
     outcome_id: str
     dollars: Decimal
     event_id: str | None = None
+
+
+class RiskStateCorruptInCapitalMode(RuntimeError):
+    """Raised by ``RiskState.load(capital_mode=True)`` when the cache is
+    corrupt. Phase 4.13.1 Fix #C (GPT-5.5 review #2): under real capital
+    we refuse to start trading on reconstructed state; the operator must
+    investigate why ``risk_state.sqlite`` became corrupt before resuming.
+
+    Paper mode retains the prior best-effort rebuild-from-venues +
+    audit-replay behavior (``capital_mode=False``, the default) so
+    observation windows and tests are unaffected.
+    """
 
 
 def utc_midnight_ns(now_ns: int | None = None) -> int:
@@ -151,10 +178,17 @@ class RiskState:
         *,
         venues: dict[str, Any] | None = None,
         audit_db_path: str | os.PathLike[str] | None = None,
+        capital_mode: bool = False,
     ) -> str:
         """
         Open the SQLite cache. On corruption, delete + rebuild from venues.
         Returns one of: "loaded", "rebuilt_venues", "rebuilt_audit_fallback".
+
+        Phase 4.13.1 Fix #C: when ``capital_mode=True``, corrupt cache is
+        NOT auto-rebuilt. Instead ``RiskStateCorruptInCapitalMode`` is
+        raised so the daemon refuses to start on reconstructed state.
+        Paper mode (``capital_mode=False``, default) preserves the prior
+        best-effort rebuild + audit-replay behavior.
         """
         outcome = await asyncio.to_thread(self._try_open)
         if outcome == "ok":
@@ -163,7 +197,22 @@ class RiskState:
             log.info("risk.state.loaded", db=str(self._db_path))
             return "loaded"
 
-        # Corrupt / missing — rebuild.
+        # Corrupt / missing path.
+        if capital_mode:
+            # Fail-closed: do not rebuild from venues, do not replay audit.
+            # The operator must investigate the corruption before resuming.
+            log.error(
+                "risk.state.corrupt_capital_mode_halt",
+                reason=outcome,
+                db=str(self._db_path),
+            )
+            raise RiskStateCorruptInCapitalMode(
+                f"risk_state.sqlite unreadable under capital_mode "
+                f"(reason={outcome}, path={self._db_path}); "
+                "refusing to start on reconstructed state — operator must "
+                "investigate the corruption before resuming trading"
+            )
+
         log.warning("risk.state.cache_corrupt_rebuilding", reason=outcome, db=str(self._db_path))
         try:
             if self._db_path.exists():
@@ -195,6 +244,14 @@ class RiskState:
                 self._conn.close()
             self._conn = None
         self._started = False
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Expose the SQLite handle for co-located stores (Phase 4.14b:
+        OperatorLivenessStore). Raises if called before load()."""
+        if self._conn is None:
+            raise RuntimeError("RiskState.connection accessed before load()")
+        return self._conn
 
     # ------------------------------------------------------------------
     # Open / schema
@@ -527,3 +584,189 @@ class RiskState:
             "DELETE FROM adverse_selection_pauses WHERE venue = ?", (venue,)
         )
         self._conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.14b — operator liveness store backing Gate 8.5 (dead-man).
+#
+# Shares the risk_state.sqlite connection; lives as a small class to keep
+# the arm/disarm/heartbeat/status surface co-located. Armed state,
+# armed_ts_ns, and last_heartbeat_ts_ns all persist across daemon restart
+# — a crash at T=3h with timeout=6h leaves 3h remaining, not a reset.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OperatorLivenessSnapshot:
+    armed: bool
+    armed_ts_ns: int
+    timeout_sec: int
+    last_heartbeat_ts_ns: int
+    armed_by_source: str | None
+    kill_mode_at_arm: str | None
+    disarmed_reason: str | None
+
+
+class OperatorLivenessStore:
+    """Singleton-row store for operator arm/disarm/heartbeat state.
+
+    The backing table is created by SCHEMA_SQL; the singleton row (id=1)
+    is seeded via INSERT OR IGNORE on every connection open so fresh
+    DBs have a valid starting row (armed=0).
+
+    Phase 4.14e — atomicity + writer serialization.
+
+    The backing sqlite3 connection is shared with the rest of
+    RiskState and is opened with ``check_same_thread=False``, which
+    permits cross-thread use at the cost of interleaved
+    read/branch/write sequences. Before this change ``heartbeat()``
+    performed ``load()`` → branch-on-armed → ``UPDATE``, so a
+    ``disarm()`` landing between the load and the update could leave
+    the row disarmed while still accepting the heartbeat write. The
+    caller would also see ``True`` and treat the heartbeat as
+    applied.
+
+    Hardening:
+      * ``heartbeat`` is now a single conditional ``UPDATE ...
+        WHERE armed = 1``; ``cursor.rowcount`` determines whether
+        the write applied (and therefore whether the caller sees
+        ``True``).
+      * ``_write_lock`` (``threading.RLock``) serializes every
+        arm/disarm/heartbeat write + commit sequence, so two writers
+        never share the connection cursor mid-transaction.
+      * ``load``/``status`` take the same lock: SQLite
+        isolation-level is autocommit-per-execute here, but the
+        lock keeps reads consistent against concurrent writers
+        (no partial ``last_heartbeat_ts_ns`` observed across the
+        write boundary).
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        # RLock so nested calls on the same thread (e.g. load() from
+        # status() while another method holds the lock) don't self-
+        # deadlock. Shared singleton lock: only one writer at a time.
+        self._write_lock = threading.RLock()
+        # Defensive: guarantee singleton row exists even if this store is
+        # constructed against a connection opened before SCHEMA_SQL ran.
+        with self._write_lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO operator_liveness (id) VALUES (1)"
+            )
+            self._conn.commit()
+
+    def load(self) -> OperatorLivenessSnapshot:
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT armed, armed_ts_ns, timeout_sec, last_heartbeat_ts_ns, "
+                "armed_by_source, kill_mode_at_arm, disarmed_reason "
+                "FROM operator_liveness WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            # Should be unreachable given INSERT OR IGNORE above, but be
+            # explicit rather than returning silently wrong state.
+            return OperatorLivenessSnapshot(
+                armed=False,
+                armed_ts_ns=0,
+                timeout_sec=0,
+                last_heartbeat_ts_ns=0,
+                armed_by_source=None,
+                kill_mode_at_arm=None,
+                disarmed_reason=None,
+            )
+        return OperatorLivenessSnapshot(
+            armed=bool(row[0]),
+            armed_ts_ns=int(row[1]),
+            timeout_sec=int(row[2]),
+            last_heartbeat_ts_ns=int(row[3]),
+            armed_by_source=row[4],
+            kill_mode_at_arm=row[5],
+            disarmed_reason=row[6],
+        )
+
+    def arm(
+        self,
+        *,
+        timeout_sec: int,
+        source: str,
+        kill_mode: str,
+        now_ns: int,
+    ) -> None:
+        """Engage the dead-man. Records kill_mode at arm time for audit.
+
+        last_heartbeat is set to now_ns so the first 'timeout_sec' window
+        starts from arm time; the operator does not need an immediate
+        heartbeat after arm.
+        """
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE operator_liveness SET "
+                "armed = 1, armed_ts_ns = ?, timeout_sec = ?, "
+                "last_heartbeat_ts_ns = ?, armed_by_source = ?, "
+                "kill_mode_at_arm = ?, disarmed_reason = NULL "
+                "WHERE id = 1",
+                (int(now_ns), int(timeout_sec), int(now_ns), source, kill_mode),
+            )
+            self._conn.commit()
+
+    def disarm(self, *, reason: str, now_ns: int) -> None:
+        """Clear armed state, recording reason for audit trail.
+
+        now_ns is accepted for API symmetry and potential future auditing
+        of disarm times; it is not currently persisted on the row (the
+        OPERATOR_DISARMED audit event carries the timestamp).
+        """
+        del now_ns  # reserved for future use
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE operator_liveness SET armed = 0, disarmed_reason = ? "
+                "WHERE id = 1",
+                (reason,),
+            )
+            self._conn.commit()
+
+    def heartbeat(self, *, now_ns: int) -> bool:
+        """Reset-to-full heartbeat. No-op on disarmed state (returns False).
+
+        Phase 4.14e — atomic conditional write. The armed-state check
+        and the last_heartbeat_ts_ns update are now a single
+        ``UPDATE ... WHERE armed = 1`` statement. If the row is
+        disarmed the ``rowcount`` is zero, ``last_heartbeat_ts_ns``
+        is NOT advanced, and the caller sees ``False`` — so a
+        concurrent ``disarm()`` landing during a heartbeat cannot
+        leave the row with a fresh heartbeat timestamp on a
+        disarmed state.
+
+        Returns True if the heartbeat write applied (row was armed),
+        False otherwise (no write — does not silently re-arm or
+        refresh heartbeat on a disarmed row).
+        """
+        with self._write_lock:
+            cur = self._conn.execute(
+                "UPDATE operator_liveness SET last_heartbeat_ts_ns = ? "
+                "WHERE id = 1 AND armed = 1",
+                (int(now_ns),),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def status(self, *, now_ns: int) -> dict[str, Any]:
+        snap = self.load()
+        if snap.armed:
+            deadline_ns = snap.last_heartbeat_ts_ns + snap.timeout_sec * 1_000_000_000
+            seconds_until_stale = (deadline_ns - int(now_ns)) / 1e9
+            seconds_since_armed = (int(now_ns) - snap.armed_ts_ns) / 1e9
+        else:
+            seconds_until_stale = 0.0
+            seconds_since_armed = 0.0
+        return {
+            "armed": snap.armed,
+            "armed_ts_ns": snap.armed_ts_ns,
+            "timeout_sec": snap.timeout_sec,
+            "last_heartbeat_ts_ns": snap.last_heartbeat_ts_ns,
+            "armed_by_source": snap.armed_by_source,
+            "kill_mode_at_arm": snap.kill_mode_at_arm,
+            "disarmed_reason": snap.disarmed_reason,
+            "seconds_until_stale": seconds_until_stale,
+            "seconds_since_armed": seconds_since_armed,
+        }

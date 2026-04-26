@@ -27,7 +27,7 @@ from .config import ConfigManager, RiskConfig
 from .exposure import intent_notional_dollars, leg_notional_dollars
 from .gates import Gate, default_gate_chain
 from .kill import KillSwitch
-from .state import RiskState
+from .state import OperatorLivenessStore, RiskState
 from .types import GateCtx, GateDecision, GateResult, RiskVerdict
 from .venue_health import VenueHealth
 
@@ -54,6 +54,7 @@ class RiskPolicy:
         adverse_selection: AdverseSelectionDetector,
         publish: Publish | None = None,
         gates: list[Gate] | None = None,
+        operator_liveness: OperatorLivenessStore | None = None,
     ) -> None:
         self._cfg_mgr = config_manager
         self.state = state
@@ -84,6 +85,11 @@ class RiskPolicy:
             )
         self.adverse_selection = adverse_selection
         self._publish = publish
+        # Phase 4.14b: operator liveness store for Gate 8.5 (dead-man).
+        # Optional; DeadManGate fails closed when cfg.dead_man.enabled=True
+        # but this is None. Tests without a wired store rely on
+        # dead_man.enabled defaulting to False.
+        self.operator_liveness = operator_liveness
         self.gates: list[Gate] = gates if gates is not None else default_gate_chain()
 
         # Registries consumed by gates. Populate via setter methods.
@@ -341,6 +347,40 @@ class RiskPolicy:
     ) -> None:
         if self._publish is None:
             return
+        # Phase 4.14d (Codex review): first-class DEAD_MAN_TRIPPED for
+        # stale operator heartbeat. DeadManGate tags its stale-reject
+        # metadata with kind="dead_man_stale" and the forensic fields
+        # listed below. We emit the trip event BEFORE the terminal
+        # GATE_REJECTED so downstream alerting observes the dead-man
+        # cause-signal first. Dual emission is intentional — general
+        # reject consumers still see GATE_REJECTED.
+        if (
+            gate.name == "dead_man"
+            and result.metadata.get("kind") == "dead_man_stale"
+        ):
+            await self._publish(
+                Event.make(
+                    EventType.DEAD_MAN_TRIPPED,
+                    source=Source.RISK,
+                    intent_id=ctx.original_intent.intent_id,
+                    strategy_id=ctx.original_intent.strategy_id,
+                    payload={
+                        "last_heartbeat_ts_ns": int(
+                            result.metadata.get("last_heartbeat_ts_ns", 0)
+                        ),
+                        "timeout_sec": int(
+                            result.metadata.get("timeout_sec", 0)
+                        ),
+                        "deadline_ns": int(
+                            result.metadata.get("deadline_ns", 0)
+                        ),
+                        "now_ns": int(result.metadata.get("now_ns", 0)),
+                        "stale_sec": result.metadata.get("stale_sec"),
+                        "intent_id": ctx.original_intent.intent_id,
+                        "strategy_id": ctx.original_intent.strategy_id,
+                    },
+                )
+            )
         await self._publish(
             Event.make(
                 EventType.GATE_REJECTED,

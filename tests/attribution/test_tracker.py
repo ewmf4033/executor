@@ -7,6 +7,7 @@ from pathlib import Path
 
 from executor.attribution.tracker import AttributionTracker
 from executor.core.types import Side
+from executor.risk.state import RiskState
 
 
 def _tracker(tmp_path: Path, *, exit_horizon_sec: int = 1) -> AttributionTracker:
@@ -193,3 +194,65 @@ def test_prune_noop_on_unknown_intent(tmp_path: Path) -> None:
     # No crash, returns 0.
     assert t.prune_intent("never-seen") == 0
     t.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.13.2: fee-aware PnL fed to gate_13 (daily_loss).
+# ---------------------------------------------------------------------------
+
+
+def test_settle_due_subtracts_fee_from_pnl(tmp_path: Path) -> None:
+    """BUY fill with fee=0.50: gross PnL 10.00 → net 9.50 into record_pnl."""
+    state = RiskState(db_path=tmp_path / "rstate.sqlite")
+    asyncio.run(state.load())
+    try:
+        tracker = AttributionTracker(
+            db_path=tmp_path / "attr.sqlite",
+            exit_horizon_sec=0,
+            risk_state=state,
+        )
+        tracker.update_mid("kalshi", "m", Decimal("0.50"))
+        tracker.on_fill(
+            fill_id="f1", order_id="o1", intent_id="i1", leg_id="l1",
+            strategy_id="s_fee", venue="kalshi", market_id="m",
+            side=Side.BUY, size=Decimal("100"), fill_price=Decimal("0.40"),
+            fill_ts_ns=1, intent_price=Decimal("0.40"),
+            fee=Decimal("0.50"),
+        )
+        settle_ns = 2_000_000_000
+        settled = asyncio.run(tracker.settle_due(now_ns=settle_ns))
+        assert len(settled) == 1
+        # Gross: (0.50 - 0.40) * 100 = 10.00 ; fee: 0.50 ; net: 9.50.
+        pnl = state.daily_pnl("s_fee", now_ns=settle_ns)
+        assert pnl == Decimal("9.50"), f"expected 9.50, got {pnl}"
+        tracker.close()
+    finally:
+        state.close()
+
+
+def test_settle_due_fee_none_treats_as_zero(tmp_path: Path) -> None:
+    """fee=None → treated as 0; gross PnL 10.00 passes through unchanged."""
+    state = RiskState(db_path=tmp_path / "rstate.sqlite")
+    asyncio.run(state.load())
+    try:
+        tracker = AttributionTracker(
+            db_path=tmp_path / "attr.sqlite",
+            exit_horizon_sec=0,
+            risk_state=state,
+        )
+        tracker.update_mid("kalshi", "m", Decimal("0.50"))
+        tracker.on_fill(
+            fill_id="f1", order_id="o1", intent_id="i1", leg_id="l1",
+            strategy_id="s_nofee", venue="kalshi", market_id="m",
+            side=Side.BUY, size=Decimal("100"), fill_price=Decimal("0.40"),
+            fill_ts_ns=1, intent_price=Decimal("0.40"),
+            # fee omitted => None
+        )
+        settle_ns = 2_000_000_000
+        settled = asyncio.run(tracker.settle_due(now_ns=settle_ns))
+        assert len(settled) == 1
+        pnl = state.daily_pnl("s_nofee", now_ns=settle_ns)
+        assert pnl == Decimal("10.00"), f"expected 10.00, got {pnl}"
+        tracker.close()
+    finally:
+        state.close()

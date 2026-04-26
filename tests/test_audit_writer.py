@@ -16,6 +16,23 @@ from executor.core.events import Event, EventType, Source
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Replace the Telegram sender with a no-op for all tests in this file.
+
+    The audit writer calls _send_telegram_alert_direct() on the panic
+    path. Without this fixture, tests that exercise the threshold/panic
+    path send real alerts to the live bot token. This autouse fixture
+    protects against that leak. Tests that want to capture alert calls
+    can still override via their own monkeypatch.setattr.
+    """
+    monkeypatch.setattr(
+        "executor.audit.writer._send_telegram_alert_direct",
+        lambda text: None,
+    )
+
+
+
 async def test_schema_and_insert_round_trip():
     with tempfile.TemporaryDirectory() as td:
         w = AuditWriter(td)
@@ -205,4 +222,51 @@ async def test_set_kill_manager_late_binding():
             await w.on_event(_event())
             await w.on_event(_event())
         assert len(km.engage_calls) == 1
+        await w.stop()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.13.1 Fix #B — capital_mode-aware fail-closed escalation.
+# ---------------------------------------------------------------------------
+
+
+async def test_audit_fail_closed_hard_in_capital_mode():
+    """capital_mode=True + write failures ≥ threshold → engage called with
+    mode=HARD and cancel_open_orders=True."""
+    from executor.kill.state import KillMode
+
+    with tempfile.TemporaryDirectory() as td:
+        km = _FakeKillManager()
+        w = AuditWriter(td, kill_manager=km, fail_threshold=2, capital_mode=True)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            await w.on_event(_event())
+            await w.on_event(_event())
+        assert len(km.engage_calls) == 1
+        call = km.engage_calls[0]
+        assert call["mode"] is KillMode.HARD
+        assert call["cancel_open_orders"] is True
+        assert call["panic"] is True
+        assert call["source"] == "audit"
+        await w.stop()
+
+
+async def test_audit_fail_closed_soft_in_paper_mode():
+    """capital_mode=False (default, paper) + write failures → engage called
+    with mode=SOFT and cancel_open_orders=False, preserving prior behavior."""
+    from executor.kill.state import KillMode
+
+    with tempfile.TemporaryDirectory() as td:
+        km = _FakeKillManager()
+        # capital_mode defaults to False; construct explicitly for clarity.
+        w = AuditWriter(td, kill_manager=km, fail_threshold=2, capital_mode=False)
+        await w.start()
+        with patch.object(w, "write", side_effect=RuntimeError("io")):
+            await w.on_event(_event())
+            await w.on_event(_event())
+        assert len(km.engage_calls) == 1
+        call = km.engage_calls[0]
+        assert call["mode"] is KillMode.SOFT
+        assert call["cancel_open_orders"] is False
+        assert call["panic"] is True
         await w.stop()
