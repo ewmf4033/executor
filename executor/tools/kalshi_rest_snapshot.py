@@ -125,8 +125,26 @@ FetchResult = tuple[int, Any, float]
 Fetch = Callable[[str, str, float], FetchResult]
 
 
+def _guarded_fetch(
+    fetch: "Fetch", method: str, url: str, timeout_sec: float
+) -> "FetchResult":
+    """Run ``_assert_public_get`` on the URL path before delegating to ``fetch``.
+
+    All public-facing call sites (``discover_markets``, ``fetch_market``,
+    ``fetch_orderbook``) MUST go through this helper. Even though
+    ``default_fetch`` re-runs the guard internally, custom fetches injected
+    by tests or callers may not — so we enforce here, before any I/O can
+    happen, regardless of the fetch implementation.
+    """
+    path = urllib.parse.urlparse(url).path
+    _assert_public_get(method, path)
+    return fetch(method, url, timeout_sec)
+
+
 def default_fetch(method: str, url: str, timeout_sec: float) -> FetchResult:
     """stdlib-only HTTP GET. Returns (status, parsed_body, elapsed_ms)."""
+    # Defense in depth: ``_guarded_fetch`` already asserted, but keep this
+    # in case ``default_fetch`` is called directly somewhere.
     _assert_public_get(method, urllib.parse.urlparse(url).path)
     req = urllib.request.Request(url, method=method)
     req.add_header("Accept", "application/json")
@@ -176,7 +194,7 @@ def discover_markets(
         params["limit"] = max(limit, 100)
     url = build_url(base_url, "/markets", params)
     try:
-        code, body, elapsed_ms = fetch(ALLOWED_METHOD, url, timeout_sec)
+        code, body, elapsed_ms = _guarded_fetch(fetch, ALLOWED_METHOD, url, timeout_sec)
     except urllib.error.URLError as exc:  # transport / DNS / timeout
         raise RuntimeError(f"markets discovery transport error: {exc}") from exc
     if code < 200 or code >= 300:
@@ -195,7 +213,7 @@ def fetch_market(
     """Fetch /markets/{ticker}. Returns (market_dict_or_none, elapsed_ms, error)."""
     url = build_url(base_url, f"/markets/{ticker}")
     try:
-        code, body, elapsed_ms = fetch(ALLOWED_METHOD, url, timeout_sec)
+        code, body, elapsed_ms = _guarded_fetch(fetch, ALLOWED_METHOD, url, timeout_sec)
     except Exception as exc:
         return None, 0.0, f"transport: {exc!r}"
     if code < 200 or code >= 300:
@@ -212,7 +230,7 @@ def fetch_orderbook(
     """Fetch /markets/{ticker}/orderbook. Returns (orderbook_or_none, elapsed_ms, error)."""
     url = build_url(base_url, f"/markets/{ticker}/orderbook")
     try:
-        code, body, elapsed_ms = fetch(ALLOWED_METHOD, url, timeout_sec)
+        code, body, elapsed_ms = _guarded_fetch(fetch, ALLOWED_METHOD, url, timeout_sec)
     except Exception as exc:
         return None, 0.0, f"transport: {exc!r}"
     if code < 200 or code >= 300:
@@ -302,7 +320,15 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=None,
         help="Repeatable. If given, skip discovery and capture only these tickers.",
     )
-    parser.add_argument("--sleep-sec", type=float, default=0.25)
+    parser.add_argument(
+        "--sleep-sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Pacing between per-ticker requests, seconds. Default 1.0; "
+            "minimum allowed 0.2."
+        ),
+    )
     parser.add_argument("--out", default=None, help="Output JSONL path.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -322,6 +348,8 @@ def run(
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     args = _parse_args(list(argv) if argv is not None else sys.argv[1:])
+    if args.sleep_sec < 0.2:
+        raise ValueError("--sleep-sec must be >= 0.2")
     do_fetch = fetch or default_fetch
 
     out_path = Path(args.out) if args.out else default_output_path()

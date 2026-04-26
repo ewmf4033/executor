@@ -115,7 +115,7 @@ def test_dry_run_does_not_write_output(tmp_path: Path):
         }
     )
     rc = snap.run(
-        ["--limit", "5", "--dry-run", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "5", "--dry-run", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -137,7 +137,7 @@ def test_jsonl_includes_captured_timestamps(tmp_path: Path):
         }
     )
     rc = snap.run(
-        ["--limit", "1", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "1", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -164,7 +164,7 @@ def test_limit_is_respected(tmp_path: Path):
         responses[f"/trade-api/v2/markets/{t}/orderbook"] = (200, _orderbook_payload(t))
     fake = FakeFetch(responses)
     rc = snap.run(
-        ["--limit", "3", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "3", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -194,7 +194,7 @@ def test_series_prefix_filter(tmp_path: Path):
             "--out",
             str(out),
             "--sleep-sec",
-            "0",
+            "0.2",
         ],
         fetch=fake,
         sleep=lambda s: None,
@@ -228,7 +228,7 @@ def test_explicit_tickers_skip_discovery(tmp_path: Path):
             "--out",
             str(out),
             "--sleep-sec",
-            "0",
+            "0.2",
         ],
         fetch=fake,
         sleep=lambda s: None,
@@ -256,7 +256,7 @@ def test_per_orderbook_failure_continues(tmp_path: Path):
         }
     )
     rc = snap.run(
-        ["--limit", "5", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "5", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -283,7 +283,7 @@ def test_initial_markets_fetch_failure_exits_nonzero(tmp_path: Path):
         }
     )
     rc = snap.run(
-        ["--limit", "5", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "5", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -309,7 +309,7 @@ def test_does_not_require_kalshi_credentials(tmp_path: Path, monkeypatch):
         }
     )
     rc = snap.run(
-        ["--limit", "1", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "1", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -345,7 +345,7 @@ def test_no_forbidden_path_during_normal_capture(tmp_path: Path):
         }
     )
     rc = snap.run(
-        ["--limit", "5", "--out", str(out), "--sleep-sec", "0"],
+        ["--limit", "5", "--out", str(out), "--sleep-sec", "0.2"],
         fetch=fake,
         sleep=lambda s: None,
     )
@@ -354,3 +354,133 @@ def test_no_forbidden_path_during_normal_capture(tmp_path: Path):
         assert method == "GET"
         for forbidden in snap.FORBIDDEN_PATH_PARTS:
             assert forbidden not in url, f"forbidden segment {forbidden!r} hit: {url}"
+
+
+# ---------------------------------------------------------------------------
+# 15. Codex F1 — guard is enforced by _guarded_fetch wrapper, not just default_fetch
+# ---------------------------------------------------------------------------
+
+
+class NaiveFetch:
+    """A fetch that records calls but does NOT enforce ``_assert_public_get``.
+
+    Used to prove that the wrapper (``_guarded_fetch``) rejects forbidden
+    paths before any I/O can happen, regardless of whether the underlying
+    fetch performs its own check.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, method: str, url: str, timeout_sec: float):
+        self.calls.append((method, url))
+        return 200, {"ok": True}, 0.0
+
+
+def test_guarded_fetch_rejects_forbidden_path_before_calling_fetch():
+    naive = NaiveFetch()
+    forbidden_url = "https://api.elections.kalshi.com/trade-api/v2/portfolio/balance"
+    with pytest.raises(ValueError, match="forbidden path segment"):
+        snap._guarded_fetch(naive, "GET", forbidden_url, 1.0)
+    assert naive.calls == []
+
+
+def test_guarded_fetch_rejects_non_get_before_calling_fetch():
+    naive = NaiveFetch()
+    public_url = "https://api.elections.kalshi.com/trade-api/v2/markets"
+    with pytest.raises(ValueError, match="forbidden method"):
+        snap._guarded_fetch(naive, "POST", public_url, 1.0)
+    assert naive.calls == []
+
+
+def test_guarded_fetch_passes_through_legitimate_request():
+    naive = NaiveFetch()
+    public_url = "https://api.elections.kalshi.com/trade-api/v2/markets"
+    code, body, _ = snap._guarded_fetch(naive, "GET", public_url, 1.0)
+    assert code == 200
+    assert body == {"ok": True}
+    assert naive.calls == [("GET", public_url)]
+
+
+# ---------------------------------------------------------------------------
+# 16. Codex F2 — sleep-sec default is >= 1.0 and validation rejects < 0.2
+# ---------------------------------------------------------------------------
+
+
+def test_cli_default_sleep_sec_is_at_least_one_second():
+    args = snap._parse_args([])
+    assert args.sleep_sec >= 1.0
+
+
+def test_run_rejects_sleep_sec_below_minimum(tmp_path: Path):
+    out = tmp_path / "out.jsonl"
+    fake = FakeFetch(
+        {"/trade-api/v2/markets": (200, _markets_payload(["A"]))}
+    )
+    with pytest.raises(ValueError, match=">= 0.2"):
+        snap.run(
+            ["--limit", "1", "--out", str(out), "--sleep-sec", "0.1"],
+            fetch=fake,
+            sleep=lambda s: None,
+        )
+    assert not out.exists()
+
+
+def test_run_accepts_explicit_sleep_sec_at_minimum(tmp_path: Path):
+    """Explicit values >= 0.2 are accepted — operator override remains."""
+    out = tmp_path / "out.jsonl"
+    fake = FakeFetch(
+        {
+            "/trade-api/v2/markets": (200, _markets_payload(["A"])),
+            "/trade-api/v2/markets/A/orderbook": (200, _orderbook_payload("A")),
+        }
+    )
+    rc = snap.run(
+        ["--limit", "1", "--out", str(out), "--sleep-sec", "0.2"],
+        fetch=fake,
+        sleep=lambda s: None,
+    )
+    assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# 17. Codex F3 — append mode preserves pre-existing JSONL content
+# ---------------------------------------------------------------------------
+
+
+def test_append_preserves_pre_existing_jsonl(tmp_path: Path):
+    out = tmp_path / "out.jsonl"
+    # Pre-seed two existing JSONL lines from a prior run.
+    pre_existing = [
+        {"source": "kalshi_rest_public", "ticker": "OLD-1", "captured_wall_ts_ns": 1},
+        {"source": "kalshi_rest_public", "ticker": "OLD-2", "captured_wall_ts_ns": 2},
+    ]
+    out.write_text(
+        "\n".join(json.dumps(r, sort_keys=True) for r in pre_existing) + "\n",
+        encoding="utf-8",
+    )
+    pre_existing_text = out.read_text()
+
+    fake = FakeFetch(
+        {
+            "/trade-api/v2/markets": (200, _markets_payload(["NEW-1"])),
+            "/trade-api/v2/markets/NEW-1/orderbook": (200, _orderbook_payload("NEW-1")),
+        }
+    )
+    rc = snap.run(
+        ["--limit", "1", "--out", str(out), "--sleep-sec", "0.2"],
+        fetch=fake,
+        sleep=lambda s: None,
+    )
+    assert rc == 0
+
+    final_text = out.read_text()
+    # Original prefix must still be at the start (no truncation, no overwrite).
+    assert final_text.startswith(pre_existing_text)
+
+    lines = final_text.splitlines()
+    assert len(lines) == 3
+    parsed = [json.loads(line) for line in lines]
+    assert parsed[0]["ticker"] == "OLD-1"
+    assert parsed[1]["ticker"] == "OLD-2"
+    assert parsed[2]["ticker"] == "NEW-1"
