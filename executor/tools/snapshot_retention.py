@@ -218,6 +218,42 @@ def _today_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
+# ---------------------------------------------------------------------------
+# Stderr sanitization (Codex 5a.2.1 — never leak raw subprocess stderr)
+# ---------------------------------------------------------------------------
+
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?]+)\?\S+")
+_AUTH_HEADER_RE = re.compile(r"(?i)(Authorization\s*:\s*)\S+(?:\s+\S+)?")
+_SENSITIVE_KV_RE = re.compile(
+    r"(?i)\b("
+    r"application_key_id|application_key|access_key_id|access_key|"
+    r"api_key|api_token|auth_token|"
+    r"password|secret|token|auth|key"
+    r")(\s*[=:]\s*)(\S+)"
+)
+
+
+def _sanitize_stderr(text: str) -> str:
+    """Mask sensitive substrings in subprocess stderr before display.
+
+    Masks:
+      - URL query strings (keep scheme://host/path, drop query).
+      - Authorization: <token> headers.
+      - key=value / key: value patterns where the key is one of
+        application_key_id, access_key_id, password, secret, token, auth, key
+        (case-insensitive).
+
+    Leaves bucket names, file paths, status codes, numeric values, rclone
+    subcommand names, and date strings untouched.
+    """
+    if not text:
+        return ""
+    text = _URL_QUERY_RE.sub(r"\1?***REDACTED***", text)
+    text = _AUTH_HEADER_RE.sub(r"\1***REDACTED***", text)
+    text = _SENSITIVE_KV_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}***REDACTED***", text)
+    return text.strip()
+
+
 def _discover(snapshot_dir: Path) -> dict[str, dict[str, Any]]:
     """Discover snapshot artifacts grouped by date.
 
@@ -403,6 +439,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
     dry_run = not args.i_confirm_snapshot_upload
     verbose = args.verbose
     dates = _discover(snapshot_dir)
+    today = _today_utc()
 
     if dry_run:
         # Dry-run: ZERO subprocess calls.
@@ -411,6 +448,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
             gz = info["gz"]
             sidecar = info["sidecar"]
             if gz is None:
+                continue
+            if date_str == today:
+                print(f"[dry-run] skip date={date_str} reason=today_utc")
                 continue
             if sidecar is None:
                 print(f"[dry-run] SKIP {gz.name}: orphan gz (no sidecar)")
@@ -432,6 +472,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
             gz = info["gz"]
             sidecar = info["sidecar"]
             if gz is None:
+                continue
+            if date_str == today:
+                print(f"skip date={date_str} reason=today_utc")
                 continue
             if sidecar is None:
                 print(f"SKIP {gz.name}: orphan gz (no sidecar)", file=sys.stderr)
@@ -459,7 +502,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
             if result.returncode != 0:
                 msg = "rclone upload failed"
                 if verbose:
-                    msg += f": {result.stderr.strip()}"
+                    sanitized = _sanitize_stderr(result.stderr)
+                    if sanitized:
+                        msg += f": {sanitized}"
                 print(f"ERROR: {msg}", file=sys.stderr)
                 return 1
             print(f"uploaded {gz.name} -> {remote_dest}")
@@ -492,7 +537,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if result.returncode != 0:
         msg = "rclone size failed"
         if verbose:
-            msg += f": {result.stderr.strip()}"
+            sanitized = _sanitize_stderr(result.stderr)
+            if sanitized:
+                msg += f": {sanitized}"
         print(f"ERROR: {msg}", file=sys.stderr)
         return 1
 
@@ -524,6 +571,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     snapshot_dir = Path(args.snapshot_dir)
     execute = args.execute
     dates = _discover(snapshot_dir)
+    today = _today_utc()
 
     lock_path: Path | None = None
     if execute:
@@ -532,11 +580,16 @@ def cmd_prune(args: argparse.Namespace) -> int:
     try:
         pruned = 0
         refused = 0
+        skipped = 0
 
         for date_str in sorted(dates):
             info = dates[date_str]
             gz = info["gz"]
             if gz is None:
+                continue
+            if date_str == today:
+                print(f"skip date={date_str} reason=today_utc")
+                skipped += 1
                 continue
             sidecar_p = info["sidecar"]
             if sidecar_p is None:
@@ -591,7 +644,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
             print(f"pruned {gz.name}")
             pruned += 1
 
-        print(f"\nPruned: {pruned}, Refused: {refused}")
+        print(f"\nPruned: {pruned}, Refused: {refused}, Skipped: {skipped}")
         return 0
     finally:
         if lock_path:
@@ -642,7 +695,9 @@ def cmd_restore(args: argparse.Namespace) -> int:
     if result.returncode != 0:
         msg = "rclone restore failed"
         if verbose:
-            msg += f": {result.stderr.strip()}"
+            sanitized = _sanitize_stderr(result.stderr)
+            if sanitized:
+                msg += f": {sanitized}"
         print(f"ERROR: {msg}", file=sys.stderr)
         return 1
 

@@ -51,6 +51,7 @@ from executor.tools.snapshot_retention import (
     _load_sidecar,
     _proc_start_time,
     _release_lock,
+    _sanitize_stderr,
     _sidecar_path,
     _today_utc,
     _write_sidecar,
@@ -641,3 +642,216 @@ class TestStderrHygiene:
         assert rc == 1
         captured = capsys.readouterr()
         assert "VERBOSE_ERROR_DETAILS" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Today UTC guard — prune & upload (Codex 5a.2.1 #1)
+# ---------------------------------------------------------------------------
+
+class TestTodayUtcGuard:
+    def test_prune_skips_today_utc_even_with_valid_sidecar(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        today = _today_utc()
+        _, gz, _ = _make_gz_and_sidecar(snap, today, verified=True)
+        rc = cmd_prune(_ns(snapshot_dir=str(snap), execute=True))
+        assert rc == 0
+        assert gz.exists()
+        out = capsys.readouterr().out
+        assert f"skip date={today} reason=today_utc" in out
+
+    def test_upload_dry_run_skips_today_utc(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        today = _today_utc()
+        _make_gz_and_sidecar(snap, today)
+        with mock.patch("subprocess.run", side_effect=AssertionError("subprocess called")):
+            rc = cmd_upload(_ns(
+                snapshot_dir=str(snap),
+                i_confirm_snapshot_upload=False,
+                verbose=False,
+            ))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"skip date={today} reason=today_utc" in out
+        assert "would upload" not in out
+
+    def test_upload_live_skips_today_utc(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        today = _today_utc()
+        _make_gz_and_sidecar(snap, today)
+        calls: list[Any] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            r = mock.Mock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc = cmd_upload(_ns(
+                snapshot_dir=str(snap),
+                i_confirm_snapshot_upload=True,
+                verbose=False,
+            ))
+        assert rc == 0
+        # No rclone call for today's date.
+        assert all("copyto" not in c for c in calls)
+        out = capsys.readouterr().out
+        assert f"skip date={today} reason=today_utc" in out
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_stderr unit tests (Codex 5a.2.1 #2)
+# ---------------------------------------------------------------------------
+
+class TestSanitizeStderr:
+    def test_sanitize_stderr_masks_key_value_patterns(self):
+        s = "rclone error: access_key_id=KFAKE123abc application_key=APPKEY9XYZ"
+        out = _sanitize_stderr(s)
+        assert "KFAKE123abc" not in out
+        assert "APPKEY9XYZ" not in out
+        assert "***REDACTED***" in out
+
+    def test_sanitize_stderr_masks_authorization_header(self):
+        s = "Failed: Authorization: Bearer eyJabc.def.ghi"
+        out = _sanitize_stderr(s)
+        assert "eyJabc.def.ghi" not in out
+        assert "Bearer" not in out
+        assert "***REDACTED***" in out
+
+    def test_sanitize_stderr_masks_url_query_string(self):
+        s = "GET https://api.b2.example.com/b2api/v2/upload?token=SECRETTOKEN12345 -> 401"
+        out = _sanitize_stderr(s)
+        assert "SECRETTOKEN12345" not in out
+        assert "https://api.b2.example.com/b2api/v2/upload" in out
+        assert "***REDACTED***" in out
+
+    def test_sanitize_stderr_keeps_bucket_and_path_visible(self):
+        s = (
+            "rclone copyto /root/executor/audit-logs/market_snapshots/kalshi_ws/"
+            "2026-04-22.jsonl.gz b2backup:ari-executor-backups/kalshi_ws_snapshots/ "
+            "status=500 attempts=3"
+        )
+        out = _sanitize_stderr(s)
+        assert "ari-executor-backups" in out
+        assert "/root/executor/audit-logs/" in out
+        assert "2026-04-22" in out
+        assert "copyto" in out
+        assert "status=500" in out
+        assert "attempts=3" in out
+
+    def test_sanitize_stderr_empty(self):
+        assert _sanitize_stderr("") == ""
+
+
+# ---------------------------------------------------------------------------
+# Stderr hygiene per command (Codex 5a.2.1 #2)
+# ---------------------------------------------------------------------------
+
+class TestStderrHygienePerCommand:
+    def test_verbose_upload_error_uses_sanitized_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        _make_gz_and_sidecar(snap, "2026-04-22")
+
+        def fake_run(cmd, **kw):
+            r = mock.Mock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "rclone failed: access_key_id=KFAKE123abcXYZ"
+            return r
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc = cmd_upload(_ns(
+                snapshot_dir=str(snap),
+                i_confirm_snapshot_upload=True,
+                verbose=True,
+            ))
+        assert rc == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert "***REDACTED***" in combined
+        assert "KFAKE123abcXYZ" not in combined
+
+    def test_non_verbose_upload_error_omits_stderr_entirely(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        _make_gz_and_sidecar(snap, "2026-04-22")
+
+        def fake_run(cmd, **kw):
+            r = mock.Mock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "rclone failed: access_key_id=KFAKE_SECRET_TOKEN"
+            return r
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc = cmd_upload(_ns(
+                snapshot_dir=str(snap),
+                i_confirm_snapshot_upload=True,
+                verbose=False,
+            ))
+        assert rc == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert "KFAKE_SECRET_TOKEN" not in combined
+        assert "access_key_id" not in combined
+        assert "***REDACTED***" not in combined  # Nothing to redact — stderr suppressed entirely.
+
+    def test_verbose_verify_error_uses_sanitized_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        _make_gz_and_sidecar(snap, "2026-04-22")
+
+        def fake_run(cmd, **kw):
+            r = mock.Mock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "auth=KFAKE_VERIFY_SECRET https://b2.example/list?token=SECRETQS"
+            return r
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc = cmd_verify(_ns(snapshot_dir=str(snap), date="2026-04-22", verbose=True))
+        assert rc == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert "KFAKE_VERIFY_SECRET" not in combined
+        assert "SECRETQS" not in combined
+        assert "***REDACTED***" in combined
+
+    def test_verbose_restore_error_uses_sanitized_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        snap = tmp_path / "snaps"
+        snap.mkdir()
+        dest = tmp_path / "restore"
+
+        def fake_run(cmd, **kw):
+            r = mock.Mock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "Authorization: Bearer KFAKE_RESTORE_TOKEN_99"
+            return r
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc = cmd_restore(_ns(
+                snapshot_dir=str(snap), date="2026-04-22",
+                dest=str(dest), force=False,
+                allow_snapshot_dir_restore=False,
+                verbose=True,
+            ))
+        assert rc == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert "KFAKE_RESTORE_TOKEN_99" not in combined
+        assert "***REDACTED***" in combined
