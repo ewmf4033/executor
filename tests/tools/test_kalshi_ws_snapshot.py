@@ -1,7 +1,10 @@
 """Tests for executor.tools.kalshi_ws_snapshot.
 
-Phase 5a.1.0 — narrow scope. Trade-only channel allowlist; recorder-specific
-credential names; non-dry-run requires --i-confirm-read-only-key.
+Phase 5a.1.1 — channel allowlist now contains the two public read-only
+channels {"trade", "orderbook_delta"}. orderbook_delta-channel frames pass
+through a key-path payload guard that quarantines anomalies. Recorder-
+specific credential names are unchanged; non-dry-run still requires
+--i-confirm-read-only-key.
 
 No live network. The drive loop and ``_default_ws_factory`` are bypassed by
 injecting a ``FakeWS``. Every test is hermetic.
@@ -287,10 +290,9 @@ def test_assert_public_channel_accepts_trade() -> None:
     wsmod._assert_public_channel("trade")
 
 
-# 8. orderbook_delta rejected.
-def test_assert_public_channel_rejects_orderbook_delta() -> None:
-    with pytest.raises(ValueError, match="forbidden channel"):
-        wsmod._assert_public_channel("orderbook_delta")
+# 8. orderbook_delta accepted (phase 5a.1.1: public read-only channel).
+def test_assert_public_channel_accepts_orderbook_delta() -> None:
+    wsmod._assert_public_channel("orderbook_delta")
 
 
 # 9. fill/position/.../unknown rejected.
@@ -329,7 +331,7 @@ def test_forbidden_channel_rejected_before_env_read(tmp_path: Path) -> None:
         wsmod.run(
             [
                 "--ticker", "T",
-                "--channel", "orderbook_delta",
+                "--channel", "fill",
                 "--out", str(out),
                 "--i-confirm-read-only-key",
             ],
@@ -372,12 +374,27 @@ def test_guarded_subscribe_blocks_forbidden_channel_on_fake_ws() -> None:
 
     async def _go() -> None:
         with pytest.raises(ValueError, match="forbidden channel"):
-            await wsmod._guarded_subscribe(fake_ws, ["orderbook_delta"], ["T"])
+            await wsmod._guarded_subscribe(fake_ws, ["fill"], ["T"])
 
     asyncio.run(_go())
     # The fake WS records subscribe calls; the guard must reject before any
     # call reaches it.
     assert fake_ws.subscribe_calls == []
+
+
+def test_guarded_subscribe_passes_through_orderbook_delta() -> None:
+    """Phase 5a.1.1: orderbook_delta is now a public read-only channel and
+    must pass _guarded_subscribe. The guard only fires AFTER channel
+    validation, so reaching the fake WS subscribe call proves the
+    allowlist accepted the channel."""
+    fake_ws = FakeWS(frames=[])
+
+    async def _go() -> Any:
+        return await wsmod._guarded_subscribe(fake_ws, ["orderbook_delta"], ["T"])
+
+    sub = asyncio.run(_go())
+    assert hasattr(sub, "queue")
+    assert fake_ws.subscribe_calls == [(("orderbook_delta",), ("T",))]
 
 
 def test_guarded_subscribe_passes_through_trade_channel() -> None:
@@ -635,6 +652,9 @@ def test_malformed_frame_skipped_and_counted(tmp_path: Path, capsys) -> None:
     summary = json.loads(summary_line)
     assert summary["records_written"] == 1
     assert summary["malformed_count"] == 3
+    # Phase 5a.1.1: anomalous_count is always present in live summaries and
+    # must be 0 here because no orderbook frames were captured.
+    assert summary["anomalous_count"] == 0
 
 
 # 20. Error frame policy pinned: write JSONL with error=true and raw payload.
@@ -831,6 +851,545 @@ def test_default_output_path_under_audit_logs_market_snapshots() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_allowed_ws_channels_is_trade_only_frozenset() -> None:
+def test_allowed_ws_channels_is_trade_and_orderbook_delta_frozenset() -> None:
+    """Phase 5a.1.1: allowlist now contains the two public read-only
+    channels and nothing else."""
     assert isinstance(wsmod.ALLOWED_WS_CHANNELS, frozenset)
-    assert wsmod.ALLOWED_WS_CHANNELS == frozenset({"trade"})
+    assert wsmod.ALLOWED_WS_CHANNELS == frozenset({"trade", "orderbook_delta"})
+
+
+def test_orderbook_delta_no_longer_in_forbidden_set() -> None:
+    """Phase 5a.1.1: orderbook_delta promoted out of FORBIDDEN_WS_CHANNELS.
+    The set still lists user/account-scoped channels."""
+    assert "orderbook_delta" not in wsmod.FORBIDDEN_WS_CHANNELS
+    # Sanity: user/account-scoped channels still rejected.
+    for ch in ("fill", "position", "balance", "portfolio"):
+        assert ch in wsmod.FORBIDDEN_WS_CHANNELS
+
+
+# ---------------------------------------------------------------------------
+# Phase 5a.1.1 — orderbook_delta routing, payload guard, anomaly handling
+# ---------------------------------------------------------------------------
+
+
+def _orderbook_snapshot_frame(
+    ticker: str,
+    *,
+    seq: int = 1,
+    sid: int = 1,
+) -> dict[str, Any]:
+    """Realistic orderbook_snapshot frame matching the 5a.1.1 diagnostic."""
+    return {
+        "type": "orderbook_snapshot",
+        "sid": sid,
+        "seq": seq,
+        "msg": {
+            "market_ticker": ticker,
+            "market_id": "11111111-2222-3333-4444-555555555555",
+            "yes_dollars_fp": [["0.3500", "100.00"], ["0.3600", "200.00"]],
+            "no_dollars_fp": [["0.6400", "150.00"], ["0.6500", "250.00"]],
+        },
+    }
+
+
+def _orderbook_delta_frame(
+    ticker: str,
+    *,
+    seq: int = 2,
+    sid: int = 1,
+    side: str = "yes",
+    price: str = "0.3500",
+    delta: str = "-15.00",
+) -> dict[str, Any]:
+    """Realistic orderbook_delta frame matching the 5a.1.1 diagnostic."""
+    return {
+        "type": "orderbook_delta",
+        "sid": sid,
+        "seq": seq,
+        "msg": {
+            "market_ticker": ticker,
+            "market_id": "11111111-2222-3333-4444-555555555555",
+            "price_dollars": price,
+            "delta_fp": delta,
+            "side": side,
+            "ts": "2026-04-26T18:45:53.752526Z",
+            "ts_ms": 1777229153752,
+        },
+    }
+
+
+def _run_recorder_with_frames(
+    tmp_path: Path,
+    frames: list[Any],
+    *,
+    channel: str,
+    ticker: str = "T",
+    extra_args: list[str] | None = None,
+    capsys=None,
+) -> tuple[int, Path, FakeWS, dict[str, Any]]:
+    """Drive the recorder to completion against ``frames`` and a sentinel.
+
+    When ``capsys`` is provided, parses the final stdout JSON line as the
+    summary and re-emits any captured stdout/stderr through ``sys.stdout``/
+    ``sys.stderr`` so that tests can call ``capsys.readouterr()`` again
+    afterwards (the helper does not consume the buffer destructively).
+    """
+    out = tmp_path / "out.jsonl"
+    fake_ws = FakeWS(frames=list(frames) + [None])
+    env = RecordingEnv({
+        "KALSHI_RECORDER_API_KEY_ID": "rec-id",
+        "KALSHI_RECORDER_PRIVATE_KEY_PATH": "/dev/null",
+    })
+    clock = MockClock()
+    argv = [
+        "--ticker", ticker,
+        "--channel", channel,
+        "--max-duration-sec", "10",
+        "--max-messages", "100",
+        "--out", str(out),
+        "--i-confirm-read-only-key",
+    ]
+    if extra_args:
+        argv.extend(extra_args)
+    rc = wsmod.run(
+        argv,
+        ws_factory=lambda kid, kp: fake_ws,
+        env=env,
+        clock_wall_ns=lambda: 1,
+        clock_monotonic_ns=clock,
+        async_sleep=_make_advancing_sleep(clock),
+        session_id="s",
+    )
+    summary: dict[str, Any] = {}
+    if capsys is not None:
+        captured = capsys.readouterr()
+        out_lines = [l for l in captured.out.strip().splitlines() if l]
+        if out_lines:
+            try:
+                summary = json.loads(out_lines[-1])
+            except json.JSONDecodeError:
+                summary = {}
+        # Re-emit so tests that call capsys.readouterr() again still see
+        # what the recorder produced (capsys.readouterr drains the buffer).
+        if captured.out:
+            sys.stdout.write(captured.out)
+        if captured.err:
+            sys.stderr.write(captured.err)
+    return rc, out, fake_ws, summary
+
+
+# --- Routing: trade vs orderbook_delta ---
+
+
+def test_trade_frame_routed_with_trade_channel(tmp_path: Path, capsys) -> None:
+    frames = [_trade_frame("KXFED-26", seq=7)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="trade", ticker="KXFED-26", capsys=capsys
+    )
+    assert rc == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["channel"] == "trade"
+    assert rec["msg_type"] == "trade"
+    assert rec["market_ticker"] == "KXFED-26"
+    assert rec["kalshi_seq"] == 7
+    assert summary["records_written"] == 1
+    assert summary["anomalous_count"] == 0
+    assert summary["malformed_count"] == 0
+
+
+def test_orderbook_snapshot_routed_with_orderbook_delta_channel(
+    tmp_path: Path, capsys
+) -> None:
+    frames = [_orderbook_snapshot_frame("KXNBA-T", seq=1, sid=42)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["channel"] == "orderbook_delta"
+    assert rec["msg_type"] == "orderbook_snapshot"
+    assert rec["market_ticker"] == "KXNBA-T"
+    assert rec["kalshi_seq"] == 1
+    assert rec["frame_seq"] == 0
+    assert rec["raw"]["sid"] == 42
+    assert summary["anomalous_count"] == 0
+
+
+def test_orderbook_delta_routed_with_orderbook_delta_channel(
+    tmp_path: Path, capsys
+) -> None:
+    frames = [_orderbook_delta_frame("KXNBA-T", seq=2, sid=42)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["channel"] == "orderbook_delta"
+    assert rec["msg_type"] == "orderbook_delta"
+    assert rec["market_ticker"] == "KXNBA-T"
+    assert rec["kalshi_seq"] == 2
+    assert rec["frame_seq"] == 0
+    assert summary["anomalous_count"] == 0
+
+
+def test_orderbook_snapshot_and_delta_seq_pinning(tmp_path: Path, capsys) -> None:
+    """Snapshot then delta frames should preserve their kalshi_seq and
+    increment frame_seq monotonically."""
+    frames = [
+        _orderbook_snapshot_frame("KXNBA-T", seq=1),
+        _orderbook_delta_frame("KXNBA-T", seq=2),
+        _orderbook_delta_frame("KXNBA-T", seq=3),
+    ]
+    rc, out, _ws, _summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    recs = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert len(recs) == 3
+    assert [r["frame_seq"] for r in recs] == [0, 1, 2]
+    assert [r["kalshi_seq"] for r in recs] == [1, 2, 3]
+    assert [r["msg_type"] for r in recs] == [
+        "orderbook_snapshot",
+        "orderbook_delta",
+        "orderbook_delta",
+    ]
+    for r in recs:
+        assert r["channel"] == "orderbook_delta"
+
+
+# --- Payload guard happy paths ---
+
+
+def test_realistic_snapshot_frame_passes_guard(tmp_path: Path, capsys) -> None:
+    frames = [_orderbook_snapshot_frame("KXNBA-T", seq=1)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert summary["anomalous_count"] == 0
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_realistic_delta_frame_passes_guard(tmp_path: Path, capsys) -> None:
+    frames = [_orderbook_delta_frame("KXNBA-T", seq=2)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert summary["anomalous_count"] == 0
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_trade_channel_bypasses_orderbook_payload_guard(
+    tmp_path: Path, capsys
+) -> None:
+    """Regression test ONLY: prove the orderbook payload guard is not
+    applied to trade-channel frames. This is not a claim that real Kalshi
+    trade payloads contain user_id; the test wires a synthetic trade frame
+    with msg.user_id and asserts the recorder writes it normally because
+    the guard is channel-scoped."""
+    synth = {
+        "type": "trade",
+        "seq": 1,
+        "msg": {"market_ticker": "T", "user_id": "should-not-trigger-guard"},
+    }
+    frames = [synth]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="trade", ticker="T", capsys=capsys
+    )
+    assert rc == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["channel"] == "trade"
+    assert summary["anomalous_count"] == 0
+    # The raw payload is preserved as-is — not redacted, not filtered.
+    assert rec["raw"]["msg"]["user_id"] == "should-not-trigger-guard"
+
+
+# --- Payload guard anomaly detection ---
+
+
+def test_orderbook_delta_with_top_level_user_id_quarantined(
+    tmp_path: Path, capsys
+) -> None:
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["user_id"] = "leak-via-top-level"
+    frames = [bad, _orderbook_delta_frame("KXNBA-T", seq=99)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    # Only the clean follow-up frame should be persisted.
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["kalshi_seq"] == 99
+    assert "user_id" not in rec["raw"]
+    assert summary["anomalous_count"] == 1
+    assert summary["records_written"] == 1
+
+
+def test_orderbook_delta_with_msg_client_order_id_quarantined(
+    tmp_path: Path, capsys
+) -> None:
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["msg"]["client_order_id"] = "abc-123"
+    frames = [bad]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert not out.exists() or out.read_text(encoding="utf-8") == ""
+    assert summary["anomalous_count"] == 1
+    assert summary["records_written"] == 0
+
+
+def test_orderbook_delta_with_deeply_nested_account_id_quarantined(
+    tmp_path: Path, capsys
+) -> None:
+    """Recursive walker must catch msg.foo.account_id even though `foo`
+    is also rejected by the structural msg-level allowlist. Both rejections
+    map to a single anomalous_count bump."""
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["msg"]["foo"] = {"account_id": "nested-leak"}
+    frames = [bad]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert summary["anomalous_count"] == 1
+    assert summary["records_written"] == 0
+    # Stderr summary should mention the nested path.
+    err = capsys.readouterr().err
+    assert "msg.foo.account_id" in err
+    # And must NOT contain the leaked value.
+    assert "nested-leak" not in err
+
+
+def test_orderbook_delta_with_unknown_msg_field_quarantined(
+    tmp_path: Path, capsys
+) -> None:
+    """Unknown msg key with NO forbidden substring is still rejected by
+    the structural allowlist."""
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["msg"]["future_unknown_field"] = "whatever"
+    frames = [bad]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert summary["anomalous_count"] == 1
+    assert summary["records_written"] == 0
+
+
+def test_value_orderbook_delta_does_not_trip_guard(
+    tmp_path: Path, capsys
+) -> None:
+    """The forbidden-substring scan inspects key NAMES, not values. A frame
+    whose `type` value is "orderbook_delta" must pass."""
+    # _orderbook_delta_frame already has type="orderbook_delta" as a value,
+    # so this is the cleanest way to assert the value-vs-key distinction.
+    frames = [_orderbook_delta_frame("KXNBA-T")]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert summary["anomalous_count"] == 0
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_anomalous_raw_payload_not_in_main_jsonl(tmp_path: Path, capsys) -> None:
+    """An anomalous frame's raw payload must not appear in the JSONL — even
+    obliquely. Search the file for the leak marker; assert absent."""
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["msg"]["user_id"] = "LEAK_MARKER_42"
+    frames = [bad, _orderbook_delta_frame("KXNBA-T", seq=99)]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    text = out.read_text(encoding="utf-8") if out.exists() else ""
+    assert "LEAK_MARKER_42" not in text
+    assert summary["anomalous_count"] == 1
+
+
+def test_no_quarantine_jsonl_file_created(tmp_path: Path, capsys) -> None:
+    """No separate quarantine file is written. Only the main JSONL exists
+    (or doesn't, when no clean frames are captured)."""
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["user_id"] = "x"
+    frames = [bad]
+    rc, _out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    assert summary["anomalous_count"] == 1
+    # Walk the tmp_path tree — any *.jsonl other than out.jsonl is forbidden.
+    jsonl_files = sorted(p.name for p in tmp_path.rglob("*.jsonl"))
+    # out.jsonl may or may not exist depending on whether any clean frames
+    # came through; quarantine.jsonl etc. must NOT exist.
+    assert all(name == "out.jsonl" for name in jsonl_files), (
+        f"unexpected jsonl files in tmp_path: {jsonl_files}"
+    )
+
+
+def test_anomalous_frame_does_not_advance_frame_seq(
+    tmp_path: Path, capsys
+) -> None:
+    """An anomalous frame between two clean frames must NOT consume a
+    frame_seq slot — the clean frames should be numbered 0 and 1."""
+    bad = _orderbook_delta_frame("KXNBA-T", seq=2)
+    bad["msg"]["user_id"] = "x"
+    frames = [
+        _orderbook_snapshot_frame("KXNBA-T", seq=1),
+        bad,
+        _orderbook_delta_frame("KXNBA-T", seq=3),
+    ]
+    rc, out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    recs = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert len(recs) == 2
+    assert [r["frame_seq"] for r in recs] == [0, 1]
+    assert [r["kalshi_seq"] for r in recs] == [1, 3]
+    assert summary["anomalous_count"] == 1
+    assert summary["records_written"] == 2
+
+
+# --- Recursive walker ---
+
+
+def test_walk_key_paths_handles_nested_dicts() -> None:
+    paths = wsmod._walk_key_paths({"a": {"b": {"c": 1}}})
+    assert paths == ["a", "a.b", "a.b.c"]
+
+
+def test_walk_key_paths_handles_lists_of_dicts() -> None:
+    paths = wsmod._walk_key_paths({"a": [{"b": 1}, {"c": {"d": 2}}]})
+    # 'a' present; 'a.b', 'a.c', 'a.c.d' all reachable through list elements
+    assert "a" in paths
+    assert "a.b" in paths
+    assert "a.c" in paths
+    assert "a.c.d" in paths
+    # Deduplication: even if the same key appears in multiple list elements
+    # the walker must yield it once.
+    paths2 = wsmod._walk_key_paths({"a": [{"b": 1}, {"b": 2}, {"b": 3}]})
+    assert paths2.count("a.b") == 1
+
+
+def test_walk_key_paths_yields_strings_only() -> None:
+    paths = wsmod._walk_key_paths({
+        "x": "value-not-a-key",
+        "y": [1, 2, 3],
+        "z": {"nested": "another-value"},
+    })
+    for p in paths:
+        assert isinstance(p, str)
+    # No values should appear in the path list.
+    assert "value-not-a-key" not in paths
+    assert "another-value" not in paths
+    # Numeric list elements have no keys to yield.
+    assert paths == sorted({"x", "y", "z", "z.nested"})
+
+
+def test_walk_key_paths_skips_non_string_keys() -> None:
+    """Walker is hardened against weird dicts whose keys aren't strings;
+    those entries are skipped (the structural allowlist still rejects
+    any frame with such keys at the top level)."""
+    paths = wsmod._walk_key_paths({1: "ignored", "a": {2: "also-ignored", "b": 3}})
+    assert "a" in paths
+    assert "a.b" in paths
+    # Non-string key paths must not appear.
+    assert all("1" != p.split(".")[0] for p in paths)
+
+
+# --- Rate-limited anomaly logging ---
+
+
+def test_first_n_anomalies_logged_in_detail(tmp_path: Path, capsys) -> None:
+    """The first ANOMALY_LOG_LIMIT anomalies should each produce a stderr
+    line containing rejected_key_paths."""
+    n = wsmod.ANOMALY_LOG_LIMIT
+    frames: list[Any] = []
+    for i in range(n):
+        bad = _orderbook_delta_frame("KXNBA-T", seq=10 + i)
+        bad["msg"]["user_id"] = f"x{i}"
+        frames.append(bad)
+    rc, _out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    detailed = [l for l in err.splitlines() if "rejected_key_paths" in l]
+    assert len(detailed) == n
+    assert summary["anomalous_count"] == n
+    assert "anomalies_suppressed_log_count" not in summary
+
+
+def test_anomalies_beyond_limit_are_log_suppressed(tmp_path: Path, capsys) -> None:
+    """Past ANOMALY_LOG_LIMIT, detailed logs are suppressed but the
+    anomalous counter still increments and the suppression count is
+    reported in the final summary."""
+    n_total = wsmod.ANOMALY_LOG_LIMIT + 5
+    frames: list[Any] = []
+    for i in range(n_total):
+        bad = _orderbook_delta_frame("KXNBA-T", seq=10 + i)
+        bad["msg"]["user_id"] = f"x{i}"
+        frames.append(bad)
+    rc, _out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    detailed = [l for l in err.splitlines() if "rejected_key_paths" in l]
+    assert len(detailed) == wsmod.ANOMALY_LOG_LIMIT
+    assert summary["anomalous_count"] == n_total
+    assert summary["anomalies_suppressed_log_count"] == 5
+    assert summary["records_written"] == 0
+
+
+# --- Summary JSON ---
+
+
+def test_summary_includes_anomalous_count_for_trade_only_run(
+    tmp_path: Path, capsys
+) -> None:
+    """anomalous_count must be present and 0 for a trade-only run."""
+    frames = [_trade_frame("T", seq=1)]
+    rc, _out, _ws, summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="trade", ticker="T", capsys=capsys
+    )
+    assert rc == 0
+    assert "anomalous_count" in summary
+    assert summary["anomalous_count"] == 0
+    assert summary["malformed_count"] == 0
+    assert summary["records_written"] == 1
+    assert "anomalies_suppressed_log_count" not in summary
+
+
+# --- Stderr safety: no values in anomaly logs ---
+
+
+def test_anomaly_stderr_log_does_not_contain_payload_values(
+    tmp_path: Path, capsys
+) -> None:
+    """The anomaly log must mention rejected key paths only — never
+    payload values."""
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["msg"]["user_id"] = "SECRET_TOKEN_VALUE"
+    frames = [bad]
+    rc, _out, _ws, _summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "SECRET_TOKEN_VALUE" not in err
+    assert "msg.user_id" in err
