@@ -1393,3 +1393,51 @@ def test_anomaly_stderr_log_does_not_contain_payload_values(
     err = capsys.readouterr().err
     assert "SECRET_TOKEN_VALUE" not in err
     assert "msg.user_id" in err
+
+
+def test_anomaly_stderr_log_omits_msg_type_and_market_ticker(
+    tmp_path: Path, capsys
+) -> None:
+    """Phase 5a.1.1.1 (Codex finding): anomaly stderr log must NOT include
+    msg_type or market_ticker — those are payload-derived values. Pin the
+    exact omission with a unique ticker leak marker."""
+    bad = _orderbook_delta_frame("TICKER_LEAK_MARKER")
+    bad["msg"]["user_id"] = "x"
+    frames = [bad]
+    rc, _out, _ws, _summary = _run_recorder_with_frames(
+        tmp_path,
+        frames,
+        channel="orderbook_delta",
+        ticker="TICKER_LEAK_MARKER",
+        capsys=capsys,
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    anomaly_lines = [l for l in err.splitlines() if "rejected_key_paths" in l]
+    assert len(anomaly_lines) == 1
+    line = anomaly_lines[0]
+    assert "TICKER_LEAK_MARKER" not in line
+    parsed = json.loads(line)
+    assert "market_ticker" not in parsed
+    assert "msg_type" not in parsed
+
+
+def test_anomaly_stderr_log_contains_only_safe_keys(
+    tmp_path: Path, capsys
+) -> None:
+    """Positive schema test: the anomaly log dict keys must be exactly
+    {event, anomalous_count, rejected_key_paths}. Prevents future drift
+    where someone adds channel, sid, seq, ticker, msg_type, or other
+    frame-derived metadata."""
+    bad = _orderbook_delta_frame("KXNBA-T")
+    bad["msg"]["user_id"] = "x"
+    frames = [bad]
+    rc, _out, _ws, _summary = _run_recorder_with_frames(
+        tmp_path, frames, channel="orderbook_delta", ticker="KXNBA-T", capsys=capsys
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    anomaly_lines = [l for l in err.splitlines() if "rejected_key_paths" in l]
+    assert len(anomaly_lines) == 1
+    parsed = json.loads(anomaly_lines[0])
+    assert set(parsed.keys()) == {"event", "anomalous_count", "rejected_key_paths"}

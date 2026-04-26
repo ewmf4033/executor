@@ -480,8 +480,6 @@ async def _drive(
                                         "event": "kalshi_ws_recorder.orderbook_anomaly",
                                         "anomalous_count": anomalous,
                                         "rejected_key_paths": anomalies,
-                                        "msg_type": rec["msg_type"],
-                                        "market_ticker": rec.get("market_ticker"),
                                     },
                                     sort_keys=True,
                                 ),
