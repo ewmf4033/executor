@@ -142,3 +142,61 @@ def test_no_obvious_secret_strings_in_source() -> None:
         "and re-run. If it is a synthetic test fixture, make it less "
         "secret-shaped (e.g. shorter, no `:` separator)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5a.1.0 — recorder credential service-boundary regression
+# ---------------------------------------------------------------------------
+#
+# The Kalshi WebSocket recorder is a manual, single-shot tool. It must not be
+# reachable from the executor daemon's environment. Concretely: the daemon
+# unit (executor.service) must NOT load recorder-specific credentials and
+# must NOT EnvironmentFile= a recorder env file. If either ever leaked into
+# the unit, the daemon would inherit the recorder API key and our credential
+# boundary would dissolve.
+#
+# Pinned tokens that must NOT appear in the daemon unit:
+#   - /etc/executor/kalshi_recorder.env
+#   - KALSHI_RECORDER_API_KEY_ID
+#   - KALSHI_RECORDER_PRIVATE_KEY_PATH
+RECORDER_BOUNDARY_TOKENS = (
+    "/etc/executor/kalshi_recorder.env",
+    "KALSHI_RECORDER_API_KEY_ID",
+    "KALSHI_RECORDER_PRIVATE_KEY_PATH",
+)
+
+IN_REPO_EXECUTOR_SERVICE = REPO_ROOT / "systemd" / "executor.service"
+DEPLOYED_EXECUTOR_SERVICE = Path("/etc/systemd/system/executor.service")
+
+
+def test_in_repo_executor_service_has_no_recorder_credential_refs() -> None:
+    """The committed daemon unit must not reference recorder credentials.
+
+    If a future change wires recorder env into the daemon, this test fires
+    so the boundary is not lost silently.
+    """
+    if not IN_REPO_EXECUTOR_SERVICE.exists():
+        pytest.skip(f"{IN_REPO_EXECUTOR_SERVICE} not present")
+    text = IN_REPO_EXECUTOR_SERVICE.read_text(encoding="utf-8")
+    for token in RECORDER_BOUNDARY_TOKENS:
+        assert token not in text, (
+            f"{IN_REPO_EXECUTOR_SERVICE} references recorder token {token!r} "
+            "— recorder credentials must not be wired into the daemon unit"
+        )
+
+
+def test_deployed_executor_service_has_no_recorder_credential_refs() -> None:
+    """Deployed daemon unit (if present) must not reference recorder creds.
+
+    Skips cleanly on CI/dev hosts where /etc/systemd/system/executor.service
+    does not exist.
+    """
+    if not DEPLOYED_EXECUTOR_SERVICE.exists():
+        pytest.skip(f"{DEPLOYED_EXECUTOR_SERVICE} not present")
+    text = DEPLOYED_EXECUTOR_SERVICE.read_text(encoding="utf-8")
+    for token in RECORDER_BOUNDARY_TOKENS:
+        assert token not in text, (
+            f"{DEPLOYED_EXECUTOR_SERVICE} references recorder token "
+            f"{token!r} — recorder credentials must not be wired into the "
+            "deployed daemon unit"
+        )
